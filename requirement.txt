@@ -1,0 +1,10 @@
+# PyTorch with CUDA 12.8
+torch==2.3.0+cu128
+torchvision==0.18.0+cu128
+torchaudio==2.3.0+cu128
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# Hugging Face Transformers 和相关工具
+transformers
+accelerate
+sentencepiece

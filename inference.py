@@ -2,7 +2,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # from transformers import LlamaTokenizer, LlamaForCausalLM
 import torch
 
-prompt = "Tell me about the Great Wall of China."
+# prompt = "Tell me about the Great Wall of China."
+
+# 非instruct版本（不是对话专用），需要使用ChatML格式prompt
+prompt = "<|begin_of_text|><|user|>\n介绍一下边缘计算。\n<|assistant|>\n"
 
 model_path = "./weights/Llama-3___2-1B"
 model_id = model_path

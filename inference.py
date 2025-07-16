@@ -2,10 +2,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # from transformers import LlamaTokenizer, LlamaForCausalLM
 import torch
 
-prompt = "介绍一下边缘计算。"
+# prompt = "介绍一下边缘计算。"
 
 # 非instruct版本（不是对话专用），需要使用ChatML格式prompt
-# prompt = "<|begin_of_text|><|user|>\n介绍一下边缘计算。\n<|assistant|>\n"
+prompt = "<|begin_of_text|><|user|>\n介绍一下边缘计算。\n<|assistant|>\n"
 
 model_path = "./weights/llama-2-7b-hf"
 # model_path = "./weights/Llama-3___2-3B"
@@ -36,7 +36,8 @@ outputs = model.generate(
     do_sample=True,
     top_p=0.95,
     temperature=0.7,
-    eos_token_id=tokenizer.eos_token_id
+    eos_token_id=tokenizer.eos_token_id,
+    repetition_penalty=1.2,  # 惩罚重复
 )
 
 # 输出

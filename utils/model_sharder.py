@@ -11,9 +11,9 @@ class ModelSharder:
 
     def __init__(self, model_path: str, model_type: str, shard_save_folder: str, device="cpu", dtype=torch.float32):
         """
-        :param model_path: 模型路径 (Hugging Face 格式)
+        :param model_path: 模型路径
         :param model_type: 模型类型 "llama" 或 "gpt" 等
-        :param shard_save_folder: 保存分片的文件夹
+        :param shard_save_folder: 保存分片的文件夹（不用带dtype，会自动标明）
         :param device: "cpu" 或 "cuda:0" 等
         :param dtype: torch.float32 / torch.float16 等
         """
@@ -21,7 +21,7 @@ class ModelSharder:
         self.model_type = model_type
         self.device = torch.device(device)
         self.dtype = dtype
-        self.shard_save_folder = shard_save_folder
+        self.shard_save_folder = shard_save_folder + "_" + str(dtype).split(".")[-1]
         os.makedirs(self.shard_save_folder, exist_ok=True)
 
         print(f"Loading full model {self.model_path} to {self.device} ...")

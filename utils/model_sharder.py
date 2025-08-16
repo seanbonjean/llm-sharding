@@ -1,33 +1,42 @@
 import os
+import shutil
 import torch
 from transformers import AutoModelForCausalLM
 
 
 class ModelSharder:
+    """
+    模型切割器，将模型按层切开
+    """
+
     def __init__(self, model_path: str, model_type: str, shard_save_folder: str, device="cpu", dtype=torch.float32):
         """
         :param model_path: 模型路径 (Hugging Face 格式)
         :param model_type: 模型类型 "llama" 或 "gpt" 等
         :param shard_save_folder: 保存分片的文件夹
         :param device: "cpu" 或 "cuda:0" 等
-        :param dtype: torch.float32 / torch.float16等
+        :param dtype: torch.float32 / torch.float16 等
         """
-        self.model_id = model_path
+        self.model_path = model_path
         self.model_type = model_type
         self.device = torch.device(device)
         self.dtype = dtype
         self.shard_save_folder = shard_save_folder
         os.makedirs(self.shard_save_folder, exist_ok=True)
 
-        print(f"Loading full model {self.model_id} to {self.device} ...")
+        print(f"Loading full model {self.model_path} to {self.device} ...")
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
+            self.model_path,
             torch_dtype=self.dtype,
             device_map=self.device,
         )
         # self.model.to(self.device)
 
     def save_shards(self):
+        # 保存 config.json
+        shutil.copyfile(os.path.join(self.model_path, "config.json"),
+                        os.path.join(self.shard_save_folder, "config.json"))
+
         if self.model_type == "llama":
             # LLaMA 结构解析
             embed_tokens = self.model.model.embed_tokens  # 词嵌入层
@@ -104,9 +113,9 @@ class ModelSharder:
 
 if __name__ == "__main__":
     sharder = ModelSharder(
-        model_path="../weights/Llama-2-7b-chat-hf",
-        model_type="llama",
-        shard_save_folder="../shards/Llama-2-7b-chat-hf",
+        "../weights/Llama-2-7b-chat-hf",
+        "llama",
+        "../shards/Llama-2-7b-chat-hf",
         device="cuda:0",
         dtype=torch.float32
     )

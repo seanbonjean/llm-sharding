@@ -9,19 +9,18 @@ prompt = "<|begin_of_text|><|user|>\n介绍一下边缘计算。\n<|assistant|>\
 
 model_path = "./weights/llama-2-7b-hf"
 # model_path = "./weights/Llama-3___2-3B"
-model_id = model_path
 
 # 加载tokenizer和model
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(
-    model_id,
+    model_path,
     torch_dtype=torch.float16,  # 也可以是int8/int4量化
     device_map="auto",
 ).to("cuda")  # 放置到GPU上
 
-# tokenizer = LlamaTokenizer.from_pretrained(model_id)
+# tokenizer = LlamaTokenizer.from_pretrained(model_path)
 # model = LlamaForCausalLM.from_pretrained(
-#     model_id,
+#     model_path,
 #     torch_dtype=torch.float16,  # 也可以是int8/int4量化
 #     device_map="auto",
 # )

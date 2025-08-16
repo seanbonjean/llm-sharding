@@ -33,9 +33,17 @@ class ModelSharder:
         # self.model.to(self.device)
 
     def save_shards(self):
-        # 保存 config.json
-        shutil.copyfile(os.path.join(self.model_path, "config.json"),
-                        os.path.join(self.shard_save_folder, "config.json"))
+        # 保存 config.json 和 tokenizer 所需文件
+        for filename in os.listdir(self.model_path):
+            # 跳过权重文件
+            if filename.endswith((".bin", ".safetensors")):
+                continue
+            src = os.path.join(self.model_path, filename)
+            dst = os.path.join(self.shard_save_folder, filename)
+            # 只复制文件，忽略文件夹
+            if os.path.isfile(src):
+                shutil.copyfile(src, dst)
+                print(f"Copied {filename} -> {dst}")
 
         if self.model_type == "llama":
             # LLaMA 结构解析
@@ -45,10 +53,9 @@ class ModelSharder:
             language_modeling_head = self.model.lm_head  # LM Head
 
             # 保存 embedding 层（LLaMA 没有位置 embedding）
-            torch.save({
-                "embed_tokens": embed_tokens.state_dict(),
-            }, os.path.join(self.shard_save_folder, "embedding.pth"))
-            print("Saved embed_tokens layer.")
+            torch.save(embed_tokens.state_dict(),
+                       os.path.join(self.shard_save_folder, "embedding.pth"))
+            print("Saved embedding layer.")
 
             # 保存每一层 Transformer block
             for i, layer in enumerate(layers):

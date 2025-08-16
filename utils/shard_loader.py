@@ -34,7 +34,8 @@ class LlamaShardPart(nn.Module):
             self.final_norm_weight = final_norm_weight
         self.config = LlamaConfig.from_pretrained(self.shards_path)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(self.config, layer_idx).to(self.dtype) for layer_idx in range(self.start, self.end)])
+            [LlamaDecoderLayer(self.config, layer_idx).to(device=self.device, dtype=self.dtype) for layer_idx in
+             range(self.start, self.end)])
         # 加载权重
         if len(self.shard_weights) != self.end - self.start:
             raise ValueError("String list: shard_weights length must be equal to (end - start)")
@@ -46,25 +47,26 @@ class LlamaShardPart(nn.Module):
 
         # 如果需要最后的归一化层
         if add_final_norm:
-            self.final_norm = LlamaRMSNorm(self.config.hidden_size)
+            self.final_norm = LlamaRMSNorm(self.config.hidden_size).to(device=self.device, dtype=self.dtype)
             # 加载 final norm 权重
             if self.final_norm_weight is None:
                 raise ValueError("final_norm_weight is required when add_final_norm is True")
             norm_state = torch.load(os.path.join(self.shards_path, self.final_norm_weight), map_location=self.device)
             self.final_norm.load_state_dict(norm_state)
 
-    def forward(self, hidden_states, attention_mask=None, past_key_values=None):
+    def forward(self, hidden_states, attention_mask=None, past_key_values=None, rotary_emb= None):
         """
         计算并返回hidden state
         :param hidden_states:
         :param attention_mask:
         :param past_key_values: 传入的KV cache，是一个列表，每个元素为对应层的past_key_value (KV cache)；如果得到的KV cache是所有层的，千万注意记得选取与当前层对应的部分
+        :param rotary_emb: 旋转位置编码（RoPE）
         :return:
         """
         next_past_key_values = []  # 初始化传下去的KV cache列表
         for relative_layer_idx, layer in enumerate(self.layers):  # 千万注意这里是分片后的相对索引
             past_key_value = past_key_values[relative_layer_idx] if past_key_values is not None else None
-            outputs = layer(hidden_states, attention_mask, past_key_value)
+            outputs = layer(hidden_states, attention_mask, past_key_value, position_embeddings=rotary_emb)
             hidden_states = outputs[0]
             if past_key_values is not None:
                 next_past_key_values.append(outputs[1])

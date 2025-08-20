@@ -54,7 +54,7 @@ class LlamaShardPart(nn.Module):
             norm_state = torch.load(os.path.join(self.shards_path, self.final_norm_weight), map_location=self.device)
             self.final_norm.load_state_dict(norm_state)
 
-    def forward(self, hidden_states, attention_mask=None, past_key_values=None, rotary_emb= None):
+    def forward(self, hidden_states, attention_mask=None, past_key_values=None, rotary_emb=None):
         """
         计算并返回hidden state
         :param hidden_states:
@@ -66,10 +66,17 @@ class LlamaShardPart(nn.Module):
         next_past_key_values = []  # 初始化传下去的KV cache列表
         for relative_layer_idx, layer in enumerate(self.layers):  # 千万注意这里是分片后的相对索引
             past_key_value = past_key_values[relative_layer_idx] if past_key_values is not None else None
-            outputs = layer(hidden_states, attention_mask, past_key_value, position_embeddings=rotary_emb)
+            outputs = layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                position_embeddings=rotary_emb,
+                use_cache=True
+            )
             hidden_states = outputs[0]
-            if past_key_values is not None:
-                next_past_key_values.append(outputs[1])
+            new_past = outputs[1]
+            if new_past is not None:
+                next_past_key_values.append(new_past)
         # 如果有最后的归一化层
         if hasattr(self, "final_norm"):
             hidden_states = self.final_norm(hidden_states)
@@ -88,6 +95,12 @@ if __name__ == '__main__':
         final_norm_weight=None
     )
     print(shard_block_0)
+    # print(shard_block_0.layers[0].self_attn.__dict__.keys())
+    # print(shard_block_0.layers[0].self_attn.config)
+    # print(shard_block_0.layers[0].self_attn.layer_idx)
+    # print(shard_block_0.layers[0].self_attn.head_dim)
+    # print(shard_block_0.layers[0].self_attn.scaling)
+    # print(shard_block_0.layers[0].self_attn.attention_dropout)
     # 加载多层
     shard_block_2_4 = LlamaShardPart(
         "../shards/Llama-2-7b-chat-hf",

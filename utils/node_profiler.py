@@ -1,45 +1,35 @@
 import os
 import torch
 from transformers import LlamaConfig, AutoTokenizer
+from transformers.cache_utils import DynamicCache
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 from utils.shard_loader import LlamaShardPart
 
 
-def build_rotary_emb(dim: int, max_position_embeddings: int = 2048, base: int = 10000, device=None, dtype=None):
+def build_position_ids(past_key_value, seq_len, device, batch_size: int = 1):
     """
-    手动构建 LLaMA 用的 rotary embedding (cos/sin 表)
-
-    参数:
-        dim (int): 每个 head 的 hidden dimension (通常是 head_dim)
-        max_position_embeddings (int): 支持的最大序列长度
-        base (int): RoPE 的 base，默认 10000（LLaMA 使用 10000）
-        device: torch.device，默认当前
-        dtype: torch.dtype，默认 torch.get_default_dtype()
-
+    past_key_value:
+      - HF Cache:  可用 past_key_value.get_seq_length()
+      - (k, v)元组: 用 k.shape[-2] 作为已缓存长度 (k: [B, n_kv, past_len, Hd])
+      - None: past_len = 0
     返回:
-        cos, sin: shape = [max_position_embeddings, dim]
+      position_ids: [B, S] LongTensor
     """
-    if device is None:
-        device = torch.device("cpu")
-    if dtype is None:
-        dtype = torch.get_default_dtype()
+    if past_key_value is None:
+        past_len = 0
+    elif hasattr(past_key_value, "get_seq_length"):
+        past_len = int(past_key_value.get_seq_length())
+    elif isinstance(past_key_value, tuple) and len(past_key_value) == 2:
+        k = past_key_value[0]
+        past_len = int(k.shape[-2])
+    else:
+        # 如果你自定义了 cache 结构，这里替换成正确的取法
+        raise ValueError("Unsupported past_key_value structure")
 
-    # rotary 只对偶数维度生效，所以一半用来算频率
-    half_dim = dim // 2
-    # [half_dim]
-    inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, device=device, dtype=dtype) / half_dim))
-
-    # [max_position_embeddings, half_dim]
-    positions = torch.arange(max_position_embeddings, device=device, dtype=dtype)
-    freqs = torch.einsum("i,j->ij", positions, inv_freq)  # outer product
-
-    # [max_position_embeddings, dim]
-    emb = torch.cat([freqs, freqs], dim=-1)
-
-    cos = emb.cos()[None, :, None, :]
-    sin = emb.sin()[None, :, None, :]
-
-    return cos, sin
+    pos = torch.arange(past_len, past_len + seq_len, device=device, dtype=torch.long)  # [S]
+    position_ids = pos.unsqueeze(0).expand(batch_size, -1).contiguous()  # [B, S]
+    return position_ids
 
 
 class NodeProfiler:
@@ -55,6 +45,9 @@ class NodeProfiler:
         self.dtype = dtype
         self.config = LlamaConfig.from_pretrained(self.shards_path_full)
         self.layer_num = self.config.num_hidden_layers
+        # self.num_heads = self.config.num_attention_heads
+        # self.hidden_size = self.config.hidden_size
+        # self.head_dim = self.hidden_size // self.num_heads
 
         self.shards = []  # 保存各层权重
 
@@ -93,27 +86,31 @@ class NodeProfiler:
         embed_tokens.load_state_dict(
             torch.load(os.path.join(self.shards_path_full, "embedding.pth"), map_location=self.device))
 
-        hidden_states = embed_tokens(input_ids)
+        hidden_states = embed_tokens(input_ids)  # [B, S, H]
+        batch_size, seq_len, _ = hidden_states.shape
 
         # 初始化 KV cache
-        past_key_values = [None] * self.layer_num
+        # past_key_values = [None] * self.layer_num
+        past_key_values = [DynamicCache() for _ in range(self.layer_num)]
 
         # 旋转位置编码（RoPE）的 cos/sin 表
-        seq_len = hidden_states.shape[1]
-        # seq_len = 32
-        cos, sin = build_rotary_emb(self.config.hidden_size // self.config.num_attention_heads,
-                                    max_position_embeddings=self.config.max_position_embeddings,
-                                    device=self.device, dtype=self.dtype)
-        cos, sin = cos[:, :seq_len, :, :], sin[:, :seq_len, :, :]
-        print(cos.shape)
-        print(sin.shape)
+        position_ids = build_position_ids(past_key_values[0], seq_len, device=self.device, batch_size=batch_size)
+        rope = LlamaRotaryEmbedding(config=self.config, device=self.device).to(self.device)
+        cos, sin = rope(hidden_states, position_ids)  # [B, S, Hd] each; hidden_states 只是用作参考张量 x
+        # cos = cos[:, :, :seq_len, :].to(device=self.device, dtype=self.dtype)
+        # sin = sin[:, :, :seq_len, :].to(device=self.device, dtype=self.dtype)
+        # print(cos.shape)
+        # print(sin.shape)
 
         # 逐层跑每个 shard
         for i, shard in enumerate(self.shards):
             hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
-            hidden_states, past = shard(hidden_states, attention_mask=inputs["attention_mask"],
-                                        past_key_values=past_key_values[i],
-                                        rotary_emb=(cos, sin))
+            hidden_states, past = shard(
+                hidden_states,
+                # attention_mask=inputs["attention_mask"],
+                past_key_values=past_key_values[i],
+                rotary_emb=(cos, sin)
+            )
             past_key_values[i] = past
 
         # 最后的 norm (此处不需要，因为 LlamaShardPart 的 forward 函数重载中，已经包含 final norm 的检测和执行了)

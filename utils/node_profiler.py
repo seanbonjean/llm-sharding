@@ -76,7 +76,7 @@ class NodeProfiler:
 
         # 分词器
         tokenizer = AutoTokenizer.from_pretrained(self.shards_path_full)
-        input_text = "Hello, this is a test for edge inference on sharded LLaMA."
+        input_text = "An apple is"
         inputs = tokenizer(input_text, return_tensors="pt").to(self.device)
         input_ids = inputs["input_ids"]  # 初始 prompt 张量化后的 token id 序列
 
@@ -91,10 +91,11 @@ class NodeProfiler:
 
         # 初始化 KV cache
         # past_key_values = [None] * self.layer_num
-        past_key_values = [DynamicCache() for _ in range(self.layer_num)]
+        # past_key_values = [DynamicCache() for _ in range(self.layer_num)]
+        past_key_values = DynamicCache()
 
         # 旋转位置编码（RoPE）的 cos/sin 表
-        position_ids = build_position_ids(past_key_values[0], seq_len, device=self.device, batch_size=batch_size)
+        position_ids = build_position_ids(past_key_values, seq_len, device=self.device, batch_size=batch_size)
         rope = LlamaRotaryEmbedding(config=self.config, device=self.device).to(self.device)
         cos, sin = rope(hidden_states, position_ids)  # [B, S, Hd] each; hidden_states 只是用作参考张量 x
         # cos = cos[:, :, :seq_len, :].to(device=self.device, dtype=self.dtype)
@@ -105,13 +106,12 @@ class NodeProfiler:
         # 逐层跑每个 shard
         for i, shard in enumerate(self.shards):
             hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
-            hidden_states, past = shard(
+            hidden_states = shard(
                 hidden_states,
                 # attention_mask=inputs["attention_mask"],
-                past_key_values=past_key_values[i],
+                past_key_values=past_key_values,
                 rotary_emb=(cos, sin)
             )
-            past_key_values[i] = past
 
         # 最后的 norm (此处不需要，因为 LlamaShardPart 的 forward 函数重载中，已经包含 final norm 的检测和执行了)
         # hidden_states = self.shards[-1].norm(hidden_states)

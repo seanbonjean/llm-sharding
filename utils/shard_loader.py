@@ -65,22 +65,18 @@ class LlamaShardPart(nn.Module):
         """
         next_past_key_values = []  # 初始化传下去的KV cache列表
         for relative_layer_idx, layer in enumerate(self.layers):  # 千万注意这里是分片后的相对索引
-            past_key_value = past_key_values[relative_layer_idx] if past_key_values is not None else None
             outputs = layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                past_key_value=past_key_value,
+                past_key_value=past_key_values,
                 position_embeddings=rotary_emb,
                 use_cache=True
             )
             hidden_states = outputs[0]
-            new_past = outputs[1]
-            if new_past is not None:
-                next_past_key_values.append(new_past)
         # 如果有最后的归一化层
         if hasattr(self, "final_norm"):
             hidden_states = self.final_norm(hidden_states)
-        return hidden_states, next_past_key_values if past_key_values is not None else None
+        return hidden_states
 
 
 if __name__ == '__main__':

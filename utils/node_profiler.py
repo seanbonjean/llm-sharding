@@ -106,6 +106,9 @@ class NodeProfiler:
             next_token = tokenizer.decode(next_token_id.item())
             print(repr(next_token), end=" ", flush=True)
 
+            if next_token == tokenizer.eos_token:
+                break
+
             # 更新输入
             hidden_states = embed_tokens(next_token_id.unsqueeze(0))  # [B, 1, H]
             seq_len = 1

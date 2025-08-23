@@ -26,7 +26,7 @@ class NodeProfiler:
 
         self.shards = []  # 保存各层权重
 
-    def go_through_every_shards(self, out_token_num: int = 10):
+    def go_through_every_shards(self, out_token_num: int = 50):
         # 初始化 KV cache
         past_key_values = [DynamicCache() for _ in range(self.layer_num)]
         # 加载分词器
@@ -36,6 +36,8 @@ class NodeProfiler:
             self.config.vocab_size, self.config.hidden_size).to(self.device, dtype=self.dtype)
         embed_tokens.load_state_dict(
             torch.load(os.path.join(self.shards_path, "embedding.pth"), map_location=self.device))
+        # 加载旋转位置编码（RoPE）
+        rope = LlamaRotaryEmbedding(config=self.config, device=self.device).to(self.device)
         # 加载所有分片
         self.shards = [LlamaShardPart(
             self.shards_path,
@@ -55,7 +57,7 @@ class NodeProfiler:
             add_final_norm=True,
             final_norm_weight="final_norm.pth"
         ))
-        # 所有分片转换到 eval模式
+        # 所有分片转换到 eval模式（关闭dropout）
         for shard in self.shards:
             shard.eval()
         # 加载 lm_head
@@ -65,41 +67,53 @@ class NodeProfiler:
             torch.load(os.path.join(self.shards_path, "lm_head.pth"), map_location=self.device))
 
         # 分词器
-        input_text = "An apple is"
+        input_text = "Write a poem about the blue sky."
         print("input: " + input_text)
         inputs = tokenizer(input_text, return_tensors="pt").to(self.device)
         input_ids = inputs["input_ids"]  # 初始 prompt 张量化后的 token id 序列
+        generated_ids = [input_ids]  # 存储所有 input 和 output 的 token id 序列
 
         # 经过嵌入层
         hidden_states = embed_tokens(input_ids)  # [B, S, H]
         batch_size, seq_len, _ = hidden_states.shape
 
-        # 旋转位置编码（RoPE）获取 cos/sin 表
-        position_ids = build_position_ids(past_key_values[0], seq_len, device=self.device, batch_size=batch_size)
-        rope = LlamaRotaryEmbedding(config=self.config, device=self.device).to(self.device)
-        cos, sin = rope(hidden_states, position_ids)  # [B, S, Hd] each; hidden_states 只是用作参考张量 x
+        for i in range(out_token_num):
+            # 旋转位置编码（RoPE）获取 cos/sin 表
+            position_ids = build_position_ids(past_key_values[0], seq_len, device=self.device, batch_size=batch_size)
+            cos, sin = rope(hidden_states, position_ids)  # [B, S, Hd] each; hidden_states 只是用作参考张量 x
 
-        # 逐层跑每个 shard
-        for i, shard in enumerate(self.shards):
-            hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
-            hidden_states = shard(
-                hidden_states,
-                # attention_mask=inputs["attention_mask"],
-                past_key_value=past_key_values[i],
-                rotary_emb=(cos, sin)
-            )
+            # 逐层跑每个 shard
+            for i, shard in enumerate(self.shards):
+                hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
+                hidden_states = shard(
+                    hidden_states,
+                    # attention_mask=inputs["attention_mask"],
+                    past_key_value=past_key_values[i],
+                    rotary_emb=(cos, sin)
+                )
 
-        # 最后的 norm (此处不需要，因为 LlamaShardPart 的 forward 函数重载中，已经包含 final norm 的检测和执行了)
-        # hidden_states = self.shards[-1].norm(hidden_states)
+            # 最后的 norm (此处不需要，因为 LlamaShardPart 的 forward 函数重载中，已经包含 final norm 的检测和执行了)
+            # hidden_states = self.shards[-1].norm(hidden_states)
 
-        # lm_head 输出 logits
-        logits = lm_head(hidden_states)  # [batch, seq_len, vocab_size]
-        # 取最后一个位置的预测 token
-        next_token_id = torch.argmax(logits[:, -1, :], dim=-1)  # [1]
-        # 拼接到已有序列
-        input_ids = torch.cat([input_ids, next_token_id.unsqueeze(-1)], dim=-1)
-        # 解码
-        print(tokenizer.decode(next_token_id.item()))
+            # lm_head 输出 logits
+            logits = lm_head(hidden_states)  # [batch, seq_len, vocab_size]
+            # 取最后一个位置的预测 token
+            next_token_id = torch.argmax(logits[:, -1, :], dim=-1)  # [1]
+            # 拼接到已有序列 (不用拼回去，因为此时已经传递到远离用户侧了，只需返回当前的预测 token)
+            # input_ids = torch.cat([input_ids, next_token_id.unsqueeze(-1)], dim=-1)
+            generated_ids.append(next_token_id.unsqueeze(-1))
+            # 解码
+            next_token = tokenizer.decode(next_token_id.item())
+            print(repr(next_token), end=" ", flush=True)
+
+            # 更新输入
+            hidden_states = embed_tokens(next_token_id.unsqueeze(0))  # [B, 1, H]
+            seq_len = 1
+
+        print()
+        # === 解码最终结果 ===
+        final_ids = torch.cat(generated_ids, dim=-1)  # [B, seq_len + out_token_num]
+        print("output: ", tokenizer.decode(final_ids[0]))
 
 
 if __name__ == "__main__":

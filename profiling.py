@@ -1,11 +1,9 @@
-from utils.profiler import LLMProfiler
+from utils.node_profiler import NodeProfiler
 import torch
 
-profiler = LLMProfiler(
-    model_path="weights/Llama-2-7b-chat-hf",
-    device="cpu",
-    dtype=torch.float32,
-    shard_size=2,
-    autoreg_steps=3
+profiler = NodeProfiler(
+    "C:/Users/sean-/Desktop/shards/Llama-2-7b-chat-hf_float32",  # C盘是SSD更快一些
+    device="cuda:0",
+    dtype=torch.float32
 )
-profiler.profile()
+profiler.go_through_every_shards(out_token_num=80)

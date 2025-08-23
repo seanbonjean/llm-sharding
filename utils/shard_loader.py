@@ -14,7 +14,7 @@ class LlamaShardPart(nn.Module):
                  device="cpu", dtype=torch.float32,
                  add_final_norm=False, final_norm_weight=None):
         """
-        :param shards_path: 所有切片的保存位置（不用带dtype，会自动补充）
+        :param shards_path: 所有切片的保存位置
         :param shard_weights: 想要加载的切片权重文件（列表）
         :param start: 只是起到注解作用，调试时看
         :param end: 不包括end，用处同上
@@ -24,7 +24,7 @@ class LlamaShardPart(nn.Module):
         :param final_norm_weight: 归一化层权重文件
         """
         super().__init__()
-        self.shards_path = shards_path + "_" + str(dtype).split(".")[-1]
+        self.shards_path = shards_path
         self.shard_weights = shard_weights
         self.start = start
         self.end = end
@@ -81,7 +81,7 @@ class LlamaShardPart(nn.Module):
 if __name__ == '__main__':
     # 加载一层
     shard_block_0 = LlamaShardPart(
-        "../shards/Llama-2-7b-chat-hf",
+        "../shards/Llama-2-7b-chat-hf_float16",
         ["block_0.pth"],
         0, 1,
         device="cpu",
@@ -98,7 +98,7 @@ if __name__ == '__main__':
     # print(shard_block_0.layers[0].self_attn.attention_dropout)
     # 加载多层
     shard_block_2_4 = LlamaShardPart(
-        "../shards/Llama-2-7b-chat-hf",
+        "../shards/Llama-2-7b-chat-hf_float16",
         ["block_2.pth", "block_3.pth", "block_4.pth"],
         2, 5,  # 不包括end
         device="cpu",
@@ -109,7 +109,7 @@ if __name__ == '__main__':
     print(shard_block_2_4)
     # 加载最后一层
     shard_block_31 = LlamaShardPart(
-        "../shards/Llama-2-7b-chat-hf",
+        "../shards/Llama-2-7b-chat-hf_float16",
         ["block_31.pth"],
         31, 32,
         device="cpu",

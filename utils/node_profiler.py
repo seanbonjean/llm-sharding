@@ -71,12 +71,14 @@ class NodeProfiler:
             add_final_norm=True,
             final_norm_weight="final_norm.pth"
         ))
+        # 转换到 eval模式
         for shard in self.shards:
             shard.eval()
 
         # 分词器
         tokenizer = AutoTokenizer.from_pretrained(self.shards_path_full)
         input_text = "An apple is"
+        print("input: " + input_text)
         inputs = tokenizer(input_text, return_tensors="pt").to(self.device)
         input_ids = inputs["input_ids"]  # 初始 prompt 张量化后的 token id 序列
 
@@ -91,11 +93,11 @@ class NodeProfiler:
 
         # 初始化 KV cache
         # past_key_values = [None] * self.layer_num
-        # past_key_values = [DynamicCache() for _ in range(self.layer_num)]
-        past_key_values = DynamicCache()
+        # past_key_values = DynamicCache()
+        past_key_values = [DynamicCache() for _ in range(self.layer_num)]
 
         # 旋转位置编码（RoPE）的 cos/sin 表
-        position_ids = build_position_ids(past_key_values, seq_len, device=self.device, batch_size=batch_size)
+        position_ids = build_position_ids(past_key_values[0], seq_len, device=self.device, batch_size=batch_size)
         rope = LlamaRotaryEmbedding(config=self.config, device=self.device).to(self.device)
         cos, sin = rope(hidden_states, position_ids)  # [B, S, Hd] each; hidden_states 只是用作参考张量 x
         # cos = cos[:, :, :seq_len, :].to(device=self.device, dtype=self.dtype)
@@ -109,7 +111,7 @@ class NodeProfiler:
             hidden_states = shard(
                 hidden_states,
                 # attention_mask=inputs["attention_mask"],
-                past_key_values=past_key_values,
+                past_key_value=past_key_values[i],
                 rotary_emb=(cos, sin)
             )
 

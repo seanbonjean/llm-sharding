@@ -4,6 +4,7 @@ from transformers import LlamaConfig, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
+from utils.node_worker import NodeWorker
 from utils.shard_loader import LlamaShardPart
 from utils.forwarding_utils import build_position_ids
 
@@ -26,7 +27,51 @@ class NodeProfiler:
 
         self.shards = []  # 保存各层权重
 
+    # TODO 建新方法来做真正的 profile
     def go_through_every_shards(self, out_token_num: int = 50):
+        node0 = NodeWorker(
+            can_receive_user_request=True,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        node1 = NodeWorker(
+            can_receive_user_request=False,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        node2 = NodeWorker(
+            can_receive_user_request=False,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        node3 = NodeWorker(
+            can_receive_user_request=False,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        node0.load_shards(0, 10)
+        node1.load_shards(10, 20)
+        node2.load_shards(20, 30)
+        node3.load_shards(30, 32)
+
+        data = node0.receive_user_request(request="Write a poem about the blue sky.")
+        for i in range(out_token_num):
+            data = node0.pass_through_shard(data)
+            data = node1.pass_through_shard(data)
+            data = node2.pass_through_shard(data)
+            data = node3.pass_through_shard(data)
+            reached_eos, data = node0.receive_next_token(data)
+            if reached_eos:
+                break
+
+    def go_through_every_shards_only_by_profiler(self, out_token_num: int = 50):
+        """
+        只通过 node profiler 实现，不实例化 node worker
+        """
         # 初始化 KV cache
         past_key_values = [DynamicCache() for _ in range(self.layer_num)]
         # 加载分词器

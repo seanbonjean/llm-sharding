@@ -115,7 +115,7 @@ class ModelSharder:
             torch.cuda.empty_cache()
             print("Sharding complete.")
         else:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
+            raise ValueError(f"[ERROR] Unsupported model type: {self.model_type}")
 
 
 if __name__ == "__main__":

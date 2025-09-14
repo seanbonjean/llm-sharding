@@ -19,7 +19,7 @@ def build_position_ids(past_key_value, seq_len, device, batch_size: int = 1):
         past_len = int(k.shape[-2])
     else:
         # 如果你自定义了 cache 结构，这里替换成正确的取法
-        raise ValueError("Unsupported past_key_value structure")
+        raise ValueError("[ERROR] Unsupported past_key_value structure")
 
     pos = torch.arange(past_len, past_len + seq_len, device=device, dtype=torch.long)  # [S]
     position_ids = pos.unsqueeze(0).expand(batch_size, -1).contiguous()  # [B, S]

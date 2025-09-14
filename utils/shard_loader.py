@@ -16,7 +16,7 @@ class LlamaShardPart(nn.Module):
         """
         :param shards_path: 所有切片的保存位置
         :param shard_weights: 想要加载的切片权重文件（列表）
-        :param start: 只是起到注解作用，调试时看
+        :param start: 由于shard_weights中已经间接指定了个数，对该变量的使用只有一个层数的断言判断；同时也起到注解作用，方便调试时看
         :param end: 不包括end，用处同上
         :param device: "cpu" 或 "cuda:0" 等
         :param dtype: torch.float32 / torch.float16 等
@@ -38,7 +38,7 @@ class LlamaShardPart(nn.Module):
              range(self.end - self.start)])  # 千万注意这里是分片后的相对索引
         # 加载权重
         if len(self.shard_weights) != self.end - self.start:
-            raise ValueError("String list: shard_weights length must be equal to (end - start)")
+            raise ValueError("[ERROR] String list: shard_weights length must be equal to (end - start)")
         for relative_layer_idx, layer in enumerate(self.layers):
             state = torch.load(os.path.join(self.shards_path, self.shard_weights[relative_layer_idx]),
                                map_location=self.device)
@@ -50,7 +50,7 @@ class LlamaShardPart(nn.Module):
             self.final_norm = LlamaRMSNorm(self.config.hidden_size).to(device=self.device, dtype=self.dtype)
             # 加载 final norm 权重
             if self.final_norm_weight is None:
-                raise ValueError("final_norm_weight is required when add_final_norm is True")
+                raise ValueError("[ERROR] final_norm_weight is required when add_final_norm is True")
             norm_state = torch.load(os.path.join(self.shards_path, self.final_norm_weight), map_location=self.device)
             self.final_norm.load_state_dict(norm_state)
 

@@ -28,6 +28,21 @@ class NodeProfiler:
         self.shards = []  # 保存各层权重
 
     # TODO 建新方法来做真正的 profile
+    def profiling(self):
+        node_worker = NodeWorker(
+            can_receive_user_request=True,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        max_layer_num = 0  # 节点能放下的最大层数（包含embedding的情况下）
+        try:
+            for i in range(self.layer_num):
+                node_worker.load_shards(0, i + 1)
+                max_layer_num = i + 1
+        except torch.cuda.OutOfMemoryError:
+            print(f"[INFO] max layer num: {max_layer_num}")
+
     def go_through_every_shards(self, out_token_num: int = 50):
         node0 = NodeWorker(
             can_receive_user_request=True,

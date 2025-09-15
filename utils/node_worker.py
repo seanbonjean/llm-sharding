@@ -72,6 +72,16 @@ class NodeWorker:
         self.start = start
         self.end = end
 
+        try:
+            del self.rope
+            del self.shard
+            del self.lm_head
+        except AttributeError:
+            pass
+        gc.collect()  # 强制 Python 做一次垃圾回收
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()  # 清空 CUDA 缓存池，让 nvidia-smi 立刻下降
+
         if self.start == 0:
             # 加载旋转位置编码（RoPE）
             print("[INFO] loading RoPE...")
@@ -102,9 +112,6 @@ class NodeWorker:
             add_final_norm=add_final_norm,
             final_norm_weight=final_norm_weight
         )
-        gc.collect()  # 强制 Python 做一次垃圾回收
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()  # 清空 CUDA 缓存池，让 nvidia-smi 立刻下降
         self.shard.eval()
         print(f"[INFO] hidden layer {start}~{end}(end excluded) loaded.")
 

@@ -5,6 +5,6 @@ torchaudio==2.7.1+cu128
 --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Hugging Face Transformers 和相关工具
-transformers
+transformers==4.53.2
 accelerate
 sentencepiece

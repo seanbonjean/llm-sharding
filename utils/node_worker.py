@@ -10,6 +10,7 @@ from utils.forwarding_utils import build_position_ids
 
 
 def transfer_data(data: torch.Tensor | dict, save_path="results/data.pt") -> str:
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)  # 确保父目录存在
     torch.save(data, save_path)
     return save_path
 

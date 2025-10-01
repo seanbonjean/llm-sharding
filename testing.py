@@ -25,3 +25,7 @@ node_worker = NodeWorker(
 node_worker.load_shards(1, 2)
 data = receive_data("results/data.pt")
 data = node_worker.pass_through_shard(data)
+
+# transfer_data(data, save_path="results/data.pt")
+
+reached_eos, data = node_worker.receive_next_token(data)

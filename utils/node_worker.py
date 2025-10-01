@@ -9,6 +9,16 @@ from utils.shard_loader import LlamaShardPart
 from utils.forwarding_utils import build_position_ids
 
 
+def transfer_data(data: torch.Tensor | dict, save_path="results/data.pt") -> str:
+    torch.save(data, save_path)
+    return save_path
+
+
+def receive_data(data_path: str) -> torch.Tensor | dict:
+    data = torch.load(data_path)
+    return data
+
+
 class NodeWorker:
     # 每个 node 上运行的 client
     def __init__(self, can_receive_user_request: bool, shards_path: str, device="cpu", dtype=torch.float16):

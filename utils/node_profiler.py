@@ -88,20 +88,20 @@ class NodeProfiler:
             data1 = node0.pass_through_shard(data0)
             node0.communicator.transfer_data(data1)
 
-            data1 = node1.communicator.receive_data()
-            data2 = node1.pass_through_shard(data1)
+            data1_recv = node1.communicator.receive_data()
+            data2 = node1.pass_through_shard(data1_recv)
             node1.communicator.transfer_data(data2)
 
-            data2 = node2.communicator.receive_data()
-            data3 = node2.pass_through_shard(data2)
+            data2_recv = node2.communicator.receive_data()
+            data3 = node2.pass_through_shard(data2_recv)
             node2.communicator.transfer_data(data3)
 
-            data3 = node3.communicator.receive_data()
-            data4 = node3.pass_through_shard(data3)
+            data3_recv = node3.communicator.receive_data()
+            data4 = node3.pass_through_shard(data3_recv)
             node3.communicator.transfer_data(data4)
 
-            data4 = node0.communicator.receive_data()
-            reached_eos, data0 = node0.receive_next_token(data4)
+            data4_recv = node0.communicator.receive_data()
+            reached_eos, data0 = node0.receive_next_token(data4_recv)
             if reached_eos:
                 break
 

@@ -30,6 +30,8 @@ class NodeProfiler:
     # TODO 建新方法来做真正的 profile
     def profiling(self):
         node_worker = NodeWorker(
+            src_addr="tcp://127.0.0.1:40800",
+            dst_addr="tcp://127.0.0.1:40801",
             can_receive_user_request=True,
             shards_path=self.shards_path,
             device=self.device,
@@ -45,24 +47,32 @@ class NodeProfiler:
 
     def go_through_every_shards(self, out_token_num: int = 50):
         node0 = NodeWorker(
+            src_addr="tcp://127.0.0.1:40800",
+            dst_addr="tcp://127.0.0.1:40801",
             can_receive_user_request=True,
             shards_path=self.shards_path,
             device=self.device,
             dtype=self.dtype
         )
         node1 = NodeWorker(
+            src_addr="tcp://127.0.0.1:40801",
+            dst_addr="tcp://127.0.0.1:40802",
             can_receive_user_request=False,
             shards_path=self.shards_path,
             device=self.device,
             dtype=self.dtype
         )
         node2 = NodeWorker(
+            src_addr="tcp://127.0.0.1:40802",
+            dst_addr="tcp://127.0.0.1:40803",
             can_receive_user_request=False,
             shards_path=self.shards_path,
             device=self.device,
             dtype=self.dtype
         )
         node3 = NodeWorker(
+            src_addr="tcp://127.0.0.1:40803",
+            dst_addr="tcp://127.0.0.1:40800",
             can_receive_user_request=False,
             shards_path=self.shards_path,
             device=self.device,
@@ -73,13 +83,25 @@ class NodeProfiler:
         node2.load_shards(20, 30)
         node3.load_shards(30, 32)
 
-        data = node0.receive_user_request(request="Write a poem about the blue sky.")
+        data0 = node0.receive_user_request(request="Write a poem about the blue sky.")
         for i in range(out_token_num):
-            data = node0.pass_through_shard(data)
-            data = node1.pass_through_shard(data)
-            data = node2.pass_through_shard(data)
-            data = node3.pass_through_shard(data)
-            reached_eos, data = node0.receive_next_token(data)
+            data1 = node0.pass_through_shard(data0)
+            node0.communicator.transfer_data(data1)
+
+            data1 = node1.communicator.receive_data()
+            data2 = node1.pass_through_shard(data1)
+            node1.communicator.transfer_data(data2)
+
+            data2 = node2.communicator.receive_data()
+            data3 = node2.pass_through_shard(data2)
+            node2.communicator.transfer_data(data3)
+
+            data3 = node3.communicator.receive_data()
+            data4 = node3.pass_through_shard(data3)
+            node3.communicator.transfer_data(data4)
+
+            data4 = node0.communicator.receive_data()
+            reached_eos, data0 = node0.receive_next_token(data4)
             if reached_eos:
                 break
 

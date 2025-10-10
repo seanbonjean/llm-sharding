@@ -8,3 +8,7 @@ torchaudio==2.7.1+cu128
 transformers==4.53.2
 accelerate
 sentencepiece
+
+# 通信相关
+zmq
+pyzmq

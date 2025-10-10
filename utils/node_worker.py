@@ -1,5 +1,6 @@
 import os
 import gc
+import zmq
 import torch
 from transformers import LlamaConfig, AutoTokenizer
 from transformers.cache_utils import DynamicCache
@@ -9,26 +10,66 @@ from utils.shard_loader import LlamaShardPart
 from utils.forwarding_utils import build_position_ids
 
 
-def transfer_data(data: torch.Tensor | dict, save_path="results/data.pt") -> str:
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)  # 确保父目录存在
-    torch.save(data, save_path)
-    return save_path
+class Communicator:
+    def __init__(self, src_addr: str, dst_addr: str):
+        """
+        :param src_addr: 从该地址接收 隐藏层 / next token id 的数据
+        :param dst_addr: 向该地址发送 隐藏层 / next token id 的数据
+        """
+        self.src_addr = src_addr
+        recv_context = zmq.Context()
+        self.recv_socket = recv_context.socket(zmq.PULL)
+        self.recv_socket.bind(self.src_addr)
 
+        self.dst_addr = dst_addr
+        send_context = zmq.Context()
+        self.send_socket = send_context.socket(zmq.PUSH)
+        self.send_socket.connect(self.dst_addr)
 
-def receive_data(data_path: str) -> torch.Tensor | dict:
-    data = torch.load(data_path)
-    return data
+    def change_src_addr(self, src_addr: str) -> str:
+        self.src_addr = src_addr
+        self.recv_socket.unbind(self.src_addr)
+        self.recv_socket.bind(self.src_addr)
+        return self.src_addr
+
+    def change_dst_addr(self, dst_addr: str) -> str:
+        self.dst_addr = dst_addr
+        self.send_socket.disconnect(self.dst_addr)
+        self.send_socket.connect(self.dst_addr)
+        return self.dst_addr
+
+    def transfer_data(self, data: torch.Tensor | dict,
+                      data_path="results/send_data.pt", keep_data=False) -> None | str:
+        os.makedirs(os.path.dirname(data_path), exist_ok=True)  # 确保父目录存在
+        torch.save(data, data_path)
+        with open(data_path, "rb") as f:
+            self.send_socket.send(f.read())
+        if not keep_data:
+            os.remove(data_path)
+            return None
+        return data_path
+
+    def receive_data(self, data_path="results/recv_data.pt", keep_data=False) -> torch.Tensor | dict:
+        received_data = self.recv_socket.recv()
+        with open(data_path, "wb") as f:
+            f.write(received_data)
+        data = torch.load(data_path)
+        if not keep_data:
+            os.remove(data_path)
+        return data
 
 
 class NodeWorker:
     # 每个 node 上运行的 client
-    def __init__(self, can_receive_user_request: bool, shards_path: str, device="cpu", dtype=torch.float16):
+    def __init__(self, src_addr: str, dst_addr: str,
+                 can_receive_user_request: bool, shards_path: str, device="cpu", dtype=torch.float16):
         """
         :param can_receive_user_request: 是否接收用户请求（关系到是否加载分词器、嵌入层）
         :param shards_path: 切片路径
         :param device: "cpu" 或 "cuda:0" 等
         :param dtype: torch.float32 / torch.float16 等
         """
+        self.communicator = Communicator(src_addr=src_addr, dst_addr=dst_addr)
         self.can_receive_user_request = can_receive_user_request
         self.shards_path = shards_path
         self.device = torch.device(device)
@@ -54,7 +95,7 @@ class NodeWorker:
             self.generated_ids = []
             self._load_embedding()
 
-    def _load_embedding(self):
+    def _load_embedding(self) -> None:
         """
         加载嵌入层
         :return: None
@@ -71,7 +112,7 @@ class NodeWorker:
             torch.load(os.path.join(self.shards_path, "embedding.pth"), map_location=self.device))
         print("[INFO] embedding layer loaded.")
 
-    def load_shards(self, start: int, end: int):
+    def load_shards(self, start: int, end: int) -> None:
         """
         加载切片并删除旧切片（如有），从start到end（不包括end）
         :param start:

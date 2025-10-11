@@ -30,7 +30,7 @@ class NodeProfiler:
     # TODO 建新方法来做真正的 profile
     def profiling(self):
         node_worker = NodeWorker(
-            src_addr="tcp://127.0.0.1:40800",
+            src_addr="tcp://*:40800",
             dst_addr="tcp://127.0.0.1:40801",
             can_receive_user_request=True,
             shards_path=self.shards_path,
@@ -47,7 +47,7 @@ class NodeProfiler:
 
     def go_through_every_shards(self, out_token_num: int = 50):
         node0 = NodeWorker(
-            src_addr="tcp://127.0.0.1:40800",
+            src_addr="tcp://*:40800",
             dst_addr="tcp://127.0.0.1:40801",
             can_receive_user_request=True,
             shards_path=self.shards_path,
@@ -55,7 +55,7 @@ class NodeProfiler:
             dtype=self.dtype
         )
         node1 = NodeWorker(
-            src_addr="tcp://127.0.0.1:40801",
+            src_addr="tcp://*:40801",
             dst_addr="tcp://127.0.0.1:40802",
             can_receive_user_request=False,
             shards_path=self.shards_path,
@@ -63,7 +63,7 @@ class NodeProfiler:
             dtype=self.dtype
         )
         node2 = NodeWorker(
-            src_addr="tcp://127.0.0.1:40802",
+            src_addr="tcp://*:40802",
             dst_addr="tcp://127.0.0.1:40803",
             can_receive_user_request=False,
             shards_path=self.shards_path,
@@ -71,7 +71,7 @@ class NodeProfiler:
             dtype=self.dtype
         )
         node3 = NodeWorker(
-            src_addr="tcp://127.0.0.1:40803",
+            src_addr="tcp://*:40803",
             dst_addr="tcp://127.0.0.1:40800",
             can_receive_user_request=False,
             shards_path=self.shards_path,

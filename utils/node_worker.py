@@ -13,8 +13,8 @@ from utils.forwarding_utils import build_position_ids
 class Communicator:
     def __init__(self, src_addr: str, dst_addr: str):
         """
-        :param src_addr: 从该地址接收 隐藏层 / next token id 的数据
-        :param dst_addr: 向该地址发送 隐藏层 / next token id 的数据
+        :param src_addr: 从该地址接收 隐藏层 / next token id 的数据（使用 socket.bind，应为本机地址，如 tcp://*:port 或指定一个本机ip）
+        :param dst_addr: 向该地址发送 隐藏层 / next token id 的数据（使用 socket.connect，应为对方地址）
         """
         self.src_addr = src_addr
         recv_context = zmq.Context()
@@ -26,20 +26,21 @@ class Communicator:
         self.send_socket = send_context.socket(zmq.PUSH)
         self.send_socket.connect(self.dst_addr)
 
-    def change_src_addr(self, src_addr: str) -> str:
-        self.src_addr = src_addr
+    def change_src_addr(self, new_src_addr: str) -> str:
         self.recv_socket.unbind(self.src_addr)
-        self.recv_socket.bind(self.src_addr)
+        self.recv_socket.bind(new_src_addr)
+        self.src_addr = new_src_addr
         return self.src_addr
 
-    def change_dst_addr(self, dst_addr: str) -> str:
-        self.dst_addr = dst_addr
+    def change_dst_addr(self, new_dst_addr: str) -> str:
         self.send_socket.disconnect(self.dst_addr)
-        self.send_socket.connect(self.dst_addr)
+        self.send_socket.connect(new_dst_addr)
+        self.dst_addr = new_dst_addr
         return self.dst_addr
 
     def transfer_data(self, data: torch.Tensor | dict,
-                      data_path="results/send_data.pt", keep_data=False) -> None | str:
+                      data_path: str = "results/send_data.pt", keep_data: bool = False) -> None | str:
+        # ! 若此处有修改，请一并修改 NodeController 类中的 _forward_request 方法
         os.makedirs(os.path.dirname(data_path), exist_ok=True)  # 确保父目录存在
         torch.save(data, data_path)
         with open(data_path, "rb") as f:
@@ -49,8 +50,12 @@ class Communicator:
             return None
         return data_path
 
-    def receive_data(self, data_path="results/recv_data.pt", keep_data=False) -> torch.Tensor | dict:
-        received_data = self.recv_socket.recv()
+    def receive_data(self, no_block: bool = False,
+                     data_path: str = "results/recv_data.pt", keep_data: bool = False) -> torch.Tensor | dict:
+        if no_block:
+            received_data = self.recv_socket.recv(flags=zmq.NOBLOCK)
+        else:
+            received_data = self.recv_socket.recv()
         with open(data_path, "wb") as f:
             f.write(received_data)
         data = torch.load(data_path)
@@ -172,7 +177,7 @@ class NodeWorker:
         self.past_key_value = DynamicCache()
         print("[INFO] KV cache loaded.")
 
-    def receive_user_request(self, request="Write a poem about the blue sky.") -> dict:
+    def receive_user_request(self, request: str = "Write a poem about the blue sky.") -> dict:
         """
         接收用户请求
         :return: input_token_info: dict，包含隐藏层参数和用于 RoPE 的 batch_size & seq_len
@@ -271,3 +276,161 @@ class NodeWorker:
                 "seq_len": seq_len,
             }
             return reached_eos, input_token_info
+
+
+class NodeController:
+    """
+    节点控制器，根据主控节点 master node 发送的配置文件自动运行 NodeWorker
+    """
+
+    def __init__(self, shards_path: str, device: str, dtype: torch.dtype,
+                 listen_port: int = 40700):
+        self.shards_path = shards_path
+        self.device = device
+        self.dtype = dtype
+
+        # 初始化接收配置文件的 socket 以接收主控节点的配置文件
+        self.listen_addr = "tcp://*:" + str(listen_port)
+        recv_config_context = zmq.Context()
+        self.recv_config_socket = recv_config_context.socket(zmq.PULL)
+        self.recv_config_socket.bind(self.listen_addr)
+
+        # 接收配置文件
+        self.received_config = self._receive_config()
+
+        # 若 can_receive_user_request=True，则需要向 first_node_addr 发送 “经过嵌入层处理后的”用户请求（从而保护用户隐私）
+        if self.received_config["can_receive_user_request"]:
+            self.first_node_addr = self.received_config["first_node_addr"]
+            send_request_context = zmq.Context()
+            self.send_request_socket = send_request_context.socket(zmq.PUSH)
+            self.send_request_socket.connect(self.first_node_addr)
+
+        # 创建节点实例并加载分片
+        self.node_worker = NodeWorker(
+            src_addr=self.received_config["src_addr"],
+            dst_addr=self.received_config["dst_addr"],
+            can_receive_user_request=self.received_config["can_receive_user_request"],
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        self.node_worker.load_shards(self.received_config["shards_start"], self.received_config["shards_end"])
+        print("[INFO] Node is ready.")
+
+    def _receive_config(self, no_block: bool = False) -> dict:
+        print("[CONFIG] Waiting for configuration file from master node...")
+        if no_block:
+            received_config = self.recv_config_socket.recv_json(flags=zmq.NOBLOCK)
+        else:
+            received_config = self.recv_config_socket.recv_json()
+        print("[CONFIG] Received configuration file from master node:")
+        for k, v in received_config.items():
+            print(f"  - {k}: {v}")
+        return received_config
+
+    def _change_first_node_addr(self, new_first_node_addr: str) -> str:
+        self.send_request_socket.disconnect(self.first_node_addr)
+        self.send_request_socket.connect(new_first_node_addr)
+        self.first_node_addr = new_first_node_addr
+        return self.first_node_addr
+
+    def check_new_config(self) -> None:
+        """
+        更改配置文件，并重新加载分片
+        """
+        # 接收配置文件
+        new_config = self._receive_config(no_block=True)
+        # 如果 can_receive_user_request 被更改，只能重新创建节点实例
+        if new_config["can_receive_user_request"] != self.received_config["can_receive_user_request"]:
+            del self.node_worker
+            # 创建节点实例并加载分片
+            self.node_worker = NodeWorker(
+                src_addr=new_config["src_addr"],
+                dst_addr=new_config["dst_addr"],
+                can_receive_user_request=new_config["can_receive_user_request"],
+                shards_path=self.shards_path,
+                device=self.device,
+                dtype=self.dtype
+            )
+            self.node_worker.load_shards(new_config["shards_start"], new_config["shards_end"])
+        else:
+            # 无需重新创建节点实例，调用方法更改配置即可
+            self.node_worker.communicator.change_src_addr(new_config["src_addr"])
+            self.node_worker.communicator.change_dst_addr(new_config["dst_addr"])
+            self._change_first_node_addr(new_config["first_node_addr"])
+            self.node_worker.load_shards(new_config["shards_start"], new_config["shards_end"])
+        self.received_config = new_config
+        print("[INFO] The new configuration node is ready.")
+
+    def _forward_request(self, data: dict,
+                         data_path: str = "results/send_request.pt", keep_data: bool = False) -> None | str:
+        os.makedirs(os.path.dirname(data_path), exist_ok=True)  # 确保父目录存在
+        torch.save(data, data_path)
+        with open(data_path, "rb") as f:
+            self.send_request_socket.send(f.read())
+        if not keep_data:
+            os.remove(data_path)
+            return None
+        return data_path
+
+    def receive_request(self, request: str = "Write a poem about the blue sky.") -> None:
+        if not self.node_worker.can_receive_user_request:
+            raise RuntimeError("[ERROR] this node cannot receive user request.")
+        token_info = self.node_worker.receive_user_request(request)
+        self._forward_request(token_info)
+
+    def run_worker_loop(self) -> None:
+        """
+        常驻监听有无传入数据待处理，若无则检查是否有新请求进入
+        """
+        skip_this_transfer = False  # 用于在得到 <EOS> 后，通过不继续传递 state 的方式来结束该推理任务
+
+        # TODO 临时实现仅发送一次请求
+        # request_not_send = True
+        request_not_send = False
+
+        while True:
+            try:
+                # 监听有无传入数据待处理
+                received_data = self.node_worker.communicator.receive_data(no_block=True)
+                # 若为从模型链末尾传回的 next_token_id
+                if type(received_data) == torch.Tensor:
+                    if self.node_worker.start != 0:
+                        raise RuntimeError(
+                            "[ERROR] I'm not the first node in the model chain, but received \"next_token_id\".")
+                    # 需要先解码并输出 token，然后产生下一个 state
+                    reached_eos, received_data = self.node_worker.receive_next_token(received_data)
+                    if reached_eos:
+                        skip_this_transfer = True
+                elif hasattr(received_data, "batch_size") and hasattr(received_data, "seq_len"):
+                    if self.node_worker.start != 0:
+                        raise RuntimeError(
+                            "[ERROR] I'm not the first node in the model chain, but received \"input_token_info\".")
+                elif hasattr(received_data, "cos") and hasattr(received_data, "sin"):
+                    if self.node_worker.start == 0:
+                        raise RuntimeError(
+                            "[ERROR] I'm the first node in the model chain, but received \"next_state_info\".")
+                else:
+                    attrs = [a for a in dir(received_data) if
+                             not a.startswith("__")]  # 报错时，同时打印对象的属性，并过滤掉 __xxx__ 这种内置属性
+                    raise RuntimeError(
+                        f"[ERROR] Received unknown data type: {type(received_data)}; "
+                        f"Attributes: {attrs if attrs else 'No attributes found'}"
+                    )
+                processed_data = self.node_worker.pass_through_shard(received_data)
+                if not skip_this_transfer:
+                    self.node_worker.communicator.transfer_data(processed_data)
+                else:
+                    skip_this_transfer = False
+            # 若无传入数据，则静默失败
+            except zmq.Again:
+                pass
+
+            # 检查是否有新请求进入
+            # TODO 替换为实际的用户请求仿真
+            if request_not_send:
+                self.receive_request()
+                request_not_send = False
+
+            # 检查是否有新的配置文件
+            self.check_new_config()

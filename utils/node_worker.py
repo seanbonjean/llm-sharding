@@ -20,6 +20,7 @@ class Communicator:
         recv_context = zmq.Context()
         self.recv_socket = recv_context.socket(zmq.PULL)
         self.recv_socket.bind(self.src_addr)
+        self.actual_src_addr = self.recv_socket.getsockopt_string(zmq.LAST_ENDPOINT)
 
         self.dst_addr = dst_addr
         send_context = zmq.Context()
@@ -27,7 +28,7 @@ class Communicator:
         self.send_socket.connect(self.dst_addr)
 
     def change_src_addr(self, new_src_addr: str) -> str:
-        self.recv_socket.unbind(self.src_addr)
+        self.recv_socket.unbind(self.actual_src_addr)
         self.recv_socket.bind(new_src_addr)
         self.src_addr = new_src_addr
         return self.src_addr

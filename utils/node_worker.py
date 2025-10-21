@@ -441,3 +441,12 @@ class NodeController:
 
             # 检查是否有新的配置文件
             self.check_new_config()
+
+
+if __name__ == "__main__":
+    controller = NodeController(
+        "shards/Llama-2-7b-chat-hf_float16",
+        device="cuda:0",
+        dtype=torch.float16
+    )
+    controller.run_worker_loop()

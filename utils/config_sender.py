@@ -47,3 +47,19 @@ class ConfigSender:
         self.node_addr = "tcp://" + node_ip + ":" + str(self.node_port)
         self.send_socket.connect(self.node_addr)
         self.send_socket.send_json(self.config)
+
+
+if __name__ == "__main__":
+    sender = ConfigSender()
+    sender.build_config(shards_start=0,
+                        shards_end=10,
+                        can_receive_user_request=True,
+                        dst_ip="100.115.1.2",
+                        first_node_addr="tcp://100.115.1.1:40800",
+                        )
+    sender.send_config(node_ip="100.115.1.1")
+    # 测试中发现如果发送完毕后进程直接结束，会主动断开连接 [TCP RST]，导致接收节点来不及接收配置文件
+    # 所以这里添加一个 while True: 循环，保持运行，保留 socket
+    while True:
+        pass
+    # 实际使用时因为 sender 实例一直都在，所以不用停顿

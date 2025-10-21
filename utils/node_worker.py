@@ -20,6 +20,7 @@ class Communicator:
         recv_context = zmq.Context()
         self.recv_socket = recv_context.socket(zmq.PULL)
         self.recv_socket.bind(self.src_addr)
+        # 将形如 tcp://*:40800 转为形如 tcp://100.115.1.1:40800
         self.actual_src_addr = self.recv_socket.getsockopt_string(zmq.LAST_ENDPOINT)
 
         self.dst_addr = dst_addr
@@ -31,6 +32,7 @@ class Communicator:
         self.recv_socket.unbind(self.actual_src_addr)
         self.recv_socket.bind(new_src_addr)
         self.src_addr = new_src_addr
+        self.actual_src_addr = self.recv_socket.getsockopt_string(zmq.LAST_ENDPOINT)
         return self.src_addr
 
     def change_dst_addr(self, new_dst_addr: str) -> str:

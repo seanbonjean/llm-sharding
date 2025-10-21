@@ -317,11 +317,15 @@ class NodeController:
         self.node_worker.load_shards(self.received_config["shards_start"], self.received_config["shards_end"])
         print("[INFO] Node is ready.")
 
-    def _receive_config(self, no_block: bool = False) -> dict:
-        print("[CONFIG] Waiting for configuration file from master node...")
+    def _receive_config(self, no_block: bool = False) -> dict | None:
         if no_block:
-            received_config = self.recv_config_socket.recv_json(flags=zmq.NOBLOCK)
+            print("[CONFIG] Checking if there has a new configuration file from master node...")
+            try:
+                received_config = self.recv_config_socket.recv_json(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                return None
         else:
+            print("[CONFIG] Waiting for configuration file from master node...")
             received_config = self.recv_config_socket.recv_json()
         print("[CONFIG] Received configuration file from master node:")
         for k, v in received_config.items():
@@ -340,6 +344,9 @@ class NodeController:
         """
         # 接收配置文件
         new_config = self._receive_config(no_block=True)
+        # 如果没有发来新的 config，直接退出该检查函数
+        if not new_config:
+            return
         # 如果 can_receive_user_request 被更改，只能重新创建节点实例
         if new_config["can_receive_user_request"] != self.received_config["can_receive_user_request"]:
             del self.node_worker

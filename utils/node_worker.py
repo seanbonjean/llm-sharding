@@ -322,7 +322,7 @@ class NodeController:
 
     def _receive_config(self, no_block: bool = False) -> dict | None:
         if no_block:
-            print("[CONFIG] Checking if there has a new configuration file from master node...")
+            # print("[CONFIG] Checking if there has a new configuration file from master node...")
             try:
                 received_config = self.recv_config_socket.recv_json(flags=zmq.NOBLOCK)
             except zmq.Again:

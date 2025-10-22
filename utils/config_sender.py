@@ -4,6 +4,7 @@ import zmq
 class ConfigSender:
     """
     配置发送器，向节点控制器发送配置文件以设置一个节点
+    使用时，需要每个节点都对应一个 ConfigSender 实例，并且对应节点退出前不能释放对应的 ConfigSender 实例，以保留 socket
     """
 
     def __init__(self, node_port: int = 40700):

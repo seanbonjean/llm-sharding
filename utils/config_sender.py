@@ -16,7 +16,7 @@ class ConfigSender:
 
     def build_config(self, shards_start: int, shards_end: int,
                      can_receive_user_request: bool,
-                     dst_ip: str, dst_port: int = 40801,
+                     dst_ip: str, dst_port: int = 40800,
                      src_addr: str = "tcp://*:40800",
                      first_node_addr: str = ""):
         """

@@ -433,7 +433,7 @@ class NodeController:
                     processed_data = self.node_worker.pass_through_shard(received_data)
                     self.node_worker.communicator.transfer_data(processed_data)
                     if self.node_worker.start != 0:
-                        print('*')  # 当有数据传过时，如果不是首节点，不会输出 token，这里打印一个 * 表示有数据经过该节点
+                        print('*', end=' ')  # 当有数据传过时，如果不是首节点，不会输出 token，这里打印一个 * 表示有数据经过该节点
                 else:
                     skip_this_transfer = False
             # 若无传入数据，则静默失败

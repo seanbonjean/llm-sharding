@@ -404,7 +404,7 @@ class NodeController:
                 # 监听有无传入数据待处理
                 received_data = self.node_worker.communicator.receive_data(no_block=True)
                 # 若为从模型链末尾传回的 next_token_id
-                if type(received_data) == torch.Tensor:
+                if isinstance(received_data, torch.Tensor):
                     if self.node_worker.start != 0:
                         raise RuntimeError(
                             "[ERROR] I'm not the first node in the model chain, but received \"next_token_id\".")
@@ -412,11 +412,11 @@ class NodeController:
                     reached_eos, received_data = self.node_worker.receive_next_token(received_data)
                     if reached_eos:
                         skip_this_transfer = True
-                elif hasattr(received_data, "batch_size") and hasattr(received_data, "seq_len"):
+                elif isinstance(received_data, dict) and "batch_size" in received_data and "seq_len" in received_data:
                     if self.node_worker.start != 0:
                         raise RuntimeError(
                             "[ERROR] I'm not the first node in the model chain, but received \"input_token_info\".")
-                elif hasattr(received_data, "cos") and hasattr(received_data, "sin"):
+                elif isinstance(received_data, dict) and "cos" in received_data and "sin" in received_data:
                     if self.node_worker.start == 0:
                         raise RuntimeError(
                             "[ERROR] I'm the first node in the model chain, but received \"next_state_info\".")

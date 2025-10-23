@@ -98,8 +98,8 @@ class NodeWorker:
         # 运行时的缓存数据
         self.start = 0
         self.end = 0
+        self.batch_size = 0  # 假设模型链是：A->B->C，如果请求是从B发起并传入A的，此时首节点A也需要一个 batch_size 属性来保存 batch_size，用于后续 receive_next_token 方法中封装新的 input_token_info
         if can_receive_user_request:
-            self.batch_size = 0
             self.generated_ids = []
             self._load_embedding()
 
@@ -217,6 +217,8 @@ class NodeWorker:
         if "batch_size" in state_info and "seq_len" in state_info:
             if self.start != 0:
                 raise RuntimeError("[ERROR] after embedding layer, the states should first passing hidden layer 0!")
+            # 在模型链的首节点中也保存一份 batch_size，用于后续 receive_next_token 方法中封装新的 input_token_info
+            self.batch_size = state_info["batch_size"]
             # 旋转位置编码（RoPE）获取 cos/sin 表
             position_ids = build_position_ids(self.past_key_value, state_info["seq_len"], device=self.device,
                                               batch_size=state_info["batch_size"])

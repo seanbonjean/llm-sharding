@@ -429,8 +429,8 @@ class NodeController:
                         f"[ERROR] Received unknown data type: {type(received_data)}; "
                         f"Attributes: {attrs if attrs else 'No attributes found'}"
                     )
-                processed_data = self.node_worker.pass_through_shard(received_data)
                 if not skip_this_transfer:
+                    processed_data = self.node_worker.pass_through_shard(received_data)
                     self.node_worker.communicator.transfer_data(processed_data)
                 else:
                     skip_this_transfer = False

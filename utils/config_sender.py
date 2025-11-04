@@ -16,23 +16,20 @@ class ConfigSender:
 
     def build_config(self, shards_start: int, shards_end: int,
                      can_receive_user_request: bool,
-                     dst_ip: str, dst_port: int = 40800,
-                     src_addr: str = "tcp://*:40800",
+                     src_addr: str, dst_addr: str,
                      first_node_addr: str = ""):
         """
         :param shards_start: 加载的起始层
         :param shards_end: 加载的最终层（不包括本身）
         :param can_receive_user_request: 见 node_worker.py 的 NodeWorker 类
-        :param first_node_addr: 当 can_receive_user_request = True 时，为其指定一个模型链的第一个 node
-        :param dst_ip: 见 node_worker.py 的 Communicator 类
-        :param dst_port: 见 node_worker.py 的 Communicator 类
         :param src_addr: 见 node_worker.py 的 Communicator 类
+        :param dst_addr: 见 node_worker.py 的 Communicator 类
+        :param first_node_addr: 当 can_receive_user_request = True 时，为其指定一个模型链的第一个 node
         """
         if can_receive_user_request:
             if first_node_addr == "":
                 raise ValueError("first_node_addr cannot be empty when can_receive_user_request = True")
 
-        dst_addr = "tcp://" + dst_ip + ":" + str(dst_port)
         self.config = {
             "src_addr": src_addr,
             "dst_addr": dst_addr,
@@ -55,7 +52,8 @@ if __name__ == "__main__":
     sender.build_config(shards_start=0,
                         shards_end=10,
                         can_receive_user_request=True,
-                        dst_ip="100.115.1.2",
+                        src_addr="tcp://*:40800",
+                        dst_addr="tcp://100.115.1.2:40800",
                         first_node_addr="tcp://100.115.1.1:40800",
                         )
     sender.send_config(node_ip="100.115.1.1")

@@ -39,6 +39,6 @@
 ### 默认端口
 
 * 所有节点接收主节点配置信息的端口：40700
-* 所有节点接收模型链上其他节点传入数据的端口：40800（传入数据有多种类型，见 `node_worker.py` 中 `NodeController` 的
+* 所有节点接收模型链上其他节点传入数据的端口：从40800开始，根据节点上的分片序号依次增加（传入数据有多种类型，见 `node_worker.py` 中 `NodeController` 的
   `run_worker_loop` 方法中的多个 `if-elif` 分支；更具体的数据内容详见 `node_worker.py` 中 `NodeWorker` 的
   `receive_user_request`、 `pass_through_shard` 和 `receive_next_token` 方法）

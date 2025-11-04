@@ -7,7 +7,7 @@ for i in range(3):
     senders.append(ConfigSender())
 
 senders[0].build_config(shards_start=0,
-                        shards_end=7,
+                        shards_end=8,
                         can_receive_user_request=True,
                         src_addr="tcp://*:40800",
                         dst_addr="tcp://100.115.1.2:40800",
@@ -15,8 +15,8 @@ senders[0].build_config(shards_start=0,
                         )
 senders[0].send_config(node_ip="100.115.1.1")
 
-senders[1].build_config(shards_start=7,
-                        shards_end=9,
+senders[1].build_config(shards_start=8,
+                        shards_end=10,
                         can_receive_user_request=True,
                         src_addr="tcp://*:40800",
                         dst_addr="tcp://100.89.105.75:40800",
@@ -24,7 +24,7 @@ senders[1].build_config(shards_start=7,
                         )
 senders[1].send_config(node_ip="100.115.1.2")
 
-senders[2].build_config(shards_start=9,
+senders[2].build_config(shards_start=10,
                         shards_end=32,
                         can_receive_user_request=True,
                         src_addr="tcp://*:40800",

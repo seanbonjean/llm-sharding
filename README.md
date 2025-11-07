@@ -5,9 +5,11 @@
 ## 架构简介
 
 整体结构由一个设备担任主节点 `master_node`，其他设备作为普通节点；  
-调度算法在主节点上运行，并调用 `ConfigSender` 发送配置给其他节点；  
-每个节点都运行一个 `NodeController`，它承担一些通信功能（接收主节点配置信息，接收用户请求），并驱使 `NodeWorker`
-工作（接收上一个节点传入的 hidden state ，处理后发送给下一个节点）
+调度算法在主节点上运行，并调用 `ConfigSender` 发送配置给其他节点上的多个 `NodeController`；  
+每个节点都运行多个 `NodeController`，它承担一些通信功能（接收主节点配置信息，接收用户请求），并驱使 `NodeWorker`
+工作（接收上一个节点传入的 hidden state ，处理后发送给下一个节点）  
+不使用的 `NodeController` 不会加载权重，只是一直停留在
+`print("[CONFIG] Waiting for configuration file from master node...")` 处等待
 
 配置信息包含：
 
@@ -24,21 +26,28 @@
 
 ### 使用
 
-1. 下载模型到 `weights` 文件夹（暂时只支持 llama2 7b 模型），并使用 `utils/shard_loader.py` 进行切割（需要能够完整加载模型的设备），保存到
+1. 下载模型到 `weights` 文件夹（暂时只支持 llama2 7b 模型），并使用 `utils/shard_loader.py` 进行切割（切割操作需要能够完整加载模型的设备），保存到
    `shards` 文件夹中；
-2. 将分片放到各个节点的 `shards` 文件夹中；
-3. 各节点运行 `start_node.py`，主节点直接发送配置给所有节点，或按照算法的调度来发送配置
+2. 将切割好的分片文件夹放到各个节点的 `shards` 文件夹中；
+3. 各节点运行 `run_this.sh`，由脚本启动多个 `start_node.py` 进程（启动数量设置为单个节点上最多可能的
+   `NodeController` 数量）；
+4. 多个 `start_node.py` 启动各自的 `NodeController` 各自监听从40700开始的多个端口；
+5. 主节点通过这些端口发送配置给节点上的进程，或按照算法的调度来发送配置（按需向对应端口发送：如果一个节点上只需要一个分片，则只需要向40700端口上的
+   `NodeController` 发送配置）
 
-### 运行 `start_node.py` 前，检查配置项
+### 运行前配置
+
+运行 `start_node.py` 前（包括由 `run_this.sh` 启动的情况），检查配置项:
 
 1. `NodeController` 对象中：切片文件的保存位置；模型运行时使用的设备；模型精度
-2. `ConfigSender` 的 `.build_config` 方法（若使用算法调度，则忽略本项）
+2. `ConfigSender` 的 `.build_config` 方法中设置的节点配置信息（若使用算法调度，则忽略本项）
 
 ## 注意事项
 
 ### 默认端口
 
-* 所有节点接收主节点配置信息的端口：40700
-* 所有节点接收模型链上其他节点传入数据的端口：从40800开始，根据节点上的分片序号依次增加（传入数据有多种类型，见 `node_worker.py` 中 `NodeController` 的
+* 所有节点上的所有 controller 接收主节点配置信息的端口：从40700开始，根据节点上的 controller 序号依次增加
+* 所有节点上的所有 controller 接收模型链上其他节点传入数据的端口：从40800开始，根据节点上的 controller 序号依次增加（传入数据有多种类型，见
+  `node_worker.py` 中 `NodeController` 的
   `run_worker_loop` 方法中的多个 `if-elif` 分支；更具体的数据内容详见 `node_worker.py` 中 `NodeWorker` 的
   `receive_user_request`、 `pass_through_shard` 和 `receive_next_token` 方法）

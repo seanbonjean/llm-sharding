@@ -3,6 +3,8 @@
 # 用法: ./run_this.sh [数量]
 # 默认启动 4 个节点，端口从 40700 开始
 
+export PYTHONUNBUFFERED=1  # 实时打印输出，不使用缓冲区
+
 NUM_NODES=${1:-4}      # 默认4个节点
 BASE_PORT=40700        # 起始端口
 
@@ -17,4 +19,4 @@ done
 echo "All $NUM_NODES nodes started (ports $BASE_PORT to $((BASE_PORT + NUM_NODES - 1)))."
 echo 'Use "cat node_<port>.log" to view logs, or "tail -fn 30 node_<port>.log" to follow the last 30 lines of logs.'
 echo 'Use "ps aux | grep start_node.py" to check which nodes are running.'
-echo 'Use "killall -9 python3" to stop all nodes.'
+echo 'Use "pkill -9 -f start_node.py" to stop all nodes.'

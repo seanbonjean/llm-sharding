@@ -78,12 +78,15 @@ class NodeProfiler:
             device=self.device,
             dtype=self.dtype
         )
-        node0.load_shards(0, 10)
-        node1.load_shards(10, 20)
-        node2.load_shards(20, 30)
-        node3.load_shards(30, 32)
+        node0.load_shards(0, 7)
+        node1.load_shards(7, 14)
+        node2.load_shards(14, 21)
+        node3.load_shards(21, 28)
 
-        data0 = node0.receive_user_request(request="Write a poem about the blue sky.")
+        # data0 = node0.receive_user_request(request="Write a poem about the blue sky.")
+        # data0 = node0.receive_user_request(request="Write a haiku about the blue sky.")
+        # data0 = node0.receive_user_request(request="The capital of France is")
+        data0 = node0.receive_user_request(request="Write a poem about the blue sky in one sentence.")
         for i in range(out_token_num):
             data1 = node0.pass_through_shard(data0)
             node0.communicator.transfer_data(data1)

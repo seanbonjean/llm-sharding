@@ -25,18 +25,34 @@ class ModelSharder:
         os.makedirs(self.shard_save_folder, exist_ok=True)
 
         print(f"Loading full model {self.model_path} to {self.device} ...")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            torch_dtype=self.dtype,
-            device_map=self.device,
-        )
-        # self.model.to(self.device)
+        if self.dtype == torch.int8:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                load_in_8bit=True,
+                device_map=self.device,
+            )
+        elif self.dtype == torch.int4:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                load_in_4bit=True,
+                device_map=self.device,
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype=self.dtype,
+                device_map=self.device,
+            )
+            # self.model.to(self.device)
 
     def save_shards(self):
         # 保存 config.json 和 tokenizer 所需文件
         for filename in os.listdir(self.model_path):
             # 跳过权重文件
             if filename.endswith((".bin", ".safetensors")):
+                continue
+            # (llama3.2) 跳过权重的原始格式 (非.safetensors格式)
+            if filename == "original":
                 continue
             src = os.path.join(self.model_path, filename)
             dst = os.path.join(self.shard_save_folder, filename)
@@ -120,10 +136,10 @@ class ModelSharder:
 
 if __name__ == "__main__":
     sharder = ModelSharder(
-        "../weights/Llama-2-7b-chat-hf",
+        "../weights/Llama-3___2-3B-Instruct",
         "llama",
-        "../shards/Llama-2-7b-chat-hf",
+        "../shards/Llama-3___2-3B-Instruct",
         device="cuda:0",
-        dtype=torch.float32
+        dtype=torch.float16
     )
     sharder.save_shards()

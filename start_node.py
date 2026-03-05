@@ -11,7 +11,7 @@ elif len(sys.argv) > 1:
     port = int(sys.argv[1])
 
 controller = NodeController(
-    "shards/Llama-2-7b-chat-hf_float16",
+    "shards/Llama-3___2-3B-Instruct_float16",
     # "C:/Users/sean-/Desktop/shards/Llama-2-7b-chat-hf_float16",  # 权重shard暂存SSD，避免硬盘瓶颈
     device="cuda:0",
     dtype=torch.float16,

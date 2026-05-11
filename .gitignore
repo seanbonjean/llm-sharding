@@ -3,3 +3,7 @@ datasets/*
 shards/*
 results/*
 .idea/
+.vscode/
+__pycache__/
+
+testing.py

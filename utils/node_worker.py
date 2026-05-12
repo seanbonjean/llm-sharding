@@ -194,6 +194,7 @@ class NodeWorker:
         # 分词器tokenize
         inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
         input_ids = inputs["input_ids"]  # 初始 prompt 张量化后的 token id 序列
+        print("[INFO] input token number: " + str(input_ids.shape[1]))
         self.generated_ids = [input_ids]  # 存储所有 input 和 output 的 token id 序列
 
         # 经过嵌入层

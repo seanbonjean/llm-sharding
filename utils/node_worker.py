@@ -102,6 +102,7 @@ class NodeWorker:
         if can_receive_user_request:
             self.generated_ids = []
             self._load_embedding()
+            self.input_token_length = None  # (仅记录) 输入 token 长度
 
     def _load_embedding(self) -> None:
         """
@@ -194,7 +195,8 @@ class NodeWorker:
         # 分词器tokenize
         inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
         input_ids = inputs["input_ids"]  # 初始 prompt 张量化后的 token id 序列
-        print("[INFO] input token number: " + str(input_ids.shape[1]))
+        self.input_token_length = input_ids.shape[1]
+        print("[INFO] input token number: " + str(self.input_token_length))
         self.generated_ids = [input_ids]  # 存储所有 input 和 output 的 token id 序列
 
         # 经过嵌入层

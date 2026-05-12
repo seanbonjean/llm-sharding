@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 from transformers import LlamaConfig, AutoTokenizer
 from transformers.cache_utils import DynamicCache
@@ -27,8 +28,7 @@ class NodeProfiler:
 
         self.shards = []  # 保存各层权重
 
-    # TODO 建新方法来做真正的 profile
-    def profiling(self):
+    def profile_max_layer_num(self):
         node_worker = NodeWorker(
             src_addr="tcp://*:40800",
             dst_addr="tcp://127.0.0.1:40801",
@@ -44,6 +44,54 @@ class NodeProfiler:
                 max_layer_num = i + 1
         except torch.cuda.OutOfMemoryError:
             print(f"[INFO] max layer num: {max_layer_num}")
+        return max_layer_num
+
+    def profile_compute_capability(self, max_layer_num: int = None):
+        """
+        :param max_layer_num: 节点能放下的最大层数（包含embedding的情况下）; -1代表设备必定能放下所有，忽略内存限制
+        """
+        if max_layer_num is None:
+            max_layer_num = self.profile_max_layer_num()
+
+        input_requests = [
+            "Why the sky blue",
+            # TODO 增加其他长度的 request
+        ]
+        requests_token_length = [5, 10, 15, 20]
+        computation_latencies = list()
+
+        node = NodeWorker(
+            src_addr="tcp://*:40800",
+            dst_addr="tcp://127.0.0.1:40800",
+            can_receive_user_request=True,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        if max_layer_num == -1:
+            node.load_shards(0, self.layer_num)
+        else:
+            node.load_shards(0, max_layer_num - 1)  # 预留给 KV Cache 一些空间
+
+        for i in len(requests_token_length):
+            start_time = time.time()
+            data0 = node.receive_user_request(request=input_requests[i])
+            if node.input_token_length != str(requests_token_length[i]):
+                raise ValueError("[ERROR] input token length is not " + str(requests_token_length[i]))  # 不同模型 tokenizer 不一样，可能导致输入长度不是期望的长度
+            data1 = node.pass_through_shard(data0)
+            node.communicator.transfer_data(data1)  # 同一个 node 自己给自己传数据
+            data1_recv = node.communicator.receive_data()
+            if max_layer_num == -1 or max_layer_num == self.layer_num:
+                _, data2 = node.receive_next_token(data1_recv)
+            end_time = time.time()
+            computation_latency = end_time - start_time
+            computation_latencies.append(computation_latency)
+            node.remove_KV_Cache()
+
+        if len(computation_latencies) != len(requests_token_length):
+            raise ValueError("[ERROR] tested computation latency number is not equal to request number.")
+        
+        # TODO 对decode阶段的profile
 
     def go_through_every_shards(self, out_token_num: int = 50):
         node0 = NodeWorker(
@@ -86,7 +134,8 @@ class NodeProfiler:
         # data0 = node0.receive_user_request(request="Write a poem about the blue sky.")
         # data0 = node0.receive_user_request(request="Write a haiku about the blue sky.")
         # data0 = node0.receive_user_request(request="The capital of France is")
-        data0 = node0.receive_user_request(request="Write a poem about the blue sky in one sentence.")
+        # data0 = node0.receive_user_request(request="Write a poem about the blue sky in one sentence.")
+        data0 = node0.receive_user_request(request="Why the sky blue")
         for i in range(out_token_num):
             data1 = node0.pass_through_shard(data0)
             node0.communicator.transfer_data(data1)

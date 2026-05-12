@@ -68,6 +68,9 @@ class Communicator:
 
 
 class NodeWorker:
+    CLEAR_KV_CACHE_COMMAND = "clear_KV_cache"
+    CLEAR_KV_CACHE_ORIGIN_KEY = "origin_node"  # 发起 clear KV cache 的源节点标志
+
     # 每个 node 上运行的 client
     def __init__(self, src_addr: str, dst_addr: str,
                  can_receive_user_request: bool, shards_path: str, device="cpu", dtype=torch.float16):
@@ -217,7 +220,7 @@ class NodeWorker:
         :param state_info: 传递hidden_states。若存在batch_size和seq_len：先计算RoPE的cos,sin；若存在cos,sin：直接传入shard
         :return: next_token_id: torch.Tensor | next_state_info: dict
         """
-        if "batch_size" in state_info and "seq_len" in state_info:
+        if self.is_input_token_info(state_info):
             if self.start != 0:
                 raise RuntimeError("[ERROR] after embedding layer, the states should first passing hidden layer 0!")
             # 在模型链的首节点中也保存一份 batch_size，用于后续 receive_next_token 方法中封装新的 input_token_info
@@ -226,8 +229,14 @@ class NodeWorker:
             position_ids = build_position_ids(self.past_key_value, state_info["seq_len"], device=self.device,
                                               batch_size=state_info["batch_size"])
             cos, sin = self.rope(state_info["hidden_states"], position_ids)  # [B, S, Hd] each; hidden_states 只是用作参考张量 x
-        else:
+        elif self.is_next_state_info(state_info):
             cos, sin = state_info["cos"], state_info["sin"]
+        else:
+            attrs = [a for a in dir(state_info) if not a.startswith("__")]
+            raise RuntimeError(
+                f"[ERROR] Received unknown state_info type: {type(state_info)}; "
+                f"Attributes: {attrs if attrs else 'No attributes found'}"
+            )
         hidden_states = state_info["hidden_states"]
 
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
@@ -284,6 +293,63 @@ class NodeWorker:
                 "seq_len": seq_len,
             }
             return reached_eos, input_token_info
+
+    @staticmethod
+    def is_input_token_info(data: object) -> bool:
+        return isinstance(data, dict) and "batch_size" in data and "seq_len" in data
+
+    @staticmethod
+    def is_next_state_info(data: object) -> bool:
+        return isinstance(data, dict) and "cos" in data and "sin" in data
+
+    def clear_KV_cache(self) -> None:
+        """
+        清除上一次用户请求留下的推理状态
+
+        保留已经加载好的 tokenizer / embedding / RoPE / shard / lm_head 等模型资源，
+        只重置一次请求内会增长或被覆盖的运行时状态
+        """
+        self.past_key_value = None
+        self.batch_size = 0
+
+        if self.can_receive_user_request:
+            self.generated_ids = []
+            self.input_token_length = None
+
+        gc.collect()  # 强制 Python 做一次垃圾回收
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()  # 清空 CUDA 缓存池，让 nvidia-smi 立刻下降
+
+        if self.shard is not None:
+            self.past_key_value = DynamicCache()
+        print("[INFO] KV cache and all states caused by prev user are cleared.")
+
+    def _get_clear_KV_cache_origin(self) -> dict:
+        """
+        通过节点的一些配置信息，识别“发起 clear KV cache 命令”的源节点，以停止继续往模型链后方节点传递 clear KV cache 命令
+        """
+        return {
+            "src_addr": self.communicator.src_addr,
+            "dst_addr": self.communicator.dst_addr,
+            "shards_start": self.start,
+            "shards_end": self.end,
+        }
+
+    def build_clear_KV_cache_command(self) -> dict:
+        return {
+            "command": self.CLEAR_KV_CACHE_COMMAND,
+            self.CLEAR_KV_CACHE_ORIGIN_KEY: self._get_clear_KV_cache_origin(),
+        }
+
+    @classmethod
+    def is_clear_KV_cache_command(cls, data: object) -> bool:
+        return isinstance(data, dict) and data.get("command") == cls.CLEAR_KV_CACHE_COMMAND
+
+    def is_clear_KV_cache_command_origin(self, data: object) -> bool:
+        return (
+            self.is_clear_KV_cache_command(data)
+            and data.get(self.CLEAR_KV_CACHE_ORIGIN_KEY) == self._get_clear_KV_cache_origin()
+        )
 
 
 class NodeController:
@@ -398,16 +464,23 @@ class NodeController:
         """
         常驻监听有无传入数据待处理，若无则检查是否有新请求进入
         """
-        skip_this_transfer = False  # 用于在得到 <EOS> 后，通过不继续传递 state 的方式来结束该推理任务
-
         # TODO 临时实现仅发送一次请求
         # request_not_send = True
         request_not_send = False
 
         while True:
             try:
+                should_pass_through_shard = True  # 得到 <EOS> 后，不再进行计算和传递数据
                 # 监听有无传入数据待处理
                 received_data = self.node_worker.communicator.receive_data(no_block=True)
+                # 若为 clear KV cache 命令
+                if self.node_worker.is_clear_KV_cache_command(received_data):
+                    # 且不是发起 clear KV cache 命令的源节点 (否则停止继续传递，防止重复清除和死循环)
+                    if not self.node_worker.is_clear_KV_cache_command_origin(received_data):
+                        # 源节点发起 clear KV Cache 命令后，顺着模型链进行一次命令传递，命令回到源节点后中止传递任何数据，通过不继续传递信息的方式来结束此次推理任务
+                        self.node_worker.communicator.transfer_data(received_data)
+                        self.node_worker.clear_KV_cache()
+                    continue
                 # 若为从模型链末尾传回的 next_token_id
                 if isinstance(received_data, torch.Tensor):
                     if self.node_worker.start != 0:
@@ -416,12 +489,15 @@ class NodeController:
                     # 需要先解码并输出 token，然后产生下一个 state
                     reached_eos, received_data = self.node_worker.receive_next_token(received_data)
                     if reached_eos:
-                        skip_this_transfer = True
-                elif isinstance(received_data, dict) and "batch_size" in received_data and "seq_len" in received_data:
+                        clear_KV_cache_command = self.node_worker.build_clear_KV_cache_command()
+                        self.node_worker.communicator.transfer_data(clear_KV_cache_command)  # 发起 clear KV Cache 命令，通知模型链后续节点也清除KV Cache
+                        self.node_worker.clear_KV_cache()
+                        should_pass_through_shard = False
+                elif self.node_worker.is_input_token_info(received_data):
                     if self.node_worker.start != 0:
                         raise RuntimeError(
                             "[ERROR] I'm not the first node in the model chain, but received \"input_token_info\".")
-                elif isinstance(received_data, dict) and "cos" in received_data and "sin" in received_data:
+                elif self.node_worker.is_next_state_info(received_data):
                     if self.node_worker.start == 0:
                         raise RuntimeError(
                             "[ERROR] I'm the first node in the model chain, but received \"next_state_info\".")
@@ -432,13 +508,11 @@ class NodeController:
                         f"[ERROR] Received unknown data type: {type(received_data)}; "
                         f"Attributes: {attrs if attrs else 'No attributes found'}"
                     )
-                if not skip_this_transfer:
+                if should_pass_through_shard:
                     processed_data = self.node_worker.pass_through_shard(received_data)
                     self.node_worker.communicator.transfer_data(processed_data)
                     if self.node_worker.start != 0:
                         print('*', end=' ', flush=True)  # 当有数据传过时，如果不是首节点，不会输出 token，这里打印一个 * 表示有数据经过该节点
-                else:
-                    skip_this_transfer = False
             # 若无传入数据，则静默失败
             except zmq.Again:
                 pass

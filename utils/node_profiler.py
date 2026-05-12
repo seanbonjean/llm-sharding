@@ -86,7 +86,7 @@ class NodeProfiler:
             end_time = time.time()
             computation_latency = end_time - start_time
             computation_latencies.append(computation_latency)
-            node.remove_KV_Cache()
+            node.clear_KV_cache()  # 没有遇到 EOS token，需要手动清除KV Cache
 
         if len(computation_latencies) != len(requests_token_length):
             raise ValueError("[ERROR] tested computation latency number is not equal to request number.")

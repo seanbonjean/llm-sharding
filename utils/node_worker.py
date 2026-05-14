@@ -184,6 +184,7 @@ class NodeWorker:
         self.past_key_value = DynamicCache()
         print("[INFO] KV cache loaded.")
 
+    @torch.inference_mode()  # 避免产生计算图
     def receive_user_request(self, request: str = "Write a poem about the blue sky.") -> dict:
         """
         接收用户请求
@@ -214,6 +215,7 @@ class NodeWorker:
         }
         return input_token_info
 
+    @torch.inference_mode()
     def pass_through_shard(self, state_info: dict) -> torch.Tensor | dict:
         """
         对隐藏层前向传播
@@ -261,6 +263,7 @@ class NodeWorker:
             }
             return next_state_info
 
+    @torch.inference_mode()
     def receive_next_token(self, next_token_id: torch.Tensor) -> tuple:
         """
         接收最后一层的输出token id
@@ -309,6 +312,7 @@ class NodeWorker:
         保留已经加载好的 tokenizer / embedding / RoPE / shard / lm_head 等模型资源，
         只重置一次请求内会增长或被覆盖的运行时状态
         """
+        old_past_key_value = self.past_key_value
         self.past_key_value = None
         self.batch_size = 0
 
@@ -316,13 +320,28 @@ class NodeWorker:
             self.generated_ids = []
             self.input_token_length = None
 
+        if old_past_key_value is not None:
+            # 尝试通过 reset 方法重置缓存
+            reset_cache = getattr(old_past_key_value, "reset", None)
+            if callable(reset_cache):
+                try:
+                    reset_cache()
+                except NotImplementedError:
+                    pass
+            # 尝试通过常见的内部容器清理缓存
+            for cache_attr in ("key_cache", "value_cache"):
+                cache_storage = getattr(old_past_key_value, cache_attr, None)
+                if hasattr(cache_storage, "clear"):
+                    cache_storage.clear()
+            del old_past_key_value
+
         gc.collect()  # 强制 Python 做一次垃圾回收
         if self.device.type == "cuda":
             torch.cuda.empty_cache()  # 清空 CUDA 缓存池，让 nvidia-smi 立刻下降
 
         if self.shard is not None:
             self.past_key_value = DynamicCache()
-        print("[INFO] KV cache and all states caused by prev user are cleared.")
+        print("\n[INFO] KV cache and all states caused by prev user are cleared.")
 
     def _get_clear_KV_cache_origin(self) -> dict:
         """
@@ -511,6 +530,8 @@ class NodeController:
                 if should_pass_through_shard:
                     processed_data = self.node_worker.pass_through_shard(received_data)
                     self.node_worker.communicator.transfer_data(processed_data)
+                    del received_data
+                    del processed_data
                     if self.node_worker.start != 0:
                         print('*', end=' ', flush=True)  # 当有数据传过时，如果不是首节点，不会输出 token，这里打印一个 * 表示有数据经过该节点
             # 若无传入数据，则静默失败

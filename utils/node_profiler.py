@@ -77,6 +77,8 @@ class NodeProfiler:
             node.load_shards(0, max_layer_num - 1)  # 预留给 KV Cache 一些空间
 
         for i in range(len(requests_token_length)):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
             start_time = time.time()
             data0 = node.receive_user_request(request=input_requests[i])
             if node.input_token_length != requests_token_length[i]:
@@ -86,6 +88,8 @@ class NodeProfiler:
             data1_recv = node.communicator.receive_data()
             if max_layer_num == -1 or max_layer_num == self.layer_num:
                 _, data2 = node.receive_next_token(data1_recv)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
             end_time = time.time()
             computation_latency = end_time - start_time
             computation_latencies.append(computation_latency)

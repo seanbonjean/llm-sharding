@@ -79,7 +79,7 @@ class NodeProfiler:
         for i in range(len(requests_token_length)):
             start_time = time.time()
             data0 = node.receive_user_request(request=input_requests[i])
-            if node.input_token_length != str(requests_token_length[i]):
+            if node.input_token_length != requests_token_length[i]:
                 raise ValueError("[ERROR] input token length is not " + str(requests_token_length[i]))  # 不同模型 tokenizer 不一样，可能导致输入长度不是期望的长度
             data1 = node.pass_through_shard(data0)
             node.communicator.transfer_data(data1)  # 同一个 node 自己给自己传数据

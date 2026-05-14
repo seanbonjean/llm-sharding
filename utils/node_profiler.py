@@ -153,8 +153,8 @@ class NodeProfiler:
             node3.communicator.transfer_data(data4)
 
             data4_recv = node0.communicator.receive_data()
-            reached_eos, data0 = node0.receive_next_token(data4_recv)
-            if reached_eos:
+            reached_end, data0 = node0.receive_next_token(data4_recv)
+            if reached_end:
                 break
 
     def go_through_every_shards_only_by_profiler(self, out_token_num: int = 50):

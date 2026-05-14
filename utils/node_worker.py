@@ -264,11 +264,11 @@ class NodeWorker:
             return next_state_info
 
     @torch.inference_mode()
-    def receive_next_token(self, next_token_id: torch.Tensor) -> tuple:
+    def receive_next_token(self, next_token_id: torch.Tensor, max_new_tokens: int = 1024) -> tuple:
         """
         接收最后一层的输出token id
         :param next_token_id:
-        :return: (reached_eos: bool, input_token_info: dict|None): tuple 如果reached_eos=True，则input_token_info=None
+        :return: (reached_end: bool, input_token_info: dict|None): tuple 如果reached_end=True，则input_token_info=None
         """
         if not self.can_receive_user_request:
             raise RuntimeError(
@@ -280,12 +280,14 @@ class NodeWorker:
         print(repr(next_token), end=" ", flush=True)
 
         reached_eos = (next_token == self.tokenizer.eos_token)
-        if reached_eos:
+        reached_max_new_tokens = len(self.generated_ids) > max_new_tokens  # 优化自 len(self.generated_ids) - 1 >= max_new_tokens ，因为 generated_ids[0] 是输入 prompt，不被计入 output
+        reached_end = reached_eos or reached_max_new_tokens
+        if reached_end:
             # 解码最终结果
             print()
             final_ids = torch.cat(self.generated_ids, dim=-1)  # [B, seq_len + out_token_num]
             print("output: ", self.tokenizer.decode(final_ids[0]))
-            return reached_eos, None
+            return reached_end, None
         else:
             # 更新输入
             hidden_states = self.embed_tokens(next_token_id.unsqueeze(0))  # [B, 1, H]
@@ -295,7 +297,7 @@ class NodeWorker:
                 "batch_size": self.batch_size,
                 "seq_len": seq_len,
             }
-            return reached_eos, input_token_info
+            return reached_end, input_token_info
 
     @staticmethod
     def is_input_token_info(data: object) -> bool:
@@ -479,7 +481,7 @@ class NodeController:
         token_info = self.node_worker.receive_user_request(request)
         self._forward_request(token_info)
 
-    def run_worker_loop(self) -> None:
+    def run_worker_loop(self, max_new_tokens: int = 1024) -> None:
         """
         常驻监听有无传入数据待处理，若无则检查是否有新请求进入
         """
@@ -506,8 +508,8 @@ class NodeController:
                         raise RuntimeError(
                             "[ERROR] I'm not the first node in the model chain, but received \"next_token_id\".")
                     # 需要先解码并输出 token，然后产生下一个 state
-                    reached_eos, received_data = self.node_worker.receive_next_token(received_data)
-                    if reached_eos:
+                    reached_end, received_data = self.node_worker.receive_next_token(received_data, max_new_tokens)
+                    if reached_end:
                         clear_KV_cache_command = self.node_worker.build_clear_KV_cache_command()
                         self.node_worker.communicator.transfer_data(clear_KV_cache_command)  # 发起 clear KV Cache 命令，通知模型链后续节点也清除KV Cache
                         self.node_worker.clear_KV_cache()

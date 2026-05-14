@@ -95,12 +95,12 @@ class NodeProfiler:
             raise ValueError("[ERROR] tested computation latency number is not equal to request number.")
 
         capa_sum = 0
-        print("[INFO] each compute capability c_k=")
+        print("[INFO] each compute capability c_k=", end=" ")
         for i, latency in enumerate(computation_latencies):
             capa_sum += latency / requests_token_length[i]
             print(capa_sum, end=" / ")
         capa_avg = capa_sum / len(requests_token_length)
-        print("[INFO] average compute capability c_k=", str(capa_avg))
+        print("\n[INFO] average compute capability c_k=", str(capa_avg))
 
         # TODO 对decode阶段的profile
 

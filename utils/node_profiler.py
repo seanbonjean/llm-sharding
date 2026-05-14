@@ -55,7 +55,9 @@ class NodeProfiler:
 
         input_requests = [
             "Why the sky blue",
-            # TODO 增加其他长度的 request
+            "Please write a poem about the blue sky.",
+            "Write a haiku-like poem about the blue sky in one sentence.",
+            "Write a haiku-like poem about the sky in one sentence, no explains, just poem.",
         ]
         requests_token_length = [5, 10, 15, 20]
         computation_latencies = list()

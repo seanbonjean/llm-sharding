@@ -93,7 +93,8 @@ class NodeProfiler:
 
         if len(computation_latencies) != len(requests_token_length):
             raise ValueError("[ERROR] tested computation latency number is not equal to request number.")
-        
+
+        capa_sum = 0
         print("[INFO] each compute capability c_k=")
         for i, latency in enumerate(computation_latencies):
             capa_sum += latency / requests_token_length[i]

@@ -7,4 +7,5 @@ profiler = NodeProfiler(
     device="cuda:0",
     dtype=torch.float16
 )
-profiler.go_through_every_shards(out_token_num=256)
+# profiler.go_through_every_shards(out_token_num=256)
+profiler.profile_compute_capability(max_layer_num=None)

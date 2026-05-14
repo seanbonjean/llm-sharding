@@ -94,6 +94,13 @@ class NodeProfiler:
         if len(computation_latencies) != len(requests_token_length):
             raise ValueError("[ERROR] tested computation latency number is not equal to request number.")
         
+        print("[INFO] each compute capability c_k=")
+        for i, latency in enumerate(computation_latencies):
+            capa_sum += latency / requests_token_length[i]
+            print(capa_sum, end=" / ")
+        capa_avg = capa_sum / len(requests_token_length)
+        print("[INFO] average compute capability c_k=", str(capa_avg))
+
         # TODO 对decode阶段的profile
 
     def go_through_every_shards(self, out_token_num: int = 50):

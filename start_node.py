@@ -17,4 +17,4 @@ controller = NodeController(
     dtype=torch.float16,
     listen_port=port,
 )
-controller.run_worker_loop(max_new_tokens=1024)
+controller.run_worker_loop(max_new_tokens=1024)  # 1024 token 约4分钟

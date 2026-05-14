@@ -287,6 +287,7 @@ class NodeWorker:
             print()
             final_ids = torch.cat(self.generated_ids, dim=-1)  # [B, seq_len + out_token_num]
             print("output: ", self.tokenizer.decode(final_ids[0]))
+            print("[INFO] output token number: " + str(len(self.generated_ids) - 1))
             return reached_end, None
         else:
             # 更新输入

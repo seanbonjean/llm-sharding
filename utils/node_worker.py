@@ -287,7 +287,7 @@ class NodeWorker:
             print()
             final_ids = torch.cat(self.generated_ids, dim=-1)  # [B, seq_len + out_token_num]
             print("output: ", self.tokenizer.decode(final_ids[0]))
-            print("[INFO] output token number: " + str(len(self.generated_ids) - 1))
+            print("\n[INFO] output token number: " + str(len(self.generated_ids) - 1))
             return reached_end, None
         else:
             # 更新输入
@@ -344,7 +344,7 @@ class NodeWorker:
 
         if self.shard is not None:
             self.past_key_value = DynamicCache()
-        print("\n[INFO] KV cache and all states caused by prev user are cleared.")
+        print("[INFO] KV cache and all states caused by prev user are cleared.")
 
     def _get_clear_KV_cache_origin(self) -> dict:
         """

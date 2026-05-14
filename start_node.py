@@ -17,4 +17,4 @@ controller = NodeController(
     dtype=torch.float16,
     listen_port=port,
 )
-controller.run_worker_loop(max_new_tokens=1024)  # 1024 token 约4分钟
+controller.run_worker_loop(max_new_tokens=512)  # max_new_tokens=1024 时，如果推理一个停不下来的 prompt，约运行4分钟

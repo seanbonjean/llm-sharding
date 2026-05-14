@@ -97,10 +97,13 @@ class NodeProfiler:
         capa_sum = 0
         print("[INFO] each compute capability c_k=", end=" ")
         for i, latency in enumerate(computation_latencies):
-            capa_sum += latency / requests_token_length[i]
-            print(capa_sum, end=" / ")
+            capa = latency / requests_token_length[i]
+            if not (max_layer_num == -1 or max_layer_num == self.layer_num):
+                capa = capa / max_layer_num * self.layer_num  # 如果不完全加载所有 layer，则换算到完整加载所有 layer
+            capa_sum += capa
+            print(capa, end=" / ")
         capa_avg = capa_sum / len(requests_token_length)
-        print("\n[INFO] average compute capability c_k=", str(capa_avg))
+        print("\n[INFO] average compute capability c_k=", str(capa_avg), f" sec / (token * {self.layer_num}layer)")
 
         # TODO 对decode阶段的profile
 

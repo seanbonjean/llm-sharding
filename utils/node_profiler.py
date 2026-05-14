@@ -76,7 +76,7 @@ class NodeProfiler:
         else:
             node.load_shards(0, max_layer_num - 1)  # 预留给 KV Cache 一些空间
 
-        for i in len(requests_token_length):
+        for i in range(len(requests_token_length)):
             start_time = time.time()
             data0 = node.receive_user_request(request=input_requests[i])
             if node.input_token_length != str(requests_token_length[i]):

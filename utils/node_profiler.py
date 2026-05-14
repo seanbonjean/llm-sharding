@@ -51,6 +51,7 @@ class NodeProfiler:
         :param max_layer_num: 节点能放下的最大层数（包含embedding的情况下）; -1代表设备必定能放下所有，忽略内存限制
         """
         if max_layer_num is None:
+            print("[WARNING] max_layer_num needed, pls rerun this profile using the result after automaticly evoking profile_max_layer_num(), or if the device can load all model layers, this profile process will continue running without killing by CUDA OOM Exception.")
             max_layer_num = self.profile_max_layer_num()
 
         input_requests = [

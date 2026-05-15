@@ -54,7 +54,8 @@ class NodeProfiler:
             print("[WARNING] max_layer_num needed, pls rerun this profile using the result after automaticly evoking profile_max_layer_num(), or if the device can load all model layers, this profile process will continue running without killing by CUDA OOM Exception.")
             max_layer_num = self.profile_max_layer_num()
 
-        computation_latencies = list()
+        computation_latencies = list()  # 每种 prompt 长度重复测试后的平均时延
+        repeated_computation_latencies = list()  # 保留每种 prompt 长度下的全部重复测试结果
         requests_token_length = [8, 16, 32, 64, 128, 256, 512]
         if max(requests_token_length) > self.config.max_position_embeddings:
             raise ValueError("[ERROR] requested prompt length exceeds model max_position_embeddings.")
@@ -113,22 +114,34 @@ class NodeProfiler:
         print("[INFO] prefill profiling warm-up finished.")
 
         # 时延的实际测试，注意与 warm-up 代码同步修改
+        repeat_num = 3  # 每种 prompt 长度重复测试 3 次
+        total_test_num = len(requests_token_length) * repeat_num
+        finished_test_num = 0
         for i in range(len(requests_token_length)):
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-            start_time = time.perf_counter()
-            data0 = node.receive_user_request(input_ids=input_ids_of_each_request[i])
-            data1 = node.pass_through_shard(data0)
-            node.communicator.transfer_data(data1)  # 同一个 node 自己给自己传数据
-            data1_recv = node.communicator.receive_data()
-            if loaded_layer_num == self.layer_num:
-                _, _ = node.receive_next_token(data1_recv)
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-            end_time = time.perf_counter()
-            computation_latency = end_time - start_time
-            computation_latencies.append(computation_latency)
-            node.clear_KV_cache()  # 没有遇到 EOS token，需要手动清除KV Cache
+            latencies_of_current_length = list()
+            for _ in range(repeat_num):
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                start_time = time.perf_counter()
+                data0 = node.receive_user_request(input_ids=input_ids_of_each_request[i])
+                data1 = node.pass_through_shard(data0)
+                node.communicator.transfer_data(data1)  # 同一个 node 自己给自己传数据
+                data1_recv = node.communicator.receive_data()
+                if loaded_layer_num == self.layer_num:
+                    _, _ = node.receive_next_token(data1_recv)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                end_time = time.perf_counter()
+                computation_latency = end_time - start_time
+                latencies_of_current_length.append(computation_latency)
+                node.clear_KV_cache()  # 没有遇到 EOS token，需要手动清除KV Cache
+
+                finished_test_num += 1
+                if finished_test_num < total_test_num:
+                    time.sleep(1)
+
+            repeated_computation_latencies.append(latencies_of_current_length)
+            computation_latencies.append(sum(latencies_of_current_length) / repeat_num)
 
         if len(computation_latencies) != len(requests_token_length):
             raise ValueError("[ERROR] tested computation latency number is not equal to request number.")
@@ -137,6 +150,7 @@ class NodeProfiler:
         latency_scale = self.layer_num / loaded_layer_num
         normalized_latencies = [latency * latency_scale for latency in computation_latencies]
         print("[INFO] tested prompt token lengths=", requests_token_length)
+        print(f"[INFO] first-token latencies (each repeated {repeat_num} times)=", repeated_computation_latencies)
         print("[INFO] normalized first-token latencies=", normalized_latencies)
 
         prefill_comp_capa_sum = 0  # prefill 阶段 计算能力 测试的所有计算能力之和 (仅用于求平均)

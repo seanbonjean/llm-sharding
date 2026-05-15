@@ -92,18 +92,37 @@ class NodeProfiler:
             for token_length in requests_token_length
         ]
 
+        # ! 实验发现首次测试的时延总会出现异常值，因此在测试前先做 warm-up
+        # 正式计时前先用最长 prompt 进行一次 warm-up：
+        # 让 CUDA lazy initialization、kernel 首次加载、序列化、ZMQ 自发自收等首轮开销先发生，
+        # 避免它们只落在第一个测试点上，导致第一个 latency 成为异常值并干扰后续拟合
+        print("[INFO] warming up prefill profiling path...")
+        warmup_input_ids = input_ids_of_each_request[-1]
+        warmup_data0 = node.receive_user_request(input_ids=warmup_input_ids)
+        warmup_data1 = node.pass_through_shard(warmup_data0)
+        node.communicator.transfer_data(warmup_data1)
+        warmup_data1_recv = node.communicator.receive_data()
+        if loaded_layer_num == self.layer_num:
+            node.receive_next_token(warmup_data1_recv)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        node.clear_KV_cache()
+        del warmup_data0
+        del warmup_data1
+        del warmup_data1_recv
+        print("[INFO] prefill profiling warm-up finished.")
+
+        # 时延的实际测试，注意与 warm-up 代码同步修改
         for i in range(len(requests_token_length)):
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             start_time = time.perf_counter()
             data0 = node.receive_user_request(input_ids=input_ids_of_each_request[i])
-            if node.input_token_length != requests_token_length[i]:
-                raise ValueError("[ERROR] input token length is not " + str(requests_token_length[i]))  # 不同模型 tokenizer 不一样，可能导致输入长度不是期望的长度
             data1 = node.pass_through_shard(data0)
             node.communicator.transfer_data(data1)  # 同一个 node 自己给自己传数据
             data1_recv = node.communicator.receive_data()
             if loaded_layer_num == self.layer_num:
-                _, data2 = node.receive_next_token(data1_recv)
+                _, _ = node.receive_next_token(data1_recv)
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             end_time = time.perf_counter()

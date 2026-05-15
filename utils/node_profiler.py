@@ -94,23 +94,28 @@ class NodeProfiler:
         ]
 
         # ! 实验发现首次测试的时延总会出现异常值，因此在测试前先做 warm-up
-        # 正式计时前先用最长 prompt 进行一次 warm-up：
+        # 正式计时前先用最长 prompt 与最短 prompt 各进行一次 warm-up：
         # 让 CUDA lazy initialization、kernel 首次加载、序列化、ZMQ 自发自收等首轮开销先发生，
-        # 避免它们只落在第一个测试点上，导致第一个 latency 成为异常值并干扰后续拟合
+        # 同时让第一个正式测试点会使用的短 prompt 也提前经过一次完整路径，
+        # 避免这些额外开销只落在第一个测试点上，导致第一个 latency 成为异常值并干扰后续拟合
         print("[INFO] warming up prefill profiling path...")
-        warmup_input_ids = input_ids_of_each_request[-1]
-        warmup_data0 = node.receive_user_request(input_ids=warmup_input_ids)
-        warmup_data1 = node.pass_through_shard(warmup_data0)
-        node.communicator.transfer_data(warmup_data1)
-        warmup_data1_recv = node.communicator.receive_data()
-        if loaded_layer_num == self.layer_num:
-            node.receive_next_token(warmup_data1_recv)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        node.clear_KV_cache()
-        del warmup_data0
-        del warmup_data1
-        del warmup_data1_recv
+        warmup_input_ids_list = [
+            input_ids_of_each_request[-1],  # 最长 prompt：先热完整 prefill 路径
+            input_ids_of_each_request[0],   # 最短 prompt：再热首个正式测试点的短 prompt
+        ]
+        for warmup_input_ids in warmup_input_ids_list:
+            warmup_data0 = node.receive_user_request(input_ids=warmup_input_ids)
+            warmup_data1 = node.pass_through_shard(warmup_data0)
+            node.communicator.transfer_data(warmup_data1)
+            warmup_data1_recv = node.communicator.receive_data()
+            if loaded_layer_num == self.layer_num:
+                node.receive_next_token(warmup_data1_recv)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            node.clear_KV_cache()
+            del warmup_data0
+            del warmup_data1
+            del warmup_data1_recv
         print("[INFO] prefill profiling warm-up finished.")
 
         # 时延的实际测试，注意与 warm-up 代码同步修改

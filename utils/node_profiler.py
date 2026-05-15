@@ -150,7 +150,9 @@ class NodeProfiler:
         latency_scale = self.layer_num / loaded_layer_num
         normalized_latencies = [latency * latency_scale for latency in computation_latencies]
         print("[INFO] tested prompt token lengths=", requests_token_length)
-        print(f"[INFO] first-token latencies (each repeated {repeat_num} times)=", repeated_computation_latencies)
+        print(f"[INFO] first-token latencies (each repeated {repeat_num} times):")
+        for latencies_of_each_length in repeated_computation_latencies:
+            print(latencies_of_each_length)
         print("[INFO] normalized first-token latencies=", normalized_latencies)
 
         prefill_comp_capa_sum = 0  # prefill 阶段 计算能力 测试的所有计算能力之和 (仅用于求平均)

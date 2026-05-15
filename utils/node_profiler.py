@@ -50,6 +50,7 @@ class NodeProfiler:
         """
         :param max_layer_num: 节点能放下的最大层数（包含embedding的情况下）; -1代表设备必定能放下所有，忽略内存限制
         """
+        interval_sleep_time = 1  # 每次测试之间间隔时间 (单位：秒)
         if max_layer_num is None:
             print("[WARNING] max_layer_num needed, pls rerun this profile using the result after automaticly evoking profile_max_layer_num(), or if the device can load all model layers, this profile process will continue running without killing by CUDA OOM Exception.")
             max_layer_num = self.profile_max_layer_num()
@@ -116,6 +117,7 @@ class NodeProfiler:
             del warmup_data0
             del warmup_data1
             del warmup_data1_recv
+            time.sleep(interval_sleep_time)
         print("[INFO] prefill profiling warm-up finished.")
 
         # 时延的实际测试，注意与 warm-up 代码同步修改
@@ -143,7 +145,7 @@ class NodeProfiler:
 
                 finished_test_num += 1
                 if finished_test_num < total_test_num:
-                    time.sleep(1)
+                    time.sleep(interval_sleep_time)
 
             repeated_computation_latencies.append(latencies_of_current_length)
             computation_latencies.append(sum(latencies_of_current_length) / repeat_num)

@@ -185,20 +185,28 @@ class NodeWorker:
         print("[INFO] KV cache loaded.")
 
     @torch.inference_mode()  # 避免产生计算图
-    def receive_user_request(self, request: str = "Write a poem about the blue sky.") -> dict:
+    def receive_user_request(self, request: str = "Write a poem about the blue sky.",
+                             input_ids: torch.Tensor | None = None) -> dict:
         """
         接收用户请求
+        :param request: 用户请求字符串
+        :param input_ids: (默认不使用) 用户请求对应的 token id 序列 (仅在 profile 阶段测试不同 token 长度下的计算能力时使用)
         :return: input_token_info: dict，包含隐藏层参数和用于 RoPE 的 batch_size & seq_len
         """
         if not self.can_receive_user_request:
             raise RuntimeError("[ERROR] this node does not have embedding layer while receiving user request.")
 
-        input_text = request
-        print("[INFO] input: " + input_text)
-
-        # 分词器tokenize
-        inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
-        input_ids = inputs["input_ids"]  # 初始 prompt 张量化后的 token id 序列
+        if input_ids is None:  # 实际只走这条路径
+            input_text = request
+            print("[INFO] input: " + input_text)
+            # 分词器tokenize
+            inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
+            input_ids = inputs["input_ids"]  # 初始 prompt 张量化后的 token id 序列
+        else:  # 仅 profile 时使用
+            if input_ids.ndim != 2:
+                raise ValueError("[ERROR] input_ids must be a 2D tensor with shape [batch_size, seq_len].")
+            input_ids = input_ids.to(device=self.device, dtype=torch.long)
+            print("[INFO] input: inputted from direct token ids.")
         self.input_token_length = input_ids.shape[1]
         print("[INFO] input token number: " + str(self.input_token_length))
         self.generated_ids = [input_ids]  # 存储所有 input 和 output 的 token id 序列

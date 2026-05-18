@@ -339,16 +339,11 @@ class NodeProfiler:
         for warmup_input_ids in warmup_input_ids_list:
             warmup_data0 = node.receive_user_request(input_ids=warmup_input_ids)
             warmup_data1 = node.pass_through_shard(warmup_data0)
-            node.communicator.transfer_data(warmup_data1)
-            warmup_data1_recv = node.communicator.receive_data()
-            if loaded_layer_num == self.layer_num:
-                node.receive_next_token(warmup_data1_recv)
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             node.clear_KV_cache()
             del warmup_data0
             del warmup_data1
-            del warmup_data1_recv
             time.sleep(interval_sleep_time)
         print("[INFO] prefill profiling warm-up finished.")
 
@@ -364,10 +359,6 @@ class NodeProfiler:
                 start_time = time.perf_counter()
                 data0 = node.receive_user_request(input_ids=input_ids_of_each_request[i])
                 data1 = node.pass_through_shard(data0)
-                node.communicator.transfer_data(data1)  # 同一个 node 自己给自己传数据
-                data1_recv = node.communicator.receive_data()
-                if loaded_layer_num == self.layer_num:
-                    _, _ = node.receive_next_token(data1_recv)
                 if self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
                 end_time = time.perf_counter()

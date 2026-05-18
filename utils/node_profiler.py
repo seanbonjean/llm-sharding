@@ -48,15 +48,19 @@ class NodeProfiler:
 
     @staticmethod
     def _fit_latency_models(token_lengths: list[int], latencies: list[float],
+                            scatter_token_lengths: list[int], scatter_latencies: list[float],
                             x_label: str, y_label: str, plot_title: str,
                             plot_filename: str, plot_note: str = None) -> dict:
         """
         对一组离散 latency 测试点分别做一次函数与二次函数拟合，并保存拟合图。
+        token_lengths / latencies 用于拟合函数；scatter_token_lengths / scatter_latencies 只作为图上显示的实测点。
         """
         if len(token_lengths) != len(latencies):
             raise ValueError("[ERROR] token_lengths length must be equal to latencies length.")
         if len(token_lengths) < 3:
             raise ValueError("[ERROR] at least 3 points are needed for quadratic fitting.")
+        if len(scatter_token_lengths) != len(scatter_latencies):
+            raise ValueError("[ERROR] scatter_token_lengths length must be equal to scatter_latencies length.")
 
         # 将测试点转换为 double tensor，后续拟合需要在这些离散点上求解模型参数
         # S 表示 token length；在 prefill 中是 input token length，在 decode 中是 output token length
@@ -157,7 +161,7 @@ class NodeProfiler:
         os.makedirs(plot_dir, exist_ok=True)
         plot_path = os.path.join(plot_dir, plot_filename)
         plt.figure(figsize=(8, 5))
-        plt.scatter(token_lengths, latencies, label="measured latency")
+        plt.scatter(scatter_token_lengths, scatter_latencies, label="measured latency")
         plt.plot(plot_token_lengths.tolist(), plot_linear_latencies.tolist(), label="linear fit")
         plt.plot(plot_token_lengths.tolist(), plot_quadratic_latencies.tolist(), label="quadratic fit")
         plt.xlabel(x_label)
@@ -397,6 +401,8 @@ class NodeProfiler:
         prefill_fit_result = self._fit_latency_models(
             token_lengths=input_token_lengths,
             latencies=normalized_latencies,
+            scatter_token_lengths=input_token_lengths,
+            scatter_latencies=normalized_latencies,
             x_label="Input token length",
             y_label="First-token latency (sec, full-model equivalent)",
             plot_title="Prefill first-token latency fit",
@@ -506,6 +512,8 @@ class NodeProfiler:
         decode_fit_result = self._fit_latency_models(
             token_lengths=output_token_lengths,
             latencies=cumulative_decode_latencies,
+            scatter_token_lengths=sampled_output_token_lengths,
+            scatter_latencies=sampled_decode_latencies,
             x_label="Output token length",
             y_label="Cumulative decode latency (sec, full-model equivalent)",
             plot_title="Decode cumulative latency fit",

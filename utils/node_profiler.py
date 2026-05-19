@@ -532,6 +532,41 @@ class NodeProfiler:
         )
         node.clear_KV_cache()
 
+    def profile_cold_start_latency(self, max_layer_num: int = None):
+        if max_layer_num is None:
+            print("[WARNING] max_layer_num needed, pls rerun this profile using the result after automaticly evoking profile_max_layer_num(), or if the device can load all model layers, this profile process will continue running without killing by CUDA OOM Exception.")
+            max_layer_num = self.profile_max_layer_num()
+
+        node = NodeWorker(
+            src_addr="tcp://*:40800",
+            dst_addr="tcp://127.0.0.1:40800",
+            can_receive_user_request=False,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        if max_layer_num == -1:
+            loaded_layer_num = self.layer_num
+        else:
+            loaded_layer_num = max_layer_num
+            if loaded_layer_num <= 0:
+                raise ValueError("[ERROR] invalid max_layer_num")
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        start_time = time.perf_counter()
+
+        node.load_shards(0, loaded_layer_num)
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        end_time = time.perf_counter()
+
+        cold_start_time = end_time - start_time
+        load_latency_per_layer = cold_start_time / loaded_layer_num
+
+        print("[INFO] overall cold start time: ", str(cold_start_time))
+        print("[INFO] load latency per layer: ", str(load_latency_per_layer))
 
     def go_through_every_shards(self, out_token_num: int = 50):
         node0 = NodeWorker(

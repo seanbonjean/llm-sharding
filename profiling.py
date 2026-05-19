@@ -8,4 +8,5 @@ profiler = NodeProfiler(
     dtype=torch.float16
 )
 # profiler.go_through_every_shards(out_token_num=256)
-profiler.profile_compute_capability(max_layer_num=None)
+# profiler.profile_compute_capability(max_layer_num=None)
+profiler.profile_cold_start_latency(max_layer_num=None)

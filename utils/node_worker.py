@@ -352,7 +352,7 @@ class NodeWorker:
 
         if self.shard is not None:
             self.past_key_value = DynamicCache()
-        print("[INFO] KV cache and all states caused by prev user are cleared.")
+        print("\n[INFO] KV cache and all states caused by prev user are cleared.")
 
     def _get_clear_KV_cache_origin(self) -> dict:
         """

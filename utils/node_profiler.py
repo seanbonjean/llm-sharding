@@ -562,7 +562,7 @@ class NodeProfiler:
         cold_start_time = end_time - start_time
         load_latency_per_layer = cold_start_time / loaded_layer_num
 
-        print("[INFO] overall cold start time: ", str(cold_start_time))
+        print(f"[INFO] overall cold start time ({loaded_layer_num} layer): ", str(cold_start_time))
         print("[INFO] load latency per layer: ", str(load_latency_per_layer))
 
     def go_through_every_shards(self, out_token_num: int = 50):

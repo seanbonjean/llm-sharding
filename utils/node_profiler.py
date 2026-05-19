@@ -419,10 +419,7 @@ class NodeProfiler:
             )
             return
 
-        decode_request = (
-            "Write a long and detailed explanation about distributed inference across edge devices. "
-            "Continue with implementation details, trade-offs, and examples for several paragraphs."
-        )
+        decode_request = "The capital of France is"
         # displayed_output_token_lengths 与下面的 output_token_lengths 区分：output_token_lengths 是所有输出 token，而这里表示希望重点查看和打印的输出长度检查点，放置画图时每个 token 都有一个采样点，导致点过于密集
         # 为了与 prefill 阶段对照，decode 阶段选用同一组 token length 作为这些检查点
         displayed_output_token_lengths = input_token_lengths.copy()

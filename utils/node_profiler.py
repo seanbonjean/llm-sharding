@@ -263,23 +263,23 @@ class NodeProfiler:
         if fitted_slope_relative_difference <= similarity_threshold:
             print(
                 "[INFO] according to the linear-fit slopes, prefill and decode compute capabilities "
-                f"can be regarded as approximately similar under the {similarity_threshold:.0%} threshold."
+                f"CAN be regarded as approximately similar under the {similarity_threshold:.0%} threshold."
             )
         else:
             print(
                 "[INFO] according to the linear-fit slopes, prefill and decode compute capabilities "
-                f"are not approximately similar under the {similarity_threshold:.0%} threshold."
+                f"are NOT approximately similar under the {similarity_threshold:.0%} threshold."
             )
         if quadratic_marginal_relative_difference_avg is not None:
             if quadratic_marginal_relative_difference_avg <= similarity_threshold:
                 print(
                     "[INFO] according to the quadratic-fit marginal costs, prefill and decode compute capabilities "
-                    f"can be regarded as approximately similar on average under the {similarity_threshold:.0%} threshold."
+                    f"CAN be regarded as approximately similar on average under the {similarity_threshold:.0%} threshold."
                 )
             else:
                 print(
                     "[INFO] according to the quadratic-fit marginal costs, prefill and decode compute capabilities "
-                    f"are not approximately similar on average under the {similarity_threshold:.0%} threshold."
+                    f"are NOT approximately similar on average under the {similarity_threshold:.0%} threshold."
                 )
 
     def profile_compute_capability(self, max_layer_num: int = None):

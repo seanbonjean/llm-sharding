@@ -11,6 +11,21 @@ from utils.forwarding_utils import build_position_ids
 
 
 class NodeProfiler:
+    PROFILE_INTERVAL_SLEEP_TIME = 1  # 每次测试之间间隔时间 (单位：秒)
+    PROFILE_REPEAT_NUM = 3  # 相同 prompt length 下的重复测试次数 (相同测试重复多次取平均)
+    PROFILE_PREFILL_INPUT_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]  # 测试 prefill 阶段的计算能力时，各输入 prompt 的 token length
+    PROFILE_DECODE_OUTPUT_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]  # 测试 decode 阶段的计算能力后，作图时采样点的采样位置 (拟合时使用了每个 token 的点，这在绘图时会造成点过密)
+    PROFILE_PREFILL_PROMPT_FRAGMENT = (
+        "Distributed inference splits a language model across multiple edge devices so that "
+        "each device processes part of the network while cooperating with the others. "
+    )  # 测试 prefill 阶段的计算能力时，通过重复这段 fragment 来生成不同长度的 prompt
+    PROFILE_DECODE_REQUEST = "The capital of France is"
+
+    # ZMQ 状态信号
+    ASSISTED_COMMAND_KEY = "profile_command"
+    ASSISTED_PREFILL_ACK_COMMAND = "prefill_ack"
+    ASSISTED_DECODE_DONE_COMMAND = "decode_done"
+
     def __init__(self, shards_path: str, device="cpu", dtype=torch.float16):
         """
         :param shards_path: 切片路径
@@ -282,8 +297,285 @@ class NodeProfiler:
                     f"are NOT approximately similar on average under the {similarity_threshold:.0%} threshold."
                 )
 
-    def profile_compute_capability(self, max_layer_num: int = None):
+    def _synchronize_device(self) -> None:
         """
+        Synchronize CUDA work before or after latency measurement.
+
+        CUDA kernel 默认是异步提交的，Python 代码不会等 GPU 真正算完就继续往下走。所以做 profile 时，如果不在 perf_counter() 前后同步，测到的可能只是“提交计算任务”的时间，而不是 GPU 实际执行完的时间
+        CUDA kernel launches are asynchronous: Python may continue running before the GPU has finished the queued computation. Profiling code calls this helper around perf_counter() boundaries so measured latency reflects the actual GPU execution time instead of only the kernel launch overhead. On non-CUDA devices this is intentionally a no-op.
+        """
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @classmethod
+    def _build_assisted_command(cls, command: str) -> dict:
+        return {cls.ASSISTED_COMMAND_KEY: command}
+
+    @classmethod
+    def _is_assisted_command(cls, data: object, command: str | None = None) -> bool:
+        """
+        判断数据是否为 ZMQ 状态信号，如有指定具体信号，判断数据是否为对应信号
+        """
+        if not isinstance(data, dict) or cls.ASSISTED_COMMAND_KEY not in data:
+            return False
+        return command is None or data[cls.ASSISTED_COMMAND_KEY] == command
+
+    def _resolve_profile_loaded_layer_num(self, max_layer_num: int) -> int:
+        if max_layer_num == -1:
+            return self.layer_num
+        loaded_layer_num = max_layer_num - 1  # 预留给 KV Cache 一些空间
+        if loaded_layer_num <= 0:
+            raise ValueError("[ERROR] max_layer_num is too small to reserve space for KV cache.")
+        return loaded_layer_num
+
+    def _resolve_assisted_target_loaded_layer_num(self, target_max_layer_num: int) -> int:
+        if target_max_layer_num is None:
+            print("[WARNING] max_layer_num needed, pls rerun this profile using the result after automaticly evoking profile_max_layer_num(), or if the device can load all model layers, pls do NOT use assisted profiling mode.")
+            target_loaded_layer_num = self.profile_max_layer_num()
+        if target_max_layer_num == -1:
+            raise ValueError("[ERROR] assisted profiling is only needed when target device can only load partial layers, but max_layer_num == -1 means the device can load all model layers.")
+        target_loaded_layer_num = target_max_layer_num - 1
+        if target_loaded_layer_num <= 0:
+            raise ValueError("[ERROR] target_max_layer_num is too small to reserve space for KV cache.")
+        if target_loaded_layer_num >= self.layer_num:
+            raise ValueError(
+                "[ERROR] the device can load all model layers, pls do NOT use assisted profiling mode."
+            )
+        return target_loaded_layer_num
+
+    def _build_profile_input_ids(self, tokenizer) -> tuple[list[int], list[torch.Tensor]]:
+        """
+        由多个 frag 重复组成完整的长 prompt ，tokenize 后切割成不同长度的输入
+        """
+        input_token_lengths = self.PROFILE_PREFILL_INPUT_TOKEN_LENGTHS.copy()
+        if max(input_token_lengths) > self.config.max_position_embeddings:
+            raise ValueError("[ERROR] requested prompt length exceeds model max_position_embeddings.")
+
+        long_prompt = self.PROFILE_PREFILL_PROMPT_FRAGMENT
+        long_prompt_input_ids = tokenizer(long_prompt, return_tensors="pt")["input_ids"]
+        # 重复拼接 frag 直到最长长度达到需求
+        while long_prompt_input_ids.shape[1] < max(input_token_lengths):
+            long_prompt += self.PROFILE_PREFILL_PROMPT_FRAGMENT
+            long_prompt_input_ids = tokenizer(long_prompt, return_tensors="pt")["input_ids"]
+
+        # 根据指定的各个 token 长度，构建不同长度的 prompt (直接以 token ids 格式截断，以保证 token length 正确)
+        input_ids_of_each_request = [
+            long_prompt_input_ids[:, :token_length].clone()
+            for token_length in input_token_lengths
+        ]
+        return input_token_lengths, input_ids_of_each_request
+
+    def _report_prefill_profile_results(self, input_token_lengths: list[int],
+                                        repeated_computation_latencies: list[list[float]],
+                                        computation_latencies: list[float],
+                                        loaded_layer_num: int) -> tuple[float, dict]:
+        if len(computation_latencies) != len(input_token_lengths):
+            raise ValueError("[ERROR] tested computation latency number is not equal to request number.")
+
+        # 如果设备显存不足导致 profile 时没有完全加载所有 layer，则近似换算到完整加载所有 layer 时的 latency
+        latency_scale = self.layer_num / loaded_layer_num
+        normalized_latencies = [latency * latency_scale for latency in computation_latencies]
+        print("[INFO] tested prompt token lengths=", input_token_lengths)
+        print(f"[INFO] first-token latencies (each repeated {self.PROFILE_REPEAT_NUM} times):")
+        for latencies_of_each_length in repeated_computation_latencies:
+            print(latencies_of_each_length)
+        print("[INFO] normalized first-token latencies=", normalized_latencies)
+
+        prefill_comp_capa_sum = 0  # prefill 阶段 计算能力 测试的所有计算能力之和 (仅用于求平均)
+        print("[INFO] each compute capability c_k=", end=" ")
+        for token_length, latency in zip(input_token_lengths, normalized_latencies):
+            prefill_comp_capa = latency / token_length  # prefill 阶段 不同输入 token 长度下各自的计算能力
+            prefill_comp_capa_sum += prefill_comp_capa
+            print(prefill_comp_capa, end=" / ")
+        prefill_comp_capa_avg = prefill_comp_capa_sum / len(input_token_lengths)
+        print(
+            "\n[INFO] average compute capability c_k=",
+            str(prefill_comp_capa_avg),
+            f" sec / (token * {self.layer_num}layer)",
+        )
+
+        prefill_fit_result = self._fit_latency_models(
+            token_lengths=input_token_lengths,
+            latencies=normalized_latencies,
+            scatter_token_lengths=input_token_lengths,
+            scatter_latencies=normalized_latencies,
+            x_label="Input token length",
+            y_label="First-token latency (sec, full-model equivalent)",
+            plot_title="Prefill first-token latency fit",
+            plot_filename="profile_prefill_compute_capability.png",
+        )
+        return prefill_comp_capa_avg, prefill_fit_result
+
+    def _report_decode_profile_results(self, cumulative_decode_latencies: list[float],
+                                       displayed_output_token_lengths: list[int],
+                                       loaded_layer_num: int) -> tuple[float, dict, list[int]] | None:
+        """
+        输出 decode 时延的统计结果，进行拟合并绘图
+        """
+        max_output_token_length = max(displayed_output_token_lengths)
+        if len(cumulative_decode_latencies) < max_output_token_length:
+            print(
+                "[WARNING] decode profiling stopped early because EOS was generated before "
+                f"output token length reached {max_output_token_length}."
+            )
+        if len(cumulative_decode_latencies) < 3:
+            print("[WARNING] too few decode points were collected; skip decode fitting and stage comparison.")
+            return None
+
+        # 换算到完整加载所有 layer 时的 latency
+        latency_scale = self.layer_num / loaded_layer_num
+        normalized_cumulative_decode_latencies = [
+            latency * latency_scale
+            for latency in cumulative_decode_latencies
+        ]
+        # output_token_lengths 表示真实参与拟合的完整横轴：
+        # 因为上面记录了每个 output token 生成完成时的累计时延，所以这里是 1, 2, ..., N，
+        # 而不是只包含 target_output_token_lengths 中的几个采样检查点。
+        output_token_lengths = list(range(1, len(normalized_cumulative_decode_latencies) + 1))
+        # 输出回答的总 token 长度可能不足 (过早达到 EOS)，想要显示的对应 token 长度不一定全都有相应位置的 token
+        sampled_output_token_lengths = [
+            token_length
+            for token_length in displayed_output_token_lengths
+            if token_length <= len(normalized_cumulative_decode_latencies)
+        ]
+        # 找到每个采样点对应的 latency
+        sampled_decode_latencies = [
+            normalized_cumulative_decode_latencies[token_length - 1]  # 由于 token_length 是从1开始计数的
+            for token_length in sampled_output_token_lengths
+        ]
+        if not sampled_output_token_lengths:
+            print("[WARNING] no decode sample reached the configured comparison checkpoints.")
+            return None
+
+        print("[INFO] sampled decode output token lengths=", sampled_output_token_lengths)
+        print("[INFO] cumulative decode latencies=", sampled_decode_latencies)
+        decode_comp_capa_sum = 0
+        print("[INFO] each decode compute capability c_k=", end=" ")
+        for token_length, latency in zip(sampled_output_token_lengths, sampled_decode_latencies):
+            decode_comp_capa = latency / token_length
+            decode_comp_capa_sum += decode_comp_capa
+            print(decode_comp_capa, end=" / ")
+        decode_comp_capa_avg = decode_comp_capa_sum / len(sampled_output_token_lengths)
+        print(
+            "\n[INFO] average decode compute capability c_k=",
+            str(decode_comp_capa_avg),
+            f" sec / (token * {self.layer_num}layer)",
+        )
+
+        decode_fit_result = self._fit_latency_models(
+            token_lengths=output_token_lengths,
+            latencies=normalized_cumulative_decode_latencies,
+            scatter_token_lengths=sampled_output_token_lengths,
+            scatter_latencies=sampled_decode_latencies,
+            x_label="Output token length",
+            y_label="Cumulative decode latency (sec, full-model equivalent)",
+            plot_title="Decode cumulative latency fit",
+            plot_note="Fit uses cumulative latency from every generated output token, not only sampled checkpoints.",
+            plot_filename="profile_decode_compute_capability.png",
+        )
+        return decode_comp_capa_avg, decode_fit_result, sampled_output_token_lengths
+
+    def _assisted_target_prefill_round(self, node: NodeWorker, measure_latency: bool = False) -> float | None:
+        """
+        prefill 阶段的 profile，target device 执行内容：收到 assistor 的输入后，对放置在本 target device 的 shard 进行计算并计时，最后不需要返回结果给 assistor，只需返回一个执行完毕 ACK 信号给 assistor
+        该函数对应 assistor device 的 _assistor_assist_prefill_round 函数
+        """
+        received_data = node.communicator.receive_data()
+        if self._is_assisted_command(received_data):
+            raise RuntimeError("[ERROR] received an assisted command where prefill state was expected.")
+
+        self._synchronize_device()
+        start_time = time.perf_counter()
+        processed_data = node.pass_through_shard(received_data)
+        self._synchronize_device()
+        end_time = time.perf_counter()
+
+        del received_data
+        del processed_data
+        node.clear_KV_cache()
+        node.communicator.transfer_data(
+            self._build_assisted_command(self.ASSISTED_PREFILL_ACK_COMMAND)
+        )
+        if measure_latency:
+            return end_time - start_time
+        return None
+
+    def _assisted_target_decode_round(self, node: NodeWorker, measure_latency: bool = False) -> list[float]:
+        """
+        decode 阶段的 profile，target device 执行内容：收到 assistor 的输入后，对放置在本 target device 的 shard 进行计算并计时，最后将中间层结果返回给 assistor 进行 next token 的生成，从而能在 assistor 的帮助下进行完整推理
+        """
+        cumulative_decode_latencies = []
+        cumulative_decode_latency = 0.0
+
+        while True:
+            received_data = node.communicator.receive_data()
+            if self._is_assisted_command(received_data, self.ASSISTED_DECODE_DONE_COMMAND):
+                break
+            if self._is_assisted_command(received_data):
+                raise RuntimeError("[ERROR] received unknown assisted command during decode profiling.")
+
+            self._synchronize_device()
+            start_time = time.perf_counter()
+            processed_data = node.pass_through_shard(received_data)
+            self._synchronize_device()
+            end_time = time.perf_counter()
+
+            if measure_latency:
+                cumulative_decode_latency += end_time - start_time
+                cumulative_decode_latencies.append(cumulative_decode_latency)
+
+            node.communicator.transfer_data(processed_data)
+            del received_data
+            del processed_data
+
+        node.clear_KV_cache()
+        return cumulative_decode_latencies
+
+    def _assistor_assist_prefill_round(self, node: NodeWorker, input_ids: torch.Tensor) -> None:
+        """
+        prefill 阶段的 profile，assistor device 执行内容：经过 embedding 层，embedding 层输出结果返回给 target device；target device 执行完毕后，assistor 不需要继续执行，assistor 只需等待一个执行完毕 ACK 信号即可结束
+        该函数对应 target device 的 _assisted_target_prefill_round 函数
+        """
+        data = node.receive_user_request(input_ids=input_ids)
+        node.communicator.transfer_data(data)
+
+        received_data = node.communicator.receive_data()
+        if not self._is_assisted_command(received_data, self.ASSISTED_PREFILL_ACK_COMMAND):
+            raise RuntimeError(
+                f"[ERROR] expected assisted profiling command {self.ASSISTED_PREFILL_ACK_COMMAND}, "
+                f"but received {type(received_data)}."
+            )
+        del data
+        node.clear_KV_cache()
+
+    def _assistor_assist_decode_round(self, node: NodeWorker, max_new_tokens: int) -> None:
+        """
+        decode 阶段的 profile，assistor device 执行内容：经过 embedding 层，embedding 层输出结果返回给 target device；target device 执行完毕后，assistor 接收中间层结果并辅助其执行到最后 layer，再将 next token 对应 embedding 层再发送给 target device，直到 reached_end=True (token 得到 EOS 或达到 max_new_tokens)
+        """
+        data = node.receive_user_request(request=self.PROFILE_DECODE_REQUEST)
+        reached_end = False
+        while not reached_end:
+            node.communicator.transfer_data(data)
+            target_output = node.communicator.receive_data()
+            if self._is_assisted_command(target_output):
+                raise RuntimeError("[ERROR] received assisted command where target decode state was expected.")
+            processed_data = node.pass_through_shard(target_output)
+            reached_end, data = node.receive_next_token(
+                processed_data,
+                max_new_tokens=max_new_tokens,
+            )
+            del target_output
+            del processed_data
+
+        # 通知 target device 测试结束
+        node.communicator.transfer_data(
+            self._build_assisted_command(self.ASSISTED_DECODE_DONE_COMMAND)
+        )
+        node.clear_KV_cache()
+
+    def _profile_compute_capability_legacy(self, max_layer_num: int = None):
+        """
+        旧版方法，仅支持无辅助节点时测试节点 prefill 和 decode 能力
         :param max_layer_num: 节点能放下的最大层数（包含embedding的情况下）; -1代表设备必定能放下所有，忽略内存限制
         """
         interval_sleep_time = 1  # 每次测试之间间隔时间 (单位：秒)
@@ -463,6 +755,7 @@ class NodeProfiler:
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             cumulative_decode_latencies.append(time.perf_counter() - decode_start_time)
+        node.clear_KV_cache()
 
         if len(cumulative_decode_latencies) < max_output_token_length:
             print(
@@ -471,7 +764,6 @@ class NodeProfiler:
             )
         if len(cumulative_decode_latencies) < 3:
             print("[WARNING] too few decode points were collected; skip decode fitting and stage comparison.")
-            node.clear_KV_cache()
             return
 
         # output_token_lengths 表示真实参与拟合的完整横轴：
@@ -491,7 +783,6 @@ class NodeProfiler:
         ]
         if not sampled_output_token_lengths:
             print("[WARNING] no decode sample reached the configured comparison checkpoints.")
-            node.clear_KV_cache()
             return
 
         print("[INFO] sampled decode output token lengths=", sampled_output_token_lengths)
@@ -527,7 +818,322 @@ class NodeProfiler:
             decode_quadratic_coefficients=decode_fit_result["quadratic_coefficients"],
             comparison_token_lengths=sampled_output_token_lengths,
         )
+
+    def profile_compute_capability(self, max_layer_num: int = None, assisted: bool = False,
+                                   src_addr: str = "tcp://*:40800",
+                                   dst_addr: str = "tcp://172.16.0.1:40800"):
+        """
+        (旧版方法已转移至 _profile_compute_capability_legacy)
+        :param max_layer_num: 节点能放下的最大层数（包含embedding的情况下）; -1代表设备必定能放下所有，忽略内存限制 / maximum placeable layer number of this device, can be found by profile_max_layer_num() or enter manually; -1 means placing full model is safe.
+        :param assisted: 是否存在另一辅助设备运行 assist_profile_compute_capability() 以帮助本节点进行计算能力的 profile / when True, another device should run assist_profile_compute_capability() to help this node profile computing capability.
+        :param src_addr: local ZMQ PULL address, used when assisted=True.
+        :param dst_addr: remote ZMQ PUSH address, used when assisted=True.
+        """
+        if assisted:
+            self._profile_compute_capability_assisted_target(
+                max_layer_num=max_layer_num,
+                src_addr=src_addr,
+                dst_addr=dst_addr,
+            )
+            return
+
+        if max_layer_num is None:
+            print("[WARNING] max_layer_num needed, pls rerun this profile using the result after automaticly evoking profile_max_layer_num(), or if the device can load all model layers, this profile process will continue running without killing by CUDA OOM Exception.")
+            max_layer_num = self.profile_max_layer_num()
+
+        computation_latencies = list()  # 每种 prompt 长度重复测试后的平均时延
+        repeated_computation_latencies = list()  # 保留每种 prompt 长度下的全部重复测试结果
+
+        node = NodeWorker(
+            src_addr="tcp://*:40800",
+            dst_addr="tcp://127.0.0.1:40800",
+            can_receive_user_request=True,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        loaded_layer_num = self._resolve_profile_loaded_layer_num(max_layer_num)
+        node.load_shards(0, loaded_layer_num)
+
+        input_token_lengths, input_ids_of_each_request = self._build_profile_input_ids(node.tokenizer)
+
+        # ! 实验发现首次测试的时延总会出现异常值，因此在测试前先做 warm-up
+        # 正式计时前先用最长 prompt 与最短 prompt 各进行一次 warm-up：
+        # 让 CUDA lazy initialization、kernel 首次加载、序列化、ZMQ 自发自收等首轮开销先发生，
+        # 同时让第一个正式测试点会使用的短 prompt 也提前经过一次完整路径，
+        # 避免这些额外开销只落在第一个测试点上，导致第一个 latency 成为异常值并干扰后续拟合
+        print("[INFO] warming up prefill profiling path...")
+        warmup_input_ids_list = [
+            input_ids_of_each_request[-1],  # 最长 prompt：先热完整 prefill 路径
+            input_ids_of_each_request[0],   # 最短 prompt：再热首个正式测试点的短 prompt
+        ]
+        for warmup_input_ids in warmup_input_ids_list:
+            warmup_data0 = node.receive_user_request(input_ids=warmup_input_ids)
+            warmup_data1 = node.pass_through_shard(warmup_data0)
+            self._synchronize_device()
+            node.clear_KV_cache()
+            del warmup_data0
+            del warmup_data1
+            time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+        print("[INFO] prefill profiling warm-up finished.")
+
+        # 时延的实际测试，注意与 warm-up 代码同步修改
+        total_test_num = len(input_token_lengths) * self.PROFILE_REPEAT_NUM
+        finished_test_num = 0
+        for i in range(len(input_token_lengths)):
+            latencies_of_current_length = list()
+            for _ in range(self.PROFILE_REPEAT_NUM):
+                self._synchronize_device()
+                start_time = time.perf_counter()
+                data0 = node.receive_user_request(input_ids=input_ids_of_each_request[i])
+                data1 = node.pass_through_shard(data0)
+                self._synchronize_device()
+                end_time = time.perf_counter()
+                computation_latency = end_time - start_time
+                latencies_of_current_length.append(computation_latency)
+                node.clear_KV_cache()  # 没有遇到 EOS token，需要手动清除KV Cache
+
+                finished_test_num += 1
+                if finished_test_num < total_test_num:
+                    time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+
+            repeated_computation_latencies.append(latencies_of_current_length)
+            computation_latencies.append(sum(latencies_of_current_length) / self.PROFILE_REPEAT_NUM)
+
+        prefill_comp_capa_avg, prefill_fit_result = self._report_prefill_profile_results(
+            input_token_lengths=input_token_lengths,
+            repeated_computation_latencies=repeated_computation_latencies,
+            computation_latencies=computation_latencies,
+            loaded_layer_num=loaded_layer_num,
+        )
+
+        # 只有完整加载了整个模型时，才能进行真实的连续 decode 推理。
+        # 当当前设备只加载了部分层时，保留上面的 prefill profile 结果，但跳过这里的验证实验。
+        if loaded_layer_num != self.layer_num:
+            print(
+                "[WARNING] decode profiling needs the full model on one device. "
+                "Pass max_layer_num=-1 on a device with enough memory to validate "
+                "whether prefill and decode compute capabilities are similar."
+            )
+            return
+
+        # displayed_output_token_lengths 与下面的 output_token_lengths 区分：output_token_lengths 是所有输出 token，而这里表示希望重点查看和打印的输出长度检查点，放置画图时每个 token 都有一个采样点，导致点过于密集
+        # 为了与 prefill 阶段对照，decode 阶段选用同一组 token length 作为这些检查点
+        displayed_output_token_lengths = self.PROFILE_DECODE_OUTPUT_TOKEN_LENGTHS.copy()
+        max_output_token_length = max(displayed_output_token_lengths)
+
+        # decode 路径单独 warm-up 一次：
+        # prefill 的 warm-up 已经覆盖了首轮 prompt 前向，但后续连续 seq_len=1 的循环还没有独立跑过。
+        print("[INFO] warming up decode profiling path...")
+        warmup_output_token_length = displayed_output_token_lengths[0]  # 取最短输出长度，足够覆盖 decode 路径
+        warmup_reached_end = False
+        warmup_data0 = node.receive_user_request(request=self.PROFILE_DECODE_REQUEST)
+        while not warmup_reached_end:
+            warmup_data1 = node.pass_through_shard(warmup_data0)
+            warmup_reached_end, warmup_data0 = node.receive_next_token(
+                warmup_data1,
+                max_new_tokens=warmup_output_token_length,
+            )
+        self._synchronize_device()
         node.clear_KV_cache()
+        time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+        print("[INFO] decode profiling warm-up finished.")
+
+        # 正式 decode 测试按正常生成过程记录累计时延：
+        # 第 1、2、... 个点分别表示“output token length 达到 1、2、... 时”的累计耗时。
+        # 其中第一个点包含首个 output token 的生成，后续点则继续累加 decode 阶段的生成时间；
+        # 因而在线性拟合中，首个 token 的额外开销会更多体现在截距，斜率仍可用于观察后续 decode 的单位 token 成本。
+        data0 = node.receive_user_request(request=self.PROFILE_DECODE_REQUEST)
+        self._synchronize_device()
+        decode_start_time = time.perf_counter()
+
+        cumulative_decode_latencies = list()
+        reached_end = False
+        while not reached_end:
+            data1 = node.pass_through_shard(data0)
+            reached_end, data0 = node.receive_next_token(
+                data1,
+                max_new_tokens=max_output_token_length,
+            )
+            self._synchronize_device()
+            cumulative_decode_latencies.append(time.perf_counter() - decode_start_time)
+        node.clear_KV_cache()
+
+        decode_report = self._report_decode_profile_results(
+            cumulative_decode_latencies=cumulative_decode_latencies,
+            displayed_output_token_lengths=displayed_output_token_lengths,
+            loaded_layer_num=loaded_layer_num,
+        )
+        if decode_report is None:
+            return
+
+        decode_comp_capa_avg, decode_fit_result, sampled_output_token_lengths = decode_report
+        self._report_prefill_decode_similarity(
+            prefill_comp_capa_avg=prefill_comp_capa_avg,
+            decode_comp_capa_avg=decode_comp_capa_avg,
+            prefill_linear_slope=prefill_fit_result["linear_coefficients"][0].item(),
+            decode_linear_slope=decode_fit_result["linear_coefficients"][0].item(),
+            prefill_quadratic_coefficients=prefill_fit_result["quadratic_coefficients"],
+            decode_quadratic_coefficients=decode_fit_result["quadratic_coefficients"],
+            comparison_token_lengths=sampled_output_token_lengths,
+        )
+
+    def _profile_compute_capability_assisted_target(self, max_layer_num: int,
+                                                    src_addr: str,
+                                                    dst_addr: str) -> None:
+        """
+        当无法放下模型所有layer时，作为target device 放置模型部分层，在放置有其他剩余层的 assistor device 的帮助下进行部分 layer 的 profile，并换算到全部 layer 的时延
+        该部分函数对应 assistor device 运行的 assist_profile_compute_capability 函数：
+        该部分函数中的 _assisted_target_prefill_round 与 assistor device 的 _assistor_assist_prefill_round 对应
+        该部分函数中的 _assisted_target_decode_round 与 assistor device 的 _assistor_assist_decode_round 对应
+        它们共同组成了 profile_compute_capability(assisted=False) 时的逻辑
+        """
+        target_loaded_layer_num = self._resolve_assisted_target_loaded_layer_num(max_layer_num)
+        input_token_lengths = self.PROFILE_PREFILL_INPUT_TOKEN_LENGTHS.copy()
+        if max(input_token_lengths) > self.config.max_position_embeddings:
+            raise ValueError("[ERROR] requested prompt length exceeds model max_position_embeddings.")
+
+        computation_latencies = list()  # 每种 prompt 长度重复测试后的平均时延
+        repeated_computation_latencies = list()  # 保留每种 prompt 长度下的全部重复测试结果
+
+        node = NodeWorker(
+            src_addr=src_addr,
+            dst_addr=dst_addr,
+            can_receive_user_request=False,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        node.load_shards(0, target_loaded_layer_num)
+
+        # prefill 的 profile
+
+        # ! 实验发现首次测试的时延总会出现异常值，因此在测试前先做 warm-up
+        # 正式计时前先用最长 prompt 与最短 prompt 各进行一次 warm-up：
+        # 让 CUDA lazy initialization、kernel 首次加载、序列化、ZMQ 自发自收等首轮开销先发生，
+        # 同时让第一个正式测试点会使用的短 prompt 也提前经过一次完整路径，
+        # 避免这些额外开销只落在第一个测试点上，导致第一个 latency 成为异常值并干扰后续拟合
+        print("[INFO] assisted target warming up prefill profiling path...")
+        for _ in range(2):
+            self._assisted_target_prefill_round(node, measure_latency=False)
+            time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+        print("[INFO] assisted target prefill profiling warm-up finished.")
+
+        # 时延的实际测试，注意与 warm-up 代码同步修改
+        total_test_num = len(input_token_lengths) * self.PROFILE_REPEAT_NUM
+        finished_test_num = 0
+        for _ in input_token_lengths:
+            latencies_of_current_length = list()
+            for _ in range(self.PROFILE_REPEAT_NUM):
+                computation_latency = self._assisted_target_prefill_round(node, measure_latency=True)
+                latencies_of_current_length.append(computation_latency)
+
+                finished_test_num += 1
+                if finished_test_num < total_test_num:
+                    time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+
+            repeated_computation_latencies.append(latencies_of_current_length)
+            computation_latencies.append(sum(latencies_of_current_length) / self.PROFILE_REPEAT_NUM)
+
+        prefill_comp_capa_avg, prefill_fit_result = self._report_prefill_profile_results(
+            input_token_lengths=input_token_lengths,
+            repeated_computation_latencies=repeated_computation_latencies,
+            computation_latencies=computation_latencies,
+            loaded_layer_num=target_loaded_layer_num,
+        )
+
+        # decode 的 profile
+        displayed_output_token_lengths = self.PROFILE_DECODE_OUTPUT_TOKEN_LENGTHS.copy()
+        print("[INFO] assisted target warming up decode profiling path...")
+        self._assisted_target_decode_round(node, measure_latency=False)
+        time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+        print("[INFO] assisted target decode profiling warm-up finished.")
+
+        # 正式 decode 测试按正常生成过程记录累计时延：
+        # 第 1、2、... 个点分别表示“output token length 达到 1、2、... 时”的累计耗时。
+        # 其中第一个点包含首个 output token 的生成，后续点则继续累加 decode 阶段的生成时间；
+        # 因而在线性拟合中，首个 token 的额外开销会更多体现在截距，斜率仍可用于观察后续 decode 的单位 token 成本。
+        cumulative_decode_latencies = self._assisted_target_decode_round(node, measure_latency=True)
+        decode_report = self._report_decode_profile_results(
+            cumulative_decode_latencies=cumulative_decode_latencies,
+            displayed_output_token_lengths=displayed_output_token_lengths,
+            loaded_layer_num=target_loaded_layer_num,
+        )
+        if decode_report is None:
+            return
+
+        decode_comp_capa_avg, decode_fit_result, sampled_output_token_lengths = decode_report
+        self._report_prefill_decode_similarity(
+            prefill_comp_capa_avg=prefill_comp_capa_avg,
+            decode_comp_capa_avg=decode_comp_capa_avg,
+            prefill_linear_slope=prefill_fit_result["linear_coefficients"][0].item(),
+            decode_linear_slope=decode_fit_result["linear_coefficients"][0].item(),
+            prefill_quadratic_coefficients=prefill_fit_result["quadratic_coefficients"],
+            decode_quadratic_coefficients=decode_fit_result["quadratic_coefficients"],
+            comparison_token_lengths=sampled_output_token_lengths,
+        )
+
+    def assist_profile_compute_capability(self, target_max_layer_num: int,
+                                          src_addr: str = "tcp://*:40800",
+                                          dst_addr: str = "tcp://172.16.0.2:40800") -> None:
+        """
+        作为 assistor device 辅助 target device 进行 profile，assistor device 放置有 target device 缺少的所有 layer，从而使 target 能够进行 prefill 和 decode
+        该部分函数对应 target device 运行的 _profile_compute_capability_assisted_target 函数：
+        该部分函数中的 _assistor_assist_prefill_round 与 target device 的 _assisted_target_prefill_round 对应
+        该部分函数中的 _assistor_assist_decode_round 与 target device 的 _assisted_target_decode_round 对应
+        它们共同组成了 profile_compute_capability(assisted=False) 时的逻辑
+        """
+        target_loaded_layer_num = self._resolve_assisted_target_loaded_layer_num(target_max_layer_num)
+        node = NodeWorker(
+            src_addr=src_addr,
+            dst_addr=dst_addr,
+            can_receive_user_request=True,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        node.load_shards(target_loaded_layer_num, self.layer_num)
+
+        # prefill 的 profile assist
+        _, input_ids_of_each_request = self._build_profile_input_ids(node.tokenizer)
+
+        # ! 实验发现首次测试的时延总会出现异常值，因此在测试前先做 warm-up
+        # 正式计时前先用最长 prompt 与最短 prompt 各进行一次 warm-up：
+        # 让 CUDA lazy initialization、kernel 首次加载、序列化、ZMQ 自发自收等首轮开销先发生，
+        # 同时让第一个正式测试点会使用的短 prompt 也提前经过一次完整路径，
+        # 避免这些额外开销只落在第一个测试点上，导致第一个 latency 成为异常值并干扰后续拟合
+        print("[INFO] assist warming up prefill profiling path...")
+        warmup_input_ids_list = [
+            input_ids_of_each_request[-1],  # 最长 prompt：先热完整 prefill 路径
+            input_ids_of_each_request[0],   # 最短 prompt：再热首个正式测试点的短 prompt
+        ]
+        for warmup_input_ids in warmup_input_ids_list:
+            self._assistor_assist_prefill_round(node, warmup_input_ids)
+            time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+        print("[INFO] assist prefill profiling warm-up finished.")
+
+        # 时延的实际测试，注意与 warm-up 代码同步修改
+        total_test_num = len(input_ids_of_each_request) * self.PROFILE_REPEAT_NUM
+        finished_test_num = 0
+        for input_ids in input_ids_of_each_request:
+            for _ in range(self.PROFILE_REPEAT_NUM):
+                self._assistor_assist_prefill_round(node, input_ids)
+
+                finished_test_num += 1
+                if finished_test_num < total_test_num:
+                    time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+
+        # decode 的 profile assist
+        displayed_output_token_lengths = self.PROFILE_DECODE_OUTPUT_TOKEN_LENGTHS.copy()
+        # decode 路径单独 warm-up 一次：
+        # prefill 的 warm-up 已经覆盖了首轮 prompt 前向，但后续连续 seq_len=1 的循环还没有独立跑过。
+        print("[INFO] assist warming up decode profiling path...")
+        self._assistor_assist_decode_round(node, max_new_tokens=displayed_output_token_lengths[0])  # 取最短输出长度，足够覆盖 decode 路径
+        time.sleep(self.PROFILE_INTERVAL_SLEEP_TIME)
+        print("[INFO] assist decode profiling warm-up finished.")
+
+        self._assistor_assist_decode_round(node, max_new_tokens=max(displayed_output_token_lengths))
+        print("[INFO] assist compute capability profiling finished.")
 
     def profile_cold_start_latency(self, max_layer_num: int = None):
         if max_layer_num is None:

@@ -7,13 +7,9 @@ profiler = NodeProfiler(
     device="cuda:0",
     dtype=torch.float16
 )
-# profiler.go_through_every_shards(out_token_num=256)
-# profiler.profile_compute_capability(max_layer_num=None)
-# profiler.profile_cold_start_latency(max_layer_num=None)
 
-profiler.profile_compute_capability(
-    max_layer_num=7,
-    assisted=True,
+profiler.assist_profile_compute_capability(
+    target_max_layer_num=7,
     src_addr="tcp://*:40800",
-    dst_addr="tcp://172.16.0.1:40800"
+    dst_addr="tcp://172.16.0.2:40800",
 )

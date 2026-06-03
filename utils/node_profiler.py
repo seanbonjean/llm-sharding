@@ -1028,7 +1028,7 @@ class NodeProfiler:
         2. 根据 torch.cuda.memory_allocated() 的增量得到的实际大小（仅在 CUDA 设备上可用）
 
         This intentionally uses the full model on one node, has no assisted path, does not
-        reserve space for OOM avoidance, and does not run warm-up rounds.
+        reserve 1 layer space for KV Cache to avoid OOM, and runs one prefill warm-up before memory measurement to load the lazy tensors.
         """
         node = NodeWorker(
             src_addr="tcp://*:40800",
@@ -1042,6 +1042,18 @@ class NodeProfiler:
 
         # prefill
         input_token_lengths, input_ids_of_each_request = self._build_profile_input_ids(node.tokenizer)
+
+        # 进行 warm-up，避免第一次 forward 触发的 CUDA/PyTorch lazy allocation 影响通过 torch.cuda.memory_allocated() 测得的 KV cache 大小，导致第一个测试点成为异常值
+        print("[INFO] warming up KV cache memory profiling path...")
+        warmup_data0 = node.receive_user_request(input_ids=input_ids_of_each_request[-1])
+        warmup_data1 = node.pass_through_shard(warmup_data0)
+        self._synchronize_device()
+        del warmup_data0
+        del warmup_data1
+        node.clear_KV_cache()
+        gc.collect()
+        self._synchronize_device()
+        print("[INFO] KV cache memory profiling warm-up finished.")
 
         prefill_cache_sizes_bytes = []
         prefill_cuda_memory_deltas_bytes = [] if self.device.type == "cuda" else None
@@ -1126,7 +1138,7 @@ class NodeProfiler:
         else:
             prompt_cuda_delta_info = ""
         print(
-            "[INFO] decode KV cache baseline after prompt prefill: "
+            "\n[INFO] decode KV cache baseline after prompt prefill: "
             f"prompt_token_length={node.input_token_length}, "
             f"bytes={prompt_cache_size_bytes}, "
             f"MiB={self._bytes_to_mib(prompt_cache_size_bytes):.6f}"
@@ -1159,7 +1171,7 @@ class NodeProfiler:
                 else:
                     cuda_delta_info = ""
                 print(
-                    "[INFO] decode KV cache size: "
+                    "\n[INFO] decode KV cache size: "
                     f"output_token_length={output_token_length}, "
                     f"bytes={cache_size_bytes}, "
                     f"MiB={self._bytes_to_mib(cache_size_bytes):.6f}"

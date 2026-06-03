@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import torch
 from transformers import LlamaConfig, AutoTokenizer
@@ -364,6 +365,205 @@ class NodeProfiler:
             for token_length in input_token_lengths
         ]
         return input_token_lengths, input_ids_of_each_request
+
+    @staticmethod
+    def _iter_tensors(data: object):
+        """
+        递归迭代数据结构中的所有 tensor，yield 出来
+        yield 可以在函数被 for 遍历时，每次只返回一个 tensor 给 for 并保持函数上下文状态 (此时函数被暂停)，直到所有 tensor 都被遍历完
+        如果递归时改用 return 处理递归树末端的结果，那么递归树顶端的函数只会在所有递归结束后才返回给 for 一个巨长的 tensor 列表，无法在迭代过程中逐个处理 tensor，可能会导致内存占用过高
+        """
+        if torch.is_tensor(data):
+            yield data
+        elif isinstance(data, dict):
+            for value in data.values():
+                yield from NodeProfiler._iter_tensors(value)
+        elif isinstance(data, (list, tuple)):
+            for value in data:
+                yield from NodeProfiler._iter_tensors(value)
+
+    @classmethod
+    def _dynamic_cache_payload_size_bytes(cls, past_key_value: DynamicCache | None) -> int:
+        """
+        Return the logical payload bytes stored by key/value tensors in a HF DynamicCache.
+
+        sys.getsizeof(cache) only measures the Python container. For KV cache profiling we
+        need to sum the actual key/value tensor payloads.
+        """
+        if past_key_value is None:
+            return 0
+
+        total_bytes = 0
+        for cache_attr in ("key_cache", "value_cache"):
+            cache_storage = getattr(past_key_value, cache_attr, None)
+            for tensor in cls._iter_tensors(cache_storage):
+                total_bytes += tensor.numel() * tensor.element_size()
+
+        if total_bytes > 0:
+            return total_bytes
+
+        # Fallback for future cache implementations that store per-layer cache objects.
+        layers = getattr(past_key_value, "layers", None)
+        if layers is not None:
+            for layer_cache in layers:
+                for cache_attr in (
+                    "key_cache",
+                    "value_cache",
+                    "keys",
+                    "values",
+                    "key_states",
+                    "value_states",
+                ):
+                    cache_storage = getattr(layer_cache, cache_attr, None)
+                    for tensor in cls._iter_tensors(cache_storage):
+                        total_bytes += tensor.numel() * tensor.element_size()
+        return total_bytes
+
+    @staticmethod
+    def _bytes_to_mib(byte_size: int) -> float:
+        return byte_size / (1024 ** 2)
+
+    def _cuda_memory_allocated_bytes(self) -> int | None:
+        if self.device.type != "cuda":
+            return None
+        self._synchronize_device()
+        return torch.cuda.memory_allocated(self.device)
+
+    @staticmethod
+    def _memory_delta_bytes(current_bytes: int | None, baseline_bytes: int | None) -> int | None:
+        if current_bytes is None or baseline_bytes is None:
+            return None
+        return current_bytes - baseline_bytes
+
+    @staticmethod
+    def _plot_kv_cache_sizes(token_lengths: list[int],
+                             cache_sizes_bytes: list[int],
+                             x_label: str,
+                             plot_title: str,
+                             plot_filename: str,
+                             sampled_token_lengths: list[int] | None = None,
+                             sampled_cache_sizes_bytes: list[int] | None = None,
+                             cuda_memory_deltas_bytes: list[int] | None = None,
+                             sampled_cuda_memory_deltas_bytes: list[int] | None = None,
+                             baseline_cache_size_bytes: int | None = None,
+                             baseline_cuda_memory_delta_bytes: int | None = None,
+                             plot_note: str | None = None) -> None:
+        if len(token_lengths) != len(cache_sizes_bytes):
+            raise ValueError("[ERROR] token_lengths length must be equal to cache_sizes_bytes length.")
+        if sampled_token_lengths is not None and sampled_cache_sizes_bytes is not None:
+            if len(sampled_token_lengths) != len(sampled_cache_sizes_bytes):
+                raise ValueError(
+                    "[ERROR] sampled_token_lengths length must be equal to sampled_cache_sizes_bytes length."
+                )
+        if cuda_memory_deltas_bytes is not None and len(token_lengths) != len(cuda_memory_deltas_bytes):
+            raise ValueError(
+                "[ERROR] token_lengths length must be equal to cuda_memory_deltas_bytes length."
+            )
+        if sampled_token_lengths is not None and sampled_cuda_memory_deltas_bytes is not None:
+            if len(sampled_token_lengths) != len(sampled_cuda_memory_deltas_bytes):
+                raise ValueError(
+                    "[ERROR] sampled_token_lengths length must be equal to "
+                    "sampled_cuda_memory_deltas_bytes length."
+                )
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        cache_sizes_mib = [
+            NodeProfiler._bytes_to_mib(byte_size)
+            for byte_size in cache_sizes_bytes
+        ]
+        plot_dir = os.path.join("results", "profiling")
+        os.makedirs(plot_dir, exist_ok=True)
+        plot_path = os.path.join(plot_dir, plot_filename)
+
+        marker = "o" if len(token_lengths) <= 32 else None
+        plt.figure(figsize=(8, 5))
+        plt.plot(token_lengths, cache_sizes_mib, marker=marker, label="measured KV cache size")
+        if cuda_memory_deltas_bytes is not None:
+            cuda_memory_deltas_mib = [
+                NodeProfiler._bytes_to_mib(byte_size)
+                for byte_size in cuda_memory_deltas_bytes
+            ]
+            plt.plot(
+                token_lengths,
+                cuda_memory_deltas_mib,
+                marker=marker,
+                label="CUDA memory_allocated delta",
+            )
+        if sampled_token_lengths is not None and sampled_cache_sizes_bytes is not None:
+            sampled_cache_sizes_mib = [
+                NodeProfiler._bytes_to_mib(byte_size)
+                for byte_size in sampled_cache_sizes_bytes
+            ]
+            plt.scatter(sampled_token_lengths, sampled_cache_sizes_mib, label="sampled checkpoints")
+        if sampled_token_lengths is not None and sampled_cuda_memory_deltas_bytes is not None:
+            sampled_cuda_memory_deltas_mib = [
+                NodeProfiler._bytes_to_mib(byte_size)
+                for byte_size in sampled_cuda_memory_deltas_bytes
+            ]
+            plt.scatter(
+                sampled_token_lengths,
+                sampled_cuda_memory_deltas_mib,
+                label="CUDA sampled checkpoints",
+            )
+
+        # 画 decode 的对应图时，用一条横线标出 prefill 第一个 token 时已有的 KV cache 大小
+        axis = plt.gca()
+        if baseline_cache_size_bytes is not None:
+            baseline_cache_size_mib = NodeProfiler._bytes_to_mib(baseline_cache_size_bytes)
+            axis.axhline(
+                baseline_cache_size_mib,
+                color="tab:blue",
+                linestyle="--",
+                linewidth=1,
+                alpha=0.8,
+                label=f"KV baseline ({baseline_cache_size_mib:.2f} MiB)",
+            )
+            axis.text(
+                0.01,
+                baseline_cache_size_mib,
+                f"KV baseline {baseline_cache_size_mib:.2f} MiB",
+                transform=axis.get_yaxis_transform(),
+                color="tab:blue",
+                fontsize=8,
+                va="bottom",
+            )
+        if baseline_cuda_memory_delta_bytes is not None:
+            baseline_cuda_memory_delta_mib = NodeProfiler._bytes_to_mib(baseline_cuda_memory_delta_bytes)
+            axis.axhline(
+                baseline_cuda_memory_delta_mib,
+                color="tab:orange",
+                linestyle=":",
+                linewidth=1.2,
+                alpha=0.9,
+                label=f"CUDA baseline ({baseline_cuda_memory_delta_mib:.2f} MiB)",
+            )
+            axis.text(
+                0.01,
+                baseline_cuda_memory_delta_mib,
+                f"CUDA baseline {baseline_cuda_memory_delta_mib:.2f} MiB",
+                transform=axis.get_yaxis_transform(),
+                color="tab:orange",
+                fontsize=8,
+                va="top",
+            )
+
+        plt.xlabel(x_label)
+        plt.ylabel("Memory size (MiB)")
+        plt.title(plot_title)
+        if plot_note is not None:
+            plt.figtext(0.5, 0.01, plot_note, ha="center", fontsize=8)
+        plt.grid(alpha=0.3)
+        plt.legend()
+        if plot_note is None:
+            plt.tight_layout()
+        else:
+            plt.tight_layout(rect=(0, 0.04, 1, 1))
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"[INFO] KV cache size plot saved to {plot_path}")
 
     def _report_prefill_profile_results(self, input_token_lengths: list[int],
                                         repeated_computation_latencies: list[list[float]],
@@ -818,6 +1018,202 @@ class NodeProfiler:
             decode_quadratic_coefficients=decode_fit_result["quadratic_coefficients"],
             comparison_token_lengths=sampled_output_token_lengths,
         )
+
+    @torch.inference_mode()
+    def profile_kv_cache_size(self) -> None:
+        """
+        Profile KV cache tensor payload size against prompt length and output length.
+        测量两种途径的 KV Cache 大小：
+        1. 根据 node.past_key_value 的 DynamicCache() 对象换算得到的理论大小
+        2. 根据 torch.cuda.memory_allocated() 的增量得到的实际大小（仅在 CUDA 设备上可用）
+
+        This intentionally uses the full model on one node, has no assisted path, does not
+        reserve space for OOM avoidance, and does not run warm-up rounds.
+        """
+        node = NodeWorker(
+            src_addr="tcp://*:40800",
+            dst_addr="tcp://127.0.0.1:40800",
+            can_receive_user_request=True,
+            shards_path=self.shards_path,
+            device=self.device,
+            dtype=self.dtype
+        )
+        node.load_shards(0, self.layer_num)
+
+        # prefill
+        input_token_lengths, input_ids_of_each_request = self._build_profile_input_ids(node.tokenizer)
+
+        prefill_cache_sizes_bytes = []
+        prefill_cuda_memory_deltas_bytes = [] if self.device.type == "cuda" else None
+        for token_length, input_ids in zip(input_token_lengths, input_ids_of_each_request):
+            gc.collect()
+            cuda_memory_baseline_bytes = self._cuda_memory_allocated_bytes()
+            data0 = node.receive_user_request(input_ids=input_ids)
+            data1 = node.pass_through_shard(data0)
+            self._synchronize_device()
+            cache_size_bytes = self._dynamic_cache_payload_size_bytes(node.past_key_value)
+            prefill_cache_sizes_bytes.append(cache_size_bytes)
+            del data0
+            del data1
+            gc.collect()
+            cuda_memory_delta_bytes = self._memory_delta_bytes(
+                self._cuda_memory_allocated_bytes(),
+                cuda_memory_baseline_bytes,
+            )
+            if prefill_cuda_memory_deltas_bytes is not None and cuda_memory_delta_bytes is not None:
+                prefill_cuda_memory_deltas_bytes.append(cuda_memory_delta_bytes)
+                cuda_delta_info = (
+                    f", cuda_memory_delta_bytes={cuda_memory_delta_bytes}, "
+                    f"cuda_memory_delta_MiB={self._bytes_to_mib(cuda_memory_delta_bytes):.6f}"
+                )
+            else:
+                cuda_delta_info = ""
+            print(
+                "[INFO] prefill KV cache size: "
+                f"input_token_length={token_length}, "
+                f"bytes={cache_size_bytes}, "
+                f"MiB={self._bytes_to_mib(cache_size_bytes):.6f}"
+                f"{cuda_delta_info}"
+            )
+            node.clear_KV_cache()
+
+        self._plot_kv_cache_sizes(
+            token_lengths=input_token_lengths,
+            cache_sizes_bytes=prefill_cache_sizes_bytes,
+            cuda_memory_deltas_bytes=prefill_cuda_memory_deltas_bytes,
+            x_label="Input prompt token length",
+            plot_title="KV cache size vs input prompt token length",
+            plot_filename="profile_kv_cache_size_by_input_tokens.png",
+        )
+
+        # 测量 decode 开始前已有的 KV cache 大小 (prefill 阶段产生的 KV Cache)
+        displayed_output_token_lengths = self.PROFILE_DECODE_OUTPUT_TOKEN_LENGTHS.copy()
+        max_output_token_length = max(displayed_output_token_lengths)
+
+        gc.collect()
+        decode_cuda_memory_baseline_bytes = self._cuda_memory_allocated_bytes()
+        data0 = node.receive_user_request(request=self.PROFILE_DECODE_REQUEST)
+        if node.input_token_length + max_output_token_length > self.config.max_position_embeddings:
+            raise ValueError("[ERROR] requested prompt + output length exceeds model max_position_embeddings.")
+
+        data1 = node.pass_through_shard(data0)
+        self._synchronize_device()
+        prompt_cache_size_bytes = self._dynamic_cache_payload_size_bytes(node.past_key_value)
+        del data0
+        gc.collect()
+        prompt_cuda_memory_delta_bytes = self._memory_delta_bytes(
+            self._cuda_memory_allocated_bytes(),
+            decode_cuda_memory_baseline_bytes,
+        )
+
+        reached_end, data0 = node.receive_next_token(
+            data1,
+            max_new_tokens=max_output_token_length + 1,  # Keep one extra token of headroom so the final measured token is still fed into the shard.
+        )
+        if reached_end:
+            print(
+                "[WARNING] decode KV cache profiling stopped before the first output token "
+                "could be fed into the shard."
+            )
+            node.clear_KV_cache()
+            return
+
+        if prompt_cuda_memory_delta_bytes is not None:
+            prompt_cuda_delta_info = (
+                f", cuda_memory_delta_bytes={prompt_cuda_memory_delta_bytes}, "
+                f"cuda_memory_delta_MiB={self._bytes_to_mib(prompt_cuda_memory_delta_bytes):.6f}"
+            )
+        else:
+            prompt_cuda_delta_info = ""
+        print(
+            "[INFO] decode KV cache baseline after prompt prefill: "
+            f"prompt_token_length={node.input_token_length}, "
+            f"bytes={prompt_cache_size_bytes}, "
+            f"MiB={self._bytes_to_mib(prompt_cache_size_bytes):.6f}"
+            f"{prompt_cuda_delta_info}"
+        )
+
+        # decode
+        output_token_lengths = list(range(1, max_output_token_length + 1))
+        decode_cache_sizes_bytes = []
+        decode_cuda_memory_deltas_bytes = [] if self.device.type == "cuda" else None
+        for output_token_length in output_token_lengths:
+            data1 = node.pass_through_shard(data0)
+            self._synchronize_device()
+            cache_size_bytes = self._dynamic_cache_payload_size_bytes(node.past_key_value)
+            del data0
+            gc.collect()
+            cuda_memory_delta_bytes = self._memory_delta_bytes(
+                self._cuda_memory_allocated_bytes(),
+                decode_cuda_memory_baseline_bytes,  # 这里去除的是 prefill 前的 baseline (import torch 等造成的)，而不是前面测得的 first token 的 baseline
+            )
+            decode_cache_sizes_bytes.append(cache_size_bytes)
+            if decode_cuda_memory_deltas_bytes is not None and cuda_memory_delta_bytes is not None:
+                decode_cuda_memory_deltas_bytes.append(cuda_memory_delta_bytes)
+            if output_token_length in displayed_output_token_lengths:
+                if cuda_memory_delta_bytes is not None:
+                    cuda_delta_info = (
+                        f", cuda_memory_delta_bytes={cuda_memory_delta_bytes}, "
+                        f"cuda_memory_delta_MiB={self._bytes_to_mib(cuda_memory_delta_bytes):.6f}"
+                    )
+                else:
+                    cuda_delta_info = ""
+                print(
+                    "[INFO] decode KV cache size: "
+                    f"output_token_length={output_token_length}, "
+                    f"bytes={cache_size_bytes}, "
+                    f"MiB={self._bytes_to_mib(cache_size_bytes):.6f}"
+                    f"{cuda_delta_info}"
+                )
+
+            if output_token_length == max_output_token_length:
+                break
+            reached_end, data0 = node.receive_next_token(
+                data1,
+                max_new_tokens=max_output_token_length + 1,
+            )
+            if reached_end:
+                print(
+                    "[WARNING] decode KV cache profiling stopped early before "
+                    f"output token length reached {max_output_token_length}."
+                )
+                break
+
+        actual_output_token_lengths = output_token_lengths[:len(decode_cache_sizes_bytes)]
+        sampled_output_token_lengths = [
+            token_length
+            for token_length in displayed_output_token_lengths
+            if token_length <= len(decode_cache_sizes_bytes)
+        ]
+        sampled_decode_cache_sizes_bytes = [
+            decode_cache_sizes_bytes[token_length - 1]
+            for token_length in sampled_output_token_lengths
+        ]
+        sampled_decode_cuda_memory_deltas_bytes = None
+        if decode_cuda_memory_deltas_bytes is not None:
+            sampled_decode_cuda_memory_deltas_bytes = [
+                decode_cuda_memory_deltas_bytes[token_length - 1]
+                for token_length in sampled_output_token_lengths
+            ]
+
+        self._plot_kv_cache_sizes(
+            token_lengths=actual_output_token_lengths,
+            cache_sizes_bytes=decode_cache_sizes_bytes,
+            sampled_token_lengths=sampled_output_token_lengths,
+            sampled_cache_sizes_bytes=sampled_decode_cache_sizes_bytes,
+            cuda_memory_deltas_bytes=decode_cuda_memory_deltas_bytes,
+            sampled_cuda_memory_deltas_bytes=sampled_decode_cuda_memory_deltas_bytes,
+            baseline_cache_size_bytes=prompt_cache_size_bytes,
+            baseline_cuda_memory_delta_bytes=prompt_cuda_memory_delta_bytes,
+            x_label="Generated output token length",
+            plot_title="KV cache size vs generated output token length",
+            plot_filename="profile_kv_cache_size_by_output_tokens.png",
+            plot_note=(
+                "Output-token curve includes the fixed prompt KV cache baseline after prompt prefill; "
+                "the slope is the incremental KV cache cost per generated token."
+            ),
+        )
+        node.clear_KV_cache()
 
     def profile_compute_capability(self, max_layer_num: int = None, assisted: bool = False,
                                    src_addr: str = "tcp://*:40800",

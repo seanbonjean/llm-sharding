@@ -11,9 +11,11 @@ profiler = NodeProfiler(
 # profiler.profile_compute_capability(max_layer_num=None)
 # profiler.profile_cold_start_latency(max_layer_num=None)
 
-profiler.profile_compute_capability(
-    max_layer_num=7,
-    assisted=True,
-    src_addr="tcp://*:40800",
-    dst_addr="tcp://172.16.0.1:40800"
-)
+# profiler.profile_compute_capability(
+#     max_layer_num=7,
+#     assisted=True,
+#     src_addr="tcp://*:40800",
+#     dst_addr="tcp://172.16.0.1:40800"
+# )
+
+profiler.profile_kv_cache_size()

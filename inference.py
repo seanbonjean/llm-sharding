@@ -1,5 +1,6 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 # from transformers import LlamaTokenizer, LlamaForCausalLM
+import time
 import torch
 
 # prompt = "介绍一下边缘计算。"
@@ -8,7 +9,8 @@ import torch
 prompt = "Write a poem about the blue sky."
 # prompt = "<|begin_of_text|><|user|>\n介绍一下边缘计算。\n<|assistant|>\n"
 
-model_path = "./weights/llama-2-7b-chat-hf"
+model_path = "./weights/Llama-3___2-3B-Instruct"
+# model_path = "./weights/llama-2-7b-chat-hf"
 # model_path = "./weights/llama-2-7b-hf"
 # model_path = "./weights/Llama-3___2-3B"
 
@@ -33,6 +35,9 @@ model.eval()  # 模型从训练模式转换到 eval模式（关闭dropout）
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
 # 推理
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+generate_start = time.perf_counter()
 outputs = model.generate(
     **inputs,
     max_new_tokens=1024,
@@ -43,6 +48,10 @@ outputs = model.generate(
     # eos_token_id=tokenizer.eos_token_id,
     # repetition_penalty=1.2,  # 惩罚重复
 )
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+generate_end = time.perf_counter()
+print(f"Generate elapsed: {generate_end - generate_start:.4f}s")
 
 # 输出
 output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)

@@ -1,6 +1,7 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 # from transformers import LlamaTokenizer, LlamaForCausalLM
 import time
+import gc
 import torch
 
 # prompt = "介绍一下边缘计算。"
@@ -9,7 +10,8 @@ import torch
 prompt = "Write a poem about the blue sky."
 # prompt = "<|begin_of_text|><|user|>\n介绍一下边缘计算。\n<|assistant|>\n"
 
-model_path = "./weights/Llama-3___2-3B-Instruct"
+model_path = "./weights/Llama-3___2-1B"
+# model_path = "./weights/Llama-3___2-3B-Instruct"
 # model_path = "./weights/llama-2-7b-chat-hf"
 # model_path = "./weights/llama-2-7b-hf"
 # model_path = "./weights/Llama-3___2-3B"
@@ -19,7 +21,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
     torch_dtype=torch.float16,  # 也可以是int8/int4量化
-    device_map="auto",
+    # device_map="auto",
 ).to("cuda")  # 放置到GPU上
 
 model.eval()  # 模型从训练模式转换到 eval模式（关闭dropout）
@@ -52,6 +54,9 @@ if torch.cuda.is_available():
     torch.cuda.synchronize()
 generate_end = time.perf_counter()
 print(f"Generate elapsed: {generate_end - generate_start:.4f}s")
+gc.collect()  # 进行垃圾回收，清理显存
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()  # 清理显存缓存，释放未使用的显存
 
 # 输出
 output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)

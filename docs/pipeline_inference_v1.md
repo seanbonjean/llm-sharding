@@ -83,8 +83,6 @@ Pipeline config 兼容旧字段，并新增：
 
 ```bash
    python pipeline_start_node.py --port 40700
-   # 可选：启用轻量终端多页面视图
-   python pipeline_start_node.py --port 40700 --cli-pages
    ```
 
 2. 修改 `pipeline_debug.py` 或 `pipeline_send_config.py` 中的 IP、切片边界和 `pipeline_depth`，然后在中控设备执行：

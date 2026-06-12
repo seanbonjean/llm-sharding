@@ -3,7 +3,6 @@ Pipeline inference 节点启动入口
 
 运行方式和旧 start_node.py 基本一致：
     python pipeline_start_node.py --port 40700
-    python pipeline_start_node.py --port 40700 --cli-pages
 
 该进程启动后会等待中控设备或 pipeline_debug.py / pipeline_send_config.py 发送 config
 pipeline 版本在旧 config 基础上新增以下字段：
@@ -15,9 +14,6 @@ pipeline 版本在旧 config 基础上新增以下字段：
 
 用户请求入口复用 node_addr 对应的数据端口，默认是 40800。外部客户端发送
 type="user_request" 的 torch 序列化 dict 后，本节点会在本地调用 receive_request()。
-
-默认使用普通 print 输出。传入 --cli-pages 后，会启用可选 curses 多页面视图：
-LOG 页显示运行日志，每个 request_id 一个实时 token 页。
 """
 
 import sys
@@ -25,42 +21,26 @@ import torch
 from utils.pipeline_node_worker import PipelineNodeController
 
 
-def parse_args(argv: list[str]) -> tuple[int, bool]:
+def parse_port(argv: list[str]) -> int:
     """解析传入参数：controller 接收 config 的端口，兼容旧脚本的位置参数写法"""
 
     port = 40700  # 未传入参数时的默认端口
-    enable_cli_pages = False
-    args = argv[1:]
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--port":
-            if i + 1 >= len(args):
-                raise ValueError("--port requires a port number")
-            port = int(args[i + 1])
-            i += 2
-        elif arg == "--cli-pages":
-            enable_cli_pages = True
-            i += 1
-        elif arg.isdigit():
-            print(
-                f"[WARNING] Port argument provided without \"--port\" flag, interpreting \"{arg}\" as port number."
-            )
-            port = int(arg)
-            i += 1
-        else:
-            raise ValueError(f"Unexpected argument {arg}")
-    return port, enable_cli_pages
-
-
-port, enable_cli_pages = parse_args(sys.argv)
+    if len(argv) > 2 and argv[1] == "--port":
+        port = int(argv[2])
+    elif len(argv) > 2 and argv[1] != "--port":
+        raise ValueError(f"Unexpected argument {argv[1]}, expected '--port'")
+    elif len(argv) > 1:  # 如果省略了 --port ，只有一个参数，则认为它是端口号
+        print(
+            f"[WARNING] Port argument provided without \"--port\" flag, interpreting \"{argv[1]}\" as port number."
+        )
+        port = int(argv[1])
+    return port
 
 
 controller = PipelineNodeController(
     "shards/Llama-3___2-3B-Instruct_float16",
     device="cuda:0",
     dtype=torch.float16,
-    listen_port=port,
-    enable_cli_pages=enable_cli_pages,
+    listen_port=parse_port(sys.argv),
 )
 controller.run_worker_loop(max_new_tokens=512)

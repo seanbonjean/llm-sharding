@@ -83,55 +83,70 @@ class ConfigSenderPipeline:
 
 
 if __name__ == "__main__":
-    # 示例：3 个 stage 组成环，末 stage 的 dst_addr 指回 first node，仅用于 clear。
+    # 示例：Llama 3.2 3B 有 28 个 layer，4 个 stage 各放 7 层。
+    # 末 stage 的 dst_addr 指回 first node，仅用于 pipeline_clear 绕回首节点。
     # 请按你的 Jetson IP 和切片边界修改。
-    pipeline_depth = 3
+    pipeline_depth = 4
     max_active_requests = pipeline_depth
-    first_node_addr = "tcp://172.16.0.2:40800"
+    first_node_addr = "tcp://172.16.0.4:40800"
 
     senders = [ConfigSenderPipeline(node_port=40700) for _ in range(pipeline_depth)]
 
     senders[0].build_config(
         shards_start=0,
-        shards_end=6,
+        shards_end=7,
         can_receive_user_request=True,
         src_addr="tcp://*:40800",
-        dst_addr="tcp://172.16.0.3:40800",
-        node_addr="tcp://172.16.0.2:40800",
+        dst_addr="tcp://172.16.0.5:40800",
+        node_addr="tcp://172.16.0.4:40800",
         first_node_addr=first_node_addr,
         pipeline_depth=pipeline_depth,
         max_active_requests=max_active_requests,
         node_id="node0",
     )
-    senders[0].send_config(node_ip="172.16.0.2")
+    senders[0].send_config(node_ip="172.16.0.4")
 
     senders[1].build_config(
-        shards_start=6,
-        shards_end=7,
+        shards_start=7,
+        shards_end=14,
         can_receive_user_request=True,
         src_addr="tcp://*:40800",
-        dst_addr="tcp://172.16.0.1:40800",
-        node_addr="tcp://172.16.0.3:40800",
+        dst_addr="tcp://172.16.0.6:40800",
+        node_addr="tcp://172.16.0.5:40800",
         first_node_addr=first_node_addr,
         pipeline_depth=pipeline_depth,
         max_active_requests=max_active_requests,
         node_id="node1",
     )
-    senders[1].send_config(node_ip="172.16.0.3")
+    senders[1].send_config(node_ip="172.16.0.5")
 
     senders[2].build_config(
-        shards_start=7,
-        shards_end=32,
+        shards_start=14,
+        shards_end=21,
         can_receive_user_request=True,
         src_addr="tcp://*:40800",
-        dst_addr="tcp://172.16.0.2:40800",
-        node_addr="tcp://172.16.0.1:40800",
+        dst_addr="tcp://172.16.0.7:40800",
+        node_addr="tcp://172.16.0.6:40800",
         first_node_addr=first_node_addr,
         pipeline_depth=pipeline_depth,
         max_active_requests=max_active_requests,
         node_id="node2",
     )
-    senders[2].send_config(node_ip="172.16.0.1")
+    senders[2].send_config(node_ip="172.16.0.6")
+
+    senders[3].build_config(
+        shards_start=21,
+        shards_end=28,
+        can_receive_user_request=True,
+        src_addr="tcp://*:40800",
+        dst_addr="tcp://172.16.0.4:40800",
+        node_addr="tcp://172.16.0.7:40800",
+        first_node_addr=first_node_addr,
+        pipeline_depth=pipeline_depth,
+        max_active_requests=max_active_requests,
+        node_id="node3",
+    )
+    senders[3].send_config(node_ip="172.16.0.7")
 
     print("[CONFIG] pipeline configs sent. Keep this process alive to retain sockets.")
     while True:

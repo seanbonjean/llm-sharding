@@ -73,7 +73,7 @@ class ConfigSenderPipeline:
         }
 
     def send_config(self, node_ip: str) -> None:
-        """向某个 start_node_pipeline.py 进程发送 config。"""
+        """向某个 pipeline_start_node.py 进程发送 config。"""
 
         if self.node_addr:
             self.send_socket.disconnect(self.node_addr)

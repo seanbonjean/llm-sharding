@@ -2,20 +2,23 @@
 Pipeline inference 节点启动入口
 
 运行方式和旧 start_node.py 基本一致：
-    python start_node_pipeline.py --port 40700
+    python pipeline_start_node.py --port 40700
 
-该进程启动后会等待中控设备或 send_config_pipeline.py 发送 config
+该进程启动后会等待中控设备或 pipeline_debug.py / pipeline_send_config.py 发送 config
 pipeline 版本在旧 config 基础上新增以下字段：
     node_addr: 当前节点可被其他节点 connect 的地址，例如 tcp://172.16.0.2:40800
     first_node_addr: 模型链首分片地址
     pipeline_depth: 模型链 stage 数，例如：4 台设备各一个 stage 时填 4
     max_active_requests: 最大 active 请求数，默认建议等于 pipeline_depth
     node_id: 用于实现日志和 request_id 前缀，不参与路由
+
+用户请求入口复用 node_addr 对应的数据端口，默认是 40800。外部客户端发送
+type="user_request" 的 torch 序列化 dict 后，本节点会在本地调用 receive_request()。
 """
 
 import sys
 import torch
-from utils.node_worker_pipeline import PipelineNodeController
+from utils.pipeline_node_worker import PipelineNodeController
 
 
 def parse_port(argv: list[str]) -> int:

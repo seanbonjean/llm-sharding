@@ -1,6 +1,6 @@
 # Pipeline Inference V1
 
-本文档说明 `utils/node_worker_pipeline.py` 的通信协议、调度策略和 Jetson 测试步骤。
+本文档说明 `utils/pipeline_node_worker.py` 的通信协议、调度策略和 Jetson 测试步骤。
 旧版 `utils/node_worker.py` 、 `utils/node_profiler.py` 不依赖 pipeline 文件，原 profiling 路径保持不变。
 
 ## 目标
@@ -42,6 +42,23 @@ Pipeline config 兼容旧字段，并新增：
 
 末节点的 `dst_addr` 仍建议指回 first node，因为 `pipeline_clear` 需要沿模型链绕一圈后停止。
 
+## 用户请求入口
+
+外部用户请求通过 ZMQ 发送到 owner 节点的 `node_addr`，也就是默认 `40800` 数据端口。
+消息是 torch 序列化后的 dict：
+
+```python
+{
+    "type": "user_request",
+    "prompt": "...",
+    "max_new_tokens": 128,
+}
+```
+
+节点收到后会在本地调用 `receive_request()`，完成 tokenizer/embedding，再生成正常的
+`pipeline_input` 发往 first node。复用 40800 可以减少额外端口；如果以后需要隔离
+外部流量和模型链内部流量，再拆出单独 client request port。
+
 ## 重配置行为
 
 如果节点收到新 config 时仍有旧请求在 pipeline 中：
@@ -65,15 +82,15 @@ Pipeline config 兼容旧字段，并新增：
    
 
 ```bash
-   python start_node_pipeline.py --port 40700
+   python pipeline_start_node.py --port 40700
    ```
 
-2. 修改 `send_config_pipeline.py` 中的 IP、切片边界和 `pipeline_depth`，然后在中控设备执行：
+2. 修改 `pipeline_debug.py` 或 `pipeline_send_config.py` 中的 IP、切片边界和 `pipeline_depth`，然后在中控设备执行：
 
    
 
 ```bash
-   python send_config_pipeline.py
+   python pipeline_debug.py
    ```
 
 3. 单请求测试：

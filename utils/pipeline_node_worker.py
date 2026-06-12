@@ -34,11 +34,32 @@ class PipelineProtocol:
     PIPELINE_TOKEN = "pipeline_token"
     PIPELINE_DONE = "pipeline_done"
     PIPELINE_CLEAR = "pipeline_clear"
+    USER_REQUEST = "user_request"
 
     PHASE_PREFILL = "prefill"
     PHASE_DECODE = "decode"
     PHASE_DONE = "done"
     PHASE_CLEAR = "clear"
+
+    @classmethod
+    def build_user_request(
+        cls,
+        prompt: str,
+        max_new_tokens: int,
+    ) -> dict[str, Any]:
+        """
+        构造外部客户端发给 owner 节点的用户请求消息。
+
+        这不是模型链内部的 hidden state 消息，而是中控/CLI 用来触发某个节点
+        调用 receive_request() 的请求入口。节点收到后会在本地完成
+        tokenizer/embedding，再生成正常的 pipeline_input 发往 first node。
+        """
+
+        return {
+            cls.TYPE_KEY: cls.USER_REQUEST,
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+        }
 
     @classmethod
     def base_message(
@@ -237,6 +258,7 @@ class PipelineProtocol:
             cls.PIPELINE_TOKEN,
             cls.PIPELINE_DONE,
             cls.PIPELINE_CLEAR,
+            cls.USER_REQUEST,
         }
 
 
@@ -1094,6 +1116,30 @@ class PipelineNodeController:
             self._handle_pipeline_done(data)
         elif PipelineProtocol.is_type(data, PipelineProtocol.PIPELINE_CLEAR):
             self._handle_pipeline_clear(data)
+        elif PipelineProtocol.is_type(data, PipelineProtocol.USER_REQUEST):
+            self._handle_user_request(data)
+
+    def _handle_user_request(self, message: dict[str, Any]) -> None:
+        """
+        处理外部客户端发来的用户请求。
+
+        该入口复用节点的 40800 PULL socket，消息类型为 user_request。为了
+        避免一次错误外部请求直接杀掉长驻 worker，这里捕获异常并打印；正常的
+        pipeline 内部状态错误仍会在对应分支 fail-fast。
+        """
+
+        try:
+            request_id = self.receive_request(
+                request=message.get("prompt", "Write a poem about the blue sky."),
+                max_new_tokens=int(
+                    message.get("max_new_tokens", self.default_max_new_tokens)
+                ),
+            )
+        except Exception as exc:
+            print(f"[REQUEST ERROR] failed to submit user request: {exc}")
+            return
+
+        print(f"[REQUEST] submitted request_id={request_id}")
 
     def _handle_first_stage_input(self, message: dict[str, Any]) -> None:
         request_id = message["request_id"]

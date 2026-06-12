@@ -453,11 +453,11 @@ class PipelineNodeWorker:
         return self.end == self.layer_num
 
     def _load_embedding(self) -> None:
-        print("[INFO] loading tokenizer...")
+        print("[LOADER] loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.shards_path)
-        print("[INFO] tokenizer loaded.")
+        print("[LOADER] tokenizer loaded.")
 
-        print("[INFO] loading embedding layer...")
+        print("[LOADER] loading embedding layer...")
         self.embed_tokens = torch.nn.Embedding(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -468,7 +468,7 @@ class PipelineNodeWorker:
                 map_location=self.device,
             )
         )
-        print("[INFO] embedding layer loaded.")
+        print("[LOADER] embedding layer loaded.")
 
     def load_shards(self, start: int, end: int) -> None:
         """
@@ -495,16 +495,16 @@ class PipelineNodeWorker:
             torch.cuda.empty_cache()
 
         if self.is_first_stage:
-            print("[INFO] loading RoPE...")
+            print("[LOADER] loading RoPE...")
             self.rope = LlamaRotaryEmbedding(config=self.config, device=self.device).to(
                 self.device
             )
-            print("[INFO] RoPE loaded.")
+            print("[LOADER] RoPE loaded.")
 
         if self.is_last_stage:
             add_final_norm = True
             final_norm_weight = "final_norm.pth"
-            print("[INFO] loading lm_head...")
+            print("[LOADER] loading lm_head...")
             self.lm_head = torch.nn.Linear(
                 self.config.hidden_size,
                 self.config.vocab_size,
@@ -516,12 +516,12 @@ class PipelineNodeWorker:
                     map_location=self.device,
                 )
             )
-            print("[INFO] lm_head loaded.")
+            print("[LOADER] lm_head loaded.")
         else:
             add_final_norm = False
             final_norm_weight = None
 
-        print(f"[INFO] loading hidden layer {start}~{end}(end excluded)...")
+        print(f"[LOADER] loading hidden layer {start}~{end}(end excluded)...")
         self.shard = LlamaShardPart(
             self.shards_path,
             ["block_" + str(i) + ".pth" for i in range(start, end)],
@@ -533,7 +533,7 @@ class PipelineNodeWorker:
             final_norm_weight=final_norm_weight,
         )
         self.shard.eval()
-        print(f"[INFO] hidden layer {start}~{end}(end excluded) loaded.")
+        print(f"[LOADER] hidden layer {start}~{end}(end excluded) loaded.")
 
     def _new_request_id(self) -> str:
         self._request_seq += 1
@@ -594,7 +594,7 @@ class PipelineNodeWorker:
         self.sessions[request_id] = session
 
         print(
-            f"[PIPELINE] request_id={request_id} input token number: {session.input_token_length}"
+            f"[REQUEST] request_id={request_id} input token number: {session.input_token_length}"
         )
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len, _ = hidden_states.shape
@@ -710,10 +710,10 @@ class PipelineNodeWorker:
             print()
             final_ids = torch.cat(session.generated_ids, dim=-1)
             print(
-                f"[PIPELINE] request_id={request_id} output: {self.tokenizer.decode(final_ids[0])}"
+                f"[REQUEST] request_id={request_id} output: {self.tokenizer.decode(final_ids[0])}"
             )
             print(
-                f"[PIPELINE] request_id={request_id} output token number: {output_token_count}"
+                f"[REQUEST] request_id={request_id} output token number: {output_token_count}"
             )
             return PipelineProtocol.build_done(message, reason, output_token_count)
 
@@ -825,7 +825,7 @@ class PipelineNodeController:
         self.deferred_config: dict[str, Any] | None = (
             None  # 等旧请求 drain 完毕后再真正应用的 config
         )
-        print("[INFO] Pipeline node is ready.")
+        print("[CONTROLLER] Pipeline node is ready.")
 
     @property
     def is_first_stage(self) -> bool:
@@ -1033,7 +1033,7 @@ class PipelineNodeController:
             message["first_node_addr"] = self.node_worker.first_node_addr
             self.node_worker.communicator.send_to(message["first_node_addr"], message)
             print(
-                f"[SCHED INFO] forwarded pending request_id={message['request_id']} "
+                f"[SCHEDULER] forwarded pending request_id={message['request_id']} "
                 f"to new first node {message['first_node_addr']}."
             )
 
@@ -1157,7 +1157,7 @@ class PipelineNodeController:
             if self.reconfig_pending:
                 self.pending_prefill_queue.append(message)
                 print(
-                    f"[SCHED INFO] queued request_id={request_id} during reconfig pending: "
+                    f"[SCHEDULER] queued request_id={request_id} during reconfig pending: "
                     "requests in the active queue are draining off to clear the way for new config; "
                     "new coming requests are pending until the new config is applied; "
                     f"pending queue={len(self.pending_prefill_queue)}"
@@ -1166,13 +1166,13 @@ class PipelineNodeController:
                 self.active_request_ids.add(request_id)
                 self.first_stage_input_queue.append(message)
                 print(
-                    f"[SCHED INFO] admitted request_id={request_id}; "
+                    f"[SCHEDULER] admitted request_id={request_id}; "
                     f"active queue={len(self.active_request_ids)}/{self.max_active_requests}"
                 )
             else:
                 self.pending_prefill_queue.append(message)
                 print(
-                    f"[SCHED INFO] queued request_id={request_id}; "
+                    f"[SCHEDULER] queued request_id={request_id}; "
                     f"pending queue={len(self.pending_prefill_queue)}"
                 )
             return
@@ -1239,7 +1239,7 @@ class PipelineNodeController:
         request_id = message["request_id"]
         self.active_request_ids.discard(request_id)
         print(
-            f"[SCHED INFO] completed request_id={request_id} reason={message.get('reason')}; "
+            f"[SCHEDULER] completed request_id={request_id} reason={message.get('reason')}; "
             f"active={len(self.active_request_ids)}/{self.max_active_requests}"
         )
 
@@ -1293,7 +1293,7 @@ class PipelineNodeController:
             message["first_node_addr"] = self.node_worker.first_node_addr
             self.first_stage_input_queue.append(message)
             print(
-                f"[SCHED INFO] admitted pending request_id={request_id}; "
+                f"[SCHEDULER] admitted pending request_id={request_id}; "
                 f"active={len(self.active_request_ids)}/{self.max_active_requests}; "
                 f"pending={len(self.pending_prefill_queue)}"
             )

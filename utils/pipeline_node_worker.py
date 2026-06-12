@@ -3,6 +3,8 @@ from __future__ import annotations
 import gc
 import io
 import os
+import textwrap
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -16,6 +18,148 @@ from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 from utils.forwarding_utils import build_position_ids
 from utils.shard_loader import LlamaShardPart
+
+
+class PipelineConsole:
+    """
+    Pipeline node output manager.
+
+    Default mode writes normal terminal lines with stable prefixes. If enabled
+    is True, it starts a lightweight curses UI:
+    - LOG page shows loader/controller/scheduler/config events.
+    - Each request_id gets a live token page.
+    - Left/right arrows or [/] switch pages.
+    - Request pages are removed when the request is released.
+
+    The curses UI is optional because it only works well on Linux terminals
+    such as Jetson shells. Windows/local runs automatically fall back to print.
+    """
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+        self._lock = threading.RLock()
+        self._pages: dict[str, list[str]] = {"LOG": []}
+        self._request_text: dict[str, str] = {}
+        self._page_order: list[str] = ["LOG"]
+        self._active_page_index = 0
+        self._stop_event = threading.Event()
+        self._curses = None
+
+        if self.enabled:
+            try:
+                import curses
+
+                self._curses = curses
+                self._thread = threading.Thread(target=self._run_curses, daemon=True)
+                self._thread.start()
+            except Exception as exc:
+                self.enabled = False
+                print(f"[CONTROLLER] CLI page mode disabled: {exc}")
+
+    def log(self, prefix: str, message: str) -> None:
+        line = f"{prefix} {message}"
+        if not self.enabled:
+            print(line)
+            return
+        with self._lock:
+            self._pages["LOG"].append(line)
+            self._trim_log()
+
+    def request_event(self, request_id: str, message: str) -> None:
+        line = f"[REQUEST] request_id={request_id} {message}"
+        if not self.enabled:
+            print(line)
+            return
+        with self._lock:
+            self._ensure_request_page(request_id)
+            self._pages["LOG"].append(line)
+            self._request_text[request_id] += "\n" + line + "\n"
+            self._trim_log()
+
+    def request_token(self, request_id: str, token_text: str) -> None:
+        if not self.enabled:
+            print(f"[REQUEST] request_id={request_id} token={token_text!r}", flush=True)
+            return
+        with self._lock:
+            self._ensure_request_page(request_id)
+            self._request_text[request_id] += token_text
+
+    def close_request_page(self, request_id: str) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if request_id in self._pages:
+                self._pages.pop(request_id, None)
+            self._request_text.pop(request_id, None)
+            if request_id in self._page_order:
+                self._page_order.remove(request_id)
+            if self._active_page_index >= len(self._page_order):
+                self._active_page_index = max(0, len(self._page_order) - 1)
+
+    def _ensure_request_page(self, request_id: str) -> None:
+        if request_id not in self._pages:
+            self._pages[request_id] = []
+            self._request_text[request_id] = ""
+            self._page_order.append(request_id)
+
+    def _trim_log(self, max_lines: int = 1000) -> None:
+        if len(self._pages["LOG"]) > max_lines:
+            self._pages["LOG"] = self._pages["LOG"][-max_lines:]
+
+    def _run_curses(self) -> None:
+        try:
+            self._curses.wrapper(self._curses_main)
+        except Exception as exc:
+            self.enabled = False
+            print(f"[CONTROLLER] CLI page mode disabled: {exc}")
+
+    def _curses_main(self, stdscr) -> None:
+        curses = self._curses
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+
+        while not self._stop_event.is_set():
+            key = stdscr.getch()
+            if key in (curses.KEY_RIGHT, ord("]")):
+                with self._lock:
+                    self._active_page_index = (self._active_page_index + 1) % len(self._page_order)
+            elif key in (curses.KEY_LEFT, ord("[")):
+                with self._lock:
+                    self._active_page_index = (self._active_page_index - 1) % len(self._page_order)
+            elif key == ord("q"):
+                self.enabled = False
+                self._stop_event.set()
+                break
+
+            self._render(stdscr)
+            curses.napms(120)
+
+    def _render(self, stdscr) -> None:
+        with self._lock:
+            page_order = list(self._page_order)
+            page_name = page_order[self._active_page_index]
+            height, width = stdscr.getmaxyx()
+            header = (
+                f"Pipeline pages [{self._active_page_index + 1}/{len(page_order)}] "
+                f"{page_name} | <-/-> or [/] switch | q page mode off"
+            )
+            if page_name == "LOG":
+                lines = self._pages["LOG"][-max(1, height - 2):]
+            else:
+                raw_text = self._request_text.get(page_name, "")
+                wrapped: list[str] = []
+                for raw_line in raw_text.splitlines() or [""]:
+                    wrapped.extend(textwrap.wrap(raw_line, max(10, width - 1)) or [""])
+                lines = wrapped[-max(1, height - 2):]
+
+        stdscr.erase()
+        stdscr.addnstr(0, 0, header, max(1, width - 1))
+        for row, line in enumerate(lines, start=1):
+            if row >= height:
+                break
+            stdscr.addnstr(row, 0, line, max(1, width - 1))
+        stdscr.refresh()
 
 
 class PipelineProtocol:
@@ -403,6 +547,7 @@ class PipelineNodeWorker:
         shards_path: str,
         device: str = "cpu",
         dtype: torch.dtype = torch.float16,
+        console: PipelineConsole | None = None,
     ):
         """
         :param src_addr: 本节点 PULL 绑定地址。
@@ -422,6 +567,7 @@ class PipelineNodeWorker:
         self.shards_path = shards_path
         self.device = torch.device(device)
         self.dtype = dtype
+        self.console = console or PipelineConsole()
 
         self.config = LlamaConfig.from_pretrained(self.shards_path)
         self.layer_num = self.config.num_hidden_layers
@@ -453,11 +599,11 @@ class PipelineNodeWorker:
         return self.end == self.layer_num
 
     def _load_embedding(self) -> None:
-        print("[INFO] loading tokenizer...")
+        self.console.log("[LOADER]", "loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.shards_path)
-        print("[INFO] tokenizer loaded.")
+        self.console.log("[LOADER]", "tokenizer loaded.")
 
-        print("[INFO] loading embedding layer...")
+        self.console.log("[LOADER]", "loading embedding layer...")
         self.embed_tokens = torch.nn.Embedding(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -468,7 +614,7 @@ class PipelineNodeWorker:
                 map_location=self.device,
             )
         )
-        print("[INFO] embedding layer loaded.")
+        self.console.log("[LOADER]", "embedding layer loaded.")
 
     def load_shards(self, start: int, end: int) -> None:
         """
@@ -495,16 +641,16 @@ class PipelineNodeWorker:
             torch.cuda.empty_cache()
 
         if self.is_first_stage:
-            print("[INFO] loading RoPE...")
+            self.console.log("[LOADER]", "loading RoPE...")
             self.rope = LlamaRotaryEmbedding(config=self.config, device=self.device).to(
                 self.device
             )
-            print("[INFO] RoPE loaded.")
+            self.console.log("[LOADER]", "RoPE loaded.")
 
         if self.is_last_stage:
             add_final_norm = True
             final_norm_weight = "final_norm.pth"
-            print("[INFO] loading lm_head...")
+            self.console.log("[LOADER]", "loading lm_head...")
             self.lm_head = torch.nn.Linear(
                 self.config.hidden_size,
                 self.config.vocab_size,
@@ -516,12 +662,14 @@ class PipelineNodeWorker:
                     map_location=self.device,
                 )
             )
-            print("[INFO] lm_head loaded.")
+            self.console.log("[LOADER]", "lm_head loaded.")
         else:
             add_final_norm = False
             final_norm_weight = None
 
-        print(f"[INFO] loading hidden layer {start}~{end}(end excluded)...")
+        self.console.log(
+            "[LOADER]", f"loading hidden layer {start}~{end}(end excluded)..."
+        )
         self.shard = LlamaShardPart(
             self.shards_path,
             ["block_" + str(i) + ".pth" for i in range(start, end)],
@@ -533,7 +681,9 @@ class PipelineNodeWorker:
             final_norm_weight=final_norm_weight,
         )
         self.shard.eval()
-        print(f"[INFO] hidden layer {start}~{end}(end excluded) loaded.")
+        self.console.log(
+            "[LOADER]", f"hidden layer {start}~{end}(end excluded) loaded."
+        )
 
     def _new_request_id(self) -> str:
         self._request_seq += 1
@@ -568,7 +718,7 @@ class PipelineNodeWorker:
             raise RuntimeError("[ERROR] this node cannot receive user request.")
 
         if input_ids is None:
-            print("[INFO] input: " + request)
+            self.console.log("[REQUEST]", f"input: {request}")
             inputs = self.tokenizer(request, return_tensors="pt").to(self.device)
             input_ids = inputs["input_ids"]
         else:
@@ -577,7 +727,7 @@ class PipelineNodeWorker:
                     "[ERROR] input_ids must be a 2D tensor with shape [batch_size, seq_len]."
                 )
             input_ids = input_ids.to(device=self.device, dtype=torch.long)
-            print("[INFO] input: inputted from direct token ids.")
+            self.console.log("[REQUEST]", "input: inputted from direct token ids.")
 
         if input_ids.shape[0] != 1:
             raise ValueError(
@@ -593,8 +743,9 @@ class PipelineNodeWorker:
         )
         self.sessions[request_id] = session
 
-        print(
-            f"[PIPELINE] request_id={request_id} input token number: {session.input_token_length}"
+        self.console.request_event(
+            request_id,
+            f"input token number: {session.input_token_length}",
         )
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len, _ = hidden_states.shape
@@ -696,7 +847,7 @@ class PipelineNodeWorker:
 
         token_id = int(next_token_id.item())
         next_token = self.tokenizer.decode(token_id)
-        print(f"[{request_id}] {next_token!r}", end=" ", flush=True)
+        self.console.request_token(request_id, next_token)
 
         output_token_count = len(session.generated_ids) - 1
         reached_eos = self.tokenizer.eos_token_id is not None and token_id == int(
@@ -707,13 +858,12 @@ class PipelineNodeWorker:
         if reached_eos or reached_max_new_tokens:
             session.finished = True
             reason = "eos" if reached_eos else "max_new_tokens"
-            print()
             final_ids = torch.cat(session.generated_ids, dim=-1)
-            print(
-                f"[PIPELINE] request_id={request_id} output: {self.tokenizer.decode(final_ids[0])}"
+            self.console.request_event(
+                request_id, f"output: {self.tokenizer.decode(final_ids[0])}"
             )
-            print(
-                f"[PIPELINE] request_id={request_id} output token number: {output_token_count}"
+            self.console.request_event(
+                request_id, f"output token number: {output_token_count}"
             )
             return PipelineProtocol.build_done(message, reason, output_token_count)
 
@@ -762,7 +912,8 @@ class PipelineNodeWorker:
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-        print(f"[PIPELINE] request_id={request_id} local session cleared.")
+        self.console.request_event(request_id, "local session cleared.")
+        self.console.close_request_page(request_id)
 
 
 class PipelineNodeController:
@@ -779,17 +930,20 @@ class PipelineNodeController:
         device: str,
         dtype: torch.dtype,
         listen_port: int = 40700,
+        enable_cli_pages: bool = False,
     ):
         """
         :param shards_path: 分片权重目录。
         :param device: 运行设备，例如 cuda:0。
         :param dtype: 模型权重 dtype。
         :param listen_port: 接收中控 config 的端口。
+        :param enable_cli_pages: 是否启用 curses 多页面终端视图；默认 False，保持普通 print 输出。
         """
 
         self.shards_path = shards_path
         self.device = device
         self.dtype = dtype
+        self.console = PipelineConsole(enabled=enable_cli_pages)
 
         self.listen_addr = "tcp://*:" + str(listen_port)
         self.config_context = zmq.Context.instance()
@@ -825,7 +979,7 @@ class PipelineNodeController:
         self.deferred_config: dict[str, Any] | None = (
             None  # 等旧请求 drain 完毕后再真正应用的 config
         )
-        print("[INFO] Pipeline node is ready.")
+        self.console.log("[CONTROLLER]", "Pipeline node is ready.")
 
     @property
     def is_first_stage(self) -> bool:
@@ -876,6 +1030,7 @@ class PipelineNodeController:
             shards_path=self.shards_path,
             device=self.device,
             dtype=self.dtype,
+            console=self.console,
         )
 
     def _receive_config(self, no_block: bool = False) -> dict[str, Any] | None:
@@ -885,14 +1040,15 @@ class PipelineNodeController:
             except zmq.Again:
                 return None
         else:
-            print(
-                "[CONFIG] Waiting for pipeline configuration file from master node..."
+            self.console.log(
+                "[CONFIG]",
+                "Waiting for pipeline configuration file from master node..."
             )
             received_config = self.recv_config_socket.recv_json()
 
-        print("[CONFIG] Received pipeline configuration:")
+        self.console.log("[CONFIG]", "Received pipeline configuration:")
         for k, v in received_config.items():
-            print(f"  - {k}: {v}")
+            self.console.log("[CONFIG]", f"{k}: {v}")
         return received_config
 
     def check_new_config(self) -> None:
@@ -913,8 +1069,9 @@ class PipelineNodeController:
         if self._has_pipeline_work_in_progress(new_config):
             self.deferred_config = new_config
             self.reconfig_pending = True
-            print(
-                "[CONFIG] Deferred new config until current pipeline requests are drained. "
+            self.console.log(
+                "[CONFIG]",
+                "Deferred new config until current pipeline requests are drained. "
                 "New prefill requests will stay in pending_prefill_queue."
             )
             return
@@ -1010,11 +1167,12 @@ class PipelineNodeController:
         self.pipeline_depth = int(new_config["pipeline_depth"])
         self.max_active_requests = int(new_config["max_active_requests"])
         if keep_owner_runtime and not self.accepting_user_requests:
-            print(
-                "[CONFIG] kept tokenizer/embedding for existing owner sessions; "
+            self.console.log(
+                "[CONFIG]",
+                "kept tokenizer/embedding for existing owner sessions; "
                 "new user requests are still rejected by the controller."
             )
-        print("[INFO] Pipeline node reconfigured.")
+        self.console.log("[CONTROLLER]", "Pipeline node reconfigured.")
 
     def _release_pending_prefill_after_reconfig(self) -> None:
         """
@@ -1032,8 +1190,9 @@ class PipelineNodeController:
             message = self.pending_prefill_queue.popleft()
             message["first_node_addr"] = self.node_worker.first_node_addr
             self.node_worker.communicator.send_to(message["first_node_addr"], message)
-            print(
-                f"[SCHED INFO] forwarded pending request_id={message['request_id']} "
+            self.console.log(
+                "[SCHEDULER]",
+                f"forwarded pending request_id={message['request_id']} "
                 f"to new first node {message['first_node_addr']}."
             )
 
@@ -1136,10 +1295,10 @@ class PipelineNodeController:
                 ),
             )
         except Exception as exc:
-            print(f"[REQUEST ERROR] failed to submit user request: {exc}")
+            self.console.log("[REQUEST]", f"failed to submit user request: {exc}")
             return
 
-        print(f"[REQUEST] submitted request_id={request_id}")
+        self.console.request_event(request_id, "submitted")
 
     def _handle_first_stage_input(self, message: dict[str, Any]) -> None:
         request_id = message["request_id"]
@@ -1156,8 +1315,9 @@ class PipelineNodeController:
                 )
             if self.reconfig_pending:
                 self.pending_prefill_queue.append(message)
-                print(
-                    f"[SCHED INFO] queued request_id={request_id} during reconfig pending: "
+                self.console.log(
+                    "[SCHEDULER]",
+                    f"queued request_id={request_id} during reconfig pending: "
                     "requests in the active queue are draining off to clear the way for new config; "
                     "new coming requests are pending until the new config is applied; "
                     f"pending queue={len(self.pending_prefill_queue)}"
@@ -1165,14 +1325,16 @@ class PipelineNodeController:
             elif len(self.active_request_ids) < self.max_active_requests:
                 self.active_request_ids.add(request_id)
                 self.first_stage_input_queue.append(message)
-                print(
-                    f"[SCHED INFO] admitted request_id={request_id}; "
+                self.console.log(
+                    "[SCHEDULER]",
+                    f"admitted request_id={request_id}; "
                     f"active queue={len(self.active_request_ids)}/{self.max_active_requests}"
                 )
             else:
                 self.pending_prefill_queue.append(message)
-                print(
-                    f"[SCHED INFO] queued request_id={request_id}; "
+                self.console.log(
+                    "[SCHEDULER]",
+                    f"queued request_id={request_id}; "
                     f"pending queue={len(self.pending_prefill_queue)}"
                 )
             return
@@ -1238,8 +1400,9 @@ class PipelineNodeController:
 
         request_id = message["request_id"]
         self.active_request_ids.discard(request_id)
-        print(
-            f"[SCHED INFO] completed request_id={request_id} reason={message.get('reason')}; "
+        self.console.log(
+            "[SCHEDULER]",
+            f"completed request_id={request_id} reason={message.get('reason')}; "
             f"active={len(self.active_request_ids)}/{self.max_active_requests}"
         )
 
@@ -1270,8 +1433,9 @@ class PipelineNodeController:
             # clear 命令已经绕模型链一圈回到首节点。首节点在发起 clear 前已经
             # 清理过本地状态，因此这里停止转发即可。
             self.clear_in_flight_request_ids.discard(request_id)
-            print(
-                f"[PIPELINE] request_id={request_id} clear command returned to origin."
+            self.console.log(
+                "[REQUEST]",
+                f"request_id={request_id} clear command returned to origin."
             )
             self._whether_apply_deferred_config()
             return
@@ -1292,8 +1456,9 @@ class PipelineNodeController:
             self.active_request_ids.add(request_id)
             message["first_node_addr"] = self.node_worker.first_node_addr
             self.first_stage_input_queue.append(message)
-            print(
-                f"[SCHED INFO] admitted pending request_id={request_id}; "
+            self.console.log(
+                "[SCHEDULER]",
+                f"admitted pending request_id={request_id}; "
                 f"active={len(self.active_request_ids)}/{self.max_active_requests}; "
                 f"pending={len(self.pending_prefill_queue)}"
             )

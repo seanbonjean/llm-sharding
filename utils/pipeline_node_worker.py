@@ -568,7 +568,7 @@ class PipelineNodeWorker:
             raise RuntimeError("[ERROR] this node cannot receive user request.")
 
         if input_ids is None:
-            print("[INFO] input: " + request)
+            print("[REQUEST] input: " + request)
             inputs = self.tokenizer(request, return_tensors="pt").to(self.device)
             input_ids = inputs["input_ids"]
         else:
@@ -577,7 +577,7 @@ class PipelineNodeWorker:
                     "[ERROR] input_ids must be a 2D tensor with shape [batch_size, seq_len]."
                 )
             input_ids = input_ids.to(device=self.device, dtype=torch.long)
-            print("[INFO] input: inputted from direct token ids.")
+            print("[REQUEST] input: inputted from direct token ids.")
 
         if input_ids.shape[0] != 1:
             raise ValueError(
@@ -1014,7 +1014,7 @@ class PipelineNodeController:
                 "[CONFIG] kept tokenizer/embedding for existing owner sessions; "
                 "new user requests are still rejected by the controller."
             )
-        print("[INFO] Pipeline node reconfigured.")
+        print("[CONTROLLER] Pipeline node reconfigured.")
 
     def _release_pending_prefill_after_reconfig(self) -> None:
         """

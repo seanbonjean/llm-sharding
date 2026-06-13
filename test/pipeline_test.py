@@ -39,6 +39,7 @@ DEFAULT_TELEMETRY_HOST = "127.0.0.1"
 DEFAULT_TELEMETRY_PORT = 40900
 DEFAULT_PREFILL_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
 DEFAULT_DECODE_OUTPUT_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
+PLOT_MAX_SCATTER_POINTS_PER_GROUP = 64
 PROMPT_FRAGMENT = (
     "Distributed inference splits a language model across multiple edge devices so "
     "that each device processes part of the network while cooperating with the others. "
@@ -437,6 +438,7 @@ def plot_scatter_with_fit(
     y_label: str = "KV cache size (MiB)",
     group_key: str | None = None,
     vertical_line_x: float | None = None,
+    scatter_rows: list[dict] | None = None,
 ) -> list[dict]:
     if not rows:
         print(f"[TEST] no rows to plot for {output_path}")
@@ -453,13 +455,25 @@ def plot_scatter_with_fit(
         for row in rows:
             groups.setdefault(str(row.get(group_key, "unknown")), []).append(row)
 
+    scatter_source_rows = rows if scatter_rows is None else scatter_rows
+    scatter_groups: dict[str, list[dict]] = {}
+    if group_key is None:
+        scatter_groups["all"] = scatter_source_rows
+    else:
+        for row in scatter_source_rows:
+            scatter_groups.setdefault(str(row.get(group_key, "unknown")), []).append(row)
+
     fit_rows = []
     plt.figure(figsize=(8, 5))
     for group_name, group_rows in groups.items():
         xs = [float(row[x_key]) for row in group_rows]
         ys_mib = [bytes_to_mib(row[y_key]) for row in group_rows]
-        label = "measured" if group_key is None else f"{group_name} measured"
-        plt.scatter(xs, ys_mib, label=label)
+        sampled_group_rows = scatter_groups.get(group_name, [])
+        scatter_xs = [float(row[x_key]) for row in sampled_group_rows]
+        scatter_ys_mib = [bytes_to_mib(row[y_key]) for row in sampled_group_rows]
+        label = "sampled checkpoints" if group_key is None else f"{group_name} sampled"
+        if scatter_xs:
+            plt.scatter(scatter_xs, scatter_ys_mib, label=label)
         if len(xs) >= 2:
             fit = linear_fit(xs, ys_mib)
             sorted_xs = sorted(xs)
@@ -487,6 +501,44 @@ def plot_scatter_with_fit(
     plt.close()
     print(f"[TEST] plot saved to {output_path}")
     return fit_rows
+
+
+def sample_rows_evenly(
+    rows: list[dict],
+    x_key: str,
+    max_points: int = PLOT_MAX_SCATTER_POINTS_PER_GROUP,
+    group_key: str | None = None,
+) -> list[dict]:
+    """
+    为绘图均匀抽样散点，保留完整 rows 给拟合使用。
+
+    decode/overlap 实验会收集 token 级数据；如果全部画成散点，图上会变成一条
+    很粗的带。这里按 x 轴均匀抽样，效果类似 node_profiler.py 中只标出
+    sampled checkpoints。
+    """
+
+    def sample_one(group_rows: list[dict]) -> list[dict]:
+        sorted_rows = sorted(group_rows, key=lambda row: float(row[x_key]))
+        if len(sorted_rows) <= max_points:
+            return sorted_rows
+        if max_points <= 1:
+            return [sorted_rows[0]]
+        indices = {
+            round(index * (len(sorted_rows) - 1) / (max_points - 1))
+            for index in range(max_points)
+        }
+        return [sorted_rows[index] for index in sorted(indices)]
+
+    if group_key is None:
+        return sample_one(rows)
+
+    sampled_rows: list[dict] = []
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(str(row.get(group_key, "unknown")), []).append(row)
+    for group_rows in groups.values():
+        sampled_rows.extend(sample_one(group_rows))
+    return sampled_rows
 
 
 def load_tokenizer():
@@ -775,6 +827,13 @@ def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> N
         done_event = client.wait_for_done(client_request_id, timeout_s=30.0)
 
     decode_rows = [row for row in aggregate_rows if row.get("phase") == "decode"]
+    sampled_decode_rows = [
+        row
+        for row in decode_rows
+        if int(row.get("output_token_length") or 0) in sample_steps
+    ]
+    if not sampled_decode_rows:
+        sampled_decode_rows = sample_rows_evenly(decode_rows, x_key="output_token_length")
     write_csv(result_dir / "decode_kv_summary.csv", aggregate_rows)
     write_csv(result_dir / "decode_kv_per_node.csv", per_node_rows)
     fit_rows = plot_scatter_with_fit(
@@ -784,6 +843,7 @@ def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> N
         output_path=result_dir / "decode_kv_fit.png",
         title="Pipeline KV cache during decode",
         x_label="Generated output token length",
+        scatter_rows=sampled_decode_rows,
     )
     write_csv(result_dir / "decode_kv_fit.csv", fit_rows)
     if done_event:
@@ -996,6 +1056,11 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
 
     write_csv(result_dir / "overlap_same_prompt_requests.csv", request_rows)
     write_csv(result_dir / "overlap_same_prompt_total.csv", total_rows)
+    sampled_request_rows = sample_rows_evenly(
+        request_rows,
+        x_key="elapsed_s",
+        group_key="request_order",
+    )
     request_fit_rows = plot_scatter_with_fit(
         request_rows,
         x_key="elapsed_s",
@@ -1005,6 +1070,7 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         x_label="Elapsed time (s)",
         group_key="request_order",
         vertical_line_x=second_submit_elapsed,
+        scatter_rows=sampled_request_rows,
     )
     write_csv(result_dir / "overlap_same_prompt_per_request_fit.csv", request_fit_rows)
 
@@ -1020,6 +1086,11 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
     ] + [
         {**row, "segment": "after_second"} for row in after_rows
     ]
+    sampled_total_rows = sample_rows_evenly(
+        total_fit_input_rows,
+        x_key="elapsed_s",
+        group_key="segment",
+    )
     total_fit_rows = plot_scatter_with_fit(
         total_fit_input_rows,
         x_key="elapsed_s",
@@ -1029,6 +1100,7 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         x_label="Elapsed time (s)",
         group_key="segment",
         vertical_line_x=second_submit_elapsed,
+        scatter_rows=sampled_total_rows,
     )
     write_csv(result_dir / "overlap_same_prompt_total_fit.csv", total_fit_rows)
 
@@ -1037,6 +1109,28 @@ def run_kv_cache_experiments(client: PipelineDebugClient) -> None:
     result_dir = make_result_dir()
     print(
         "\nKV cache experiments:\n"
+        "\n"
+        "Experiment descriptions:\n"
+        "  1. Prefill length sweep: send prompts with exact token lengths such as "
+        "8/16/32/... and collect the KV cache size immediately after prefill "
+        "finishes on every pipeline shard. This checks whether KV cache size is "
+        "linear in input token length.\n"
+        "  2. Decode growth sweep: run one request for many generated tokens, "
+        "collect every decode-step KV cache snapshot for fitting, and only draw "
+        "the configured output-token checkpoints on the figure. This checks "
+        "whether each generated token adds a constant KV cache increment.\n"
+        "  3. Sequential same-prompt consistency: submit two identical prompts "
+        "one after another with max_new_tokens=1, compare their post-prefill KV "
+        "cache sizes, then repeat for several input lengths. This checks whether "
+        "per-request clear/reuse leaves no residual state.\n"
+        "  4. Overlapped same-prompt timeline: submit a second identical prompt "
+        "after a delay while the first request is still decoding, then record "
+        "per-request and total KV cache over time. This checks how the total "
+        "growth slope changes before and after concurrent requests overlap.\n"
+        "  5. Run all experiments above in order and save all CSV/plots under "
+        "one timestamped result directory.\n"
+        "\n"
+        "Select an experiment option:\n"
         "  1. prefill KV cache vs input token length\n"
         "  2. decode KV cache vs output token length\n"
         "  3. sequential same-prompt prefill consistency\n"

@@ -35,6 +35,17 @@ class PipelineProtocol:
     PIPELINE_DONE = "pipeline_done"
     PIPELINE_CLEAR = "pipeline_clear"
     USER_REQUEST = "user_request"
+    USER_REQUEST_ACK = "user_request_ack"
+    KV_CACHE_QUERY = "kv_cache_query"
+    KV_CACHE_REPORT = "kv_cache_report"
+    PIPELINE_DONE_REPORT = "pipeline_done_report"
+
+    TELEMETRY_FIELDS = (
+        "client_request_id",
+        "telemetry_addr",
+        "trace_kv_cache",
+        "trace_label",
+    )
 
     PHASE_PREFILL = "prefill"
     PHASE_DECODE = "decode"
@@ -60,6 +71,22 @@ class PipelineProtocol:
             "prompt": prompt,
             "max_new_tokens": max_new_tokens,
         }
+
+    @classmethod
+    def copy_telemetry_fields(
+        cls, source_message: dict[str, Any], target_message: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        复制测试/观测用的可选字段。
+
+        这些字段只在 pipeline_test.py 发起 KV cache 实验时存在；普通推理消息
+        不带这些字段，因此不会产生额外回传，也不会改变原有 pipeline 行为。
+        """
+
+        for field in cls.TELEMETRY_FIELDS:
+            if field in source_message:
+                target_message[field] = source_message[field]
+        return target_message
 
     @classmethod
     def base_message(
@@ -162,7 +189,7 @@ class PipelineProtocol:
                 "sin": sin,
             }
         )
-        return message
+        return cls.copy_telemetry_fields(source_message, message)
 
     @classmethod
     def build_token(
@@ -186,7 +213,7 @@ class PipelineProtocol:
             source_message["first_node_addr"],
         )
         message["next_token_id"] = next_token_id
-        return message
+        return cls.copy_telemetry_fields(source_message, message)
 
     @classmethod
     def build_done(
@@ -216,7 +243,7 @@ class PipelineProtocol:
                 "output_token_count": output_token_count,
             }
         )
-        return message
+        return cls.copy_telemetry_fields(source_message, message)
 
     @classmethod
     def build_clear(
@@ -240,7 +267,7 @@ class PipelineProtocol:
             source_message["first_node_addr"],
         )
         message["clear_origin_addr"] = clear_origin_addr
-        return message
+        return cls.copy_telemetry_fields(source_message, message)
 
     @classmethod
     def is_type(cls, data: object, message_type: str) -> bool:
@@ -259,6 +286,7 @@ class PipelineProtocol:
             cls.PIPELINE_DONE,
             cls.PIPELINE_CLEAR,
             cls.USER_REQUEST,
+            cls.KV_CACHE_QUERY,
         }
 
 
@@ -549,12 +577,172 @@ class PipelineNodeWorker:
             session.past_key_value = DynamicCache()
         return session
 
+    @staticmethod
+    def _iter_tensors(data: object):
+        """
+        递归遍历 DynamicCache 内部结构中的 tensor。
+
+        HuggingFace 不同版本的 cache 容器结构可能略有差异，因此这里不假设
+        key_cache/value_cache 一定是简单 list，而是递归展开 dict/list/tuple。
+        """
+
+        if torch.is_tensor(data):
+            yield data
+        elif isinstance(data, dict):
+            for value in data.values():
+                yield from PipelineNodeWorker._iter_tensors(value)
+        elif isinstance(data, (list, tuple)):
+            for value in data:
+                yield from PipelineNodeWorker._iter_tensors(value)
+
+    @classmethod
+    def _dynamic_cache_payload_stats(
+        cls, past_key_value: DynamicCache | None
+    ) -> dict[str, int]:
+        """
+        统计 DynamicCache 中 key/value tensor 的逻辑 payload 大小。
+
+        bytes/numel 只来自 KV cache tensor 本体，不包含 Python 容器开销；
+        token_length 取 cache tensor 中能观察到的最大 seq_len，用于辅助检查
+        prefill/decode 后 cache 是否按预期增长。
+        """
+
+        if past_key_value is None:
+            return {
+                "kv_cache_bytes": 0,
+                "kv_cache_numel": 0,
+                "kv_cache_tensor_count": 0,
+                "kv_cache_token_length": 0,
+            }
+
+        total_bytes = 0
+        total_numel = 0
+        tensor_count = 0
+        token_length = 0
+
+        def visit(cache_storage: object) -> None:
+            nonlocal total_bytes, total_numel, tensor_count, token_length
+            for tensor in cls._iter_tensors(cache_storage):
+                tensor_count += 1
+                total_numel += tensor.numel()
+                total_bytes += tensor.numel() * tensor.element_size()
+                if tensor.ndim >= 2:
+                    token_length = max(token_length, int(tensor.shape[-2]))
+
+        for cache_attr in ("key_cache", "value_cache"):
+            visit(getattr(past_key_value, cache_attr, None))
+
+        if tensor_count == 0:
+            layers = getattr(past_key_value, "layers", None)
+            if layers is not None:
+                for layer_cache in layers:
+                    for cache_attr in (
+                        "key_cache",
+                        "value_cache",
+                        "keys",
+                        "values",
+                        "key_states",
+                        "value_states",
+                    ):
+                        visit(getattr(layer_cache, cache_attr, None))
+
+        return {
+            "kv_cache_bytes": int(total_bytes),
+            "kv_cache_numel": int(total_numel),
+            "kv_cache_tensor_count": int(tensor_count),
+            "kv_cache_token_length": int(token_length),
+        }
+
+    def _cuda_memory_allocated_bytes(self) -> int | None:
+        """返回当前 CUDA memory_allocated；非 CUDA 设备返回 None。"""
+
+        if self.device.type != "cuda":
+            return None
+        torch.cuda.synchronize(self.device)
+        return int(torch.cuda.memory_allocated(self.device))
+
+    def build_kv_cache_report(
+        self,
+        request_id: str,
+        source_message: dict[str, Any] | None = None,
+        event: str = "query",
+    ) -> dict[str, Any]:
+        """
+        构造当前节点某个 request_id 的 KV cache 测量结果。
+
+        report 会发回 pipeline_test.py 绑定的 telemetry socket；这里不修改
+        session，不触发 clear，只做只读统计。
+        """
+
+        session = self.sessions.get(request_id)
+        cache_stats = self._dynamic_cache_payload_stats(
+            session.past_key_value if session is not None else None
+        )
+        report: dict[str, Any] = {
+            PipelineProtocol.TYPE_KEY: PipelineProtocol.KV_CACHE_REPORT,
+            "event": event,
+            "request_id": request_id,
+            "node_id": self.node_id,
+            "node_addr": self.node_addr,
+            "shards_start": self.start,
+            "shards_end": self.end,
+            "has_session": session is not None,
+            "session_step": session.step if session is not None else None,
+            "timestamp": time.time(),
+            "cuda_memory_allocated_bytes": self._cuda_memory_allocated_bytes(),
+        }
+        report.update(cache_stats)
+        if source_message is not None:
+            report.update(
+                {
+                    "phase": source_message.get("phase"),
+                    "step": source_message.get("step"),
+                    "forward_seq_len": source_message.get("seq_len"),
+                    "client_request_id": source_message.get("client_request_id"),
+                    "trace_label": source_message.get("trace_label"),
+                }
+            )
+        else:
+            report.update(
+                {
+                    "phase": None,
+                    "step": session.step if session is not None else None,
+                    "forward_seq_len": None,
+                    "client_request_id": None,
+                    "trace_label": None,
+                }
+            )
+        return report
+
+    def maybe_emit_kv_cache_report(
+        self,
+        request_id: str,
+        source_message: dict[str, Any],
+        event: str = "post_shard_forward",
+    ) -> None:
+        """
+        如果消息带 telemetry_addr，则把当前节点 KV cache snapshot 发回测试脚本。
+
+        普通推理消息没有 telemetry_addr，所以这里是零侵入的观测钩子。
+        """
+
+        telemetry_addr = source_message.get("telemetry_addr")
+        if not telemetry_addr or not bool(source_message.get("trace_kv_cache", False)):
+            return
+        report = self.build_kv_cache_report(
+            request_id=request_id,
+            source_message=source_message,
+            event=event,
+        )
+        self.communicator.send_to(telemetry_addr, report)
+
     @torch.inference_mode()
     def receive_user_request(
         self,
         request: str = "Write a poem about the blue sky.",
         max_new_tokens: int = 1024,
         input_ids: torch.Tensor | None = None,
+        request_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         接收用户请求并构造发往 first node 的 pipeline_input。
@@ -599,7 +787,7 @@ class PipelineNodeWorker:
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len, _ = hidden_states.shape
 
-        return PipelineProtocol.build_input(
+        message = PipelineProtocol.build_input(
             request_id=request_id,
             phase=PipelineProtocol.PHASE_PREFILL,
             step=0,
@@ -609,6 +797,9 @@ class PipelineNodeWorker:
             batch_size=batch_size,
             seq_len=seq_len,
         )
+        if request_metadata:
+            PipelineProtocol.copy_telemetry_fields(request_metadata, message)
+        return message
 
     @torch.inference_mode()
     def pass_through_shard(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -661,6 +852,7 @@ class PipelineNodeWorker:
             past_key_value=session.past_key_value,
             rotary_emb=(cos, sin),
         )
+        self.maybe_emit_kv_cache_report(message["request_id"], message)
 
         if self.is_last_stage:
             logits = self.lm_head(next_hidden_states)
@@ -719,7 +911,7 @@ class PipelineNodeWorker:
 
         session.step = output_token_count
         hidden_states = self.embed_tokens(next_token_id.unsqueeze(0))
-        return PipelineProtocol.build_input(
+        next_input = PipelineProtocol.build_input(
             request_id=request_id,
             phase=PipelineProtocol.PHASE_DECODE,
             step=session.step,
@@ -729,6 +921,7 @@ class PipelineNodeWorker:
             batch_size=1,
             seq_len=1,
         )
+        return PipelineProtocol.copy_telemetry_fields(message, next_input)
 
     def clear_request_state(self, request_id: str) -> None:
         """
@@ -1042,6 +1235,7 @@ class PipelineNodeController:
         request: str = "Write a poem about the blue sky.",
         max_new_tokens: int | None = None,
         input_ids: torch.Tensor | None = None,
+        request_metadata: dict[str, Any] | None = None,
     ) -> str:
         """
         接收一个用户请求并提交到 pipeline
@@ -1059,6 +1253,7 @@ class PipelineNodeController:
             request=request,
             max_new_tokens=max_new_tokens or self.default_max_new_tokens,
             input_ids=input_ids,
+            request_metadata=request_metadata,
         )
         request_id = message["request_id"]
         self._submit_input_to_first_stage(message)
@@ -1118,6 +1313,8 @@ class PipelineNodeController:
             self._handle_pipeline_clear(data)
         elif PipelineProtocol.is_type(data, PipelineProtocol.USER_REQUEST):
             self._handle_user_request(data)
+        elif PipelineProtocol.is_type(data, PipelineProtocol.KV_CACHE_QUERY):
+            self._handle_kv_cache_query(data)
 
     def _handle_user_request(self, message: dict[str, Any]) -> None:
         """
@@ -1128,18 +1325,102 @@ class PipelineNodeController:
         pipeline 内部状态错误仍会在对应分支 fail-fast。
         """
 
+        response_addr = message.get("response_addr") or message.get("telemetry_addr")
+        client_request_id = message.get("client_request_id")
+        request_metadata = {
+            field: message[field]
+            for field in PipelineProtocol.TELEMETRY_FIELDS
+            if field in message
+        }
+
+        raw_input_ids = message.get("input_ids")
+        input_ids = None
+        if raw_input_ids is not None:
+            input_ids = raw_input_ids if torch.is_tensor(raw_input_ids) else torch.as_tensor(raw_input_ids)
+            if input_ids.ndim == 1:
+                input_ids = input_ids.unsqueeze(0)
+
         try:
             request_id = self.receive_request(
                 request=message.get("prompt", "Write a poem about the blue sky."),
                 max_new_tokens=int(
                     message.get("max_new_tokens", self.default_max_new_tokens)
                 ),
+                input_ids=input_ids,
+                request_metadata=request_metadata,
             )
         except Exception as exc:
             print(f"[REQUEST ERROR] failed to submit user request: {exc}")
+            if response_addr:
+                self.node_worker.communicator.send_to(
+                    response_addr,
+                    {
+                        PipelineProtocol.TYPE_KEY: PipelineProtocol.USER_REQUEST_ACK,
+                        "ok": False,
+                        "client_request_id": client_request_id,
+                        "request_id": None,
+                        "node_id": self.node_worker.node_id,
+                        "node_addr": self.node_worker.node_addr,
+                        "error": str(exc),
+                        "timestamp": time.time(),
+                    },
+                )
             return
 
         print(f"[REQUEST] submitted request_id={request_id}")
+        if response_addr:
+            session = self.node_worker.sessions.get(request_id)
+            self.node_worker.communicator.send_to(
+                response_addr,
+                {
+                    PipelineProtocol.TYPE_KEY: PipelineProtocol.USER_REQUEST_ACK,
+                    "ok": True,
+                    "client_request_id": client_request_id,
+                    "request_id": request_id,
+                    "node_id": self.node_worker.node_id,
+                    "node_addr": self.node_worker.node_addr,
+                    "input_token_length": (
+                        session.input_token_length if session is not None else None
+                    ),
+                    "timestamp": time.time(),
+                },
+            )
+
+    def _handle_kv_cache_query(self, message: dict[str, Any]) -> None:
+        """
+        处理测试脚本发来的 KV cache 查询。
+
+        查询不参与模型链调度，也不会清理 session；它只是把本节点当前保存的
+        某个 request_id 的 DynamicCache 统计结果回传到 response_addr。
+        """
+
+        response_addr = message.get("response_addr") or message.get("telemetry_addr")
+        if not response_addr:
+            print("[REQUEST ERROR] kv_cache_query missing response_addr.")
+            return
+
+        request_id = message.get("request_id")
+        if request_id and request_id != "*":
+            request_ids = [request_id]
+        else:
+            request_ids = list(self.node_worker.sessions.keys())
+            if not request_ids:
+                request_ids = [request_id or "*"]
+
+        for current_request_id in request_ids:
+            report = self.node_worker.build_kv_cache_report(
+                request_id=current_request_id,
+                source_message=None,
+                event="query",
+            )
+            report.update(
+                {
+                    "client_request_id": message.get("client_request_id"),
+                    "trace_label": message.get("trace_label"),
+                    "query_id": message.get("query_id"),
+                }
+            )
+            self.node_worker.communicator.send_to(response_addr, report)
 
     def _handle_first_stage_input(self, message: dict[str, Any]) -> None:
         request_id = message["request_id"]
@@ -1242,12 +1523,34 @@ class PipelineNodeController:
             f"[SCHEDULER] completed request_id={request_id} reason={message.get('reason')}; "
             f"active={len(self.active_request_ids)}/{self.max_active_requests}"
         )
+        self._emit_pipeline_done_report(message)
 
         self._start_pipeline_clear(message)
         if self.reconfig_pending:
             self._whether_apply_deferred_config()
         else:
             self._admit_pending_prefill()
+
+    def _emit_pipeline_done_report(self, message: dict[str, Any]) -> None:
+        """在测试模式下通知 pipeline_test.py 某个 request 已经完成。"""
+
+        telemetry_addr = message.get("telemetry_addr")
+        if not telemetry_addr:
+            return
+        self.node_worker.communicator.send_to(
+            telemetry_addr,
+            {
+                PipelineProtocol.TYPE_KEY: PipelineProtocol.PIPELINE_DONE_REPORT,
+                "request_id": message["request_id"],
+                "client_request_id": message.get("client_request_id"),
+                "trace_label": message.get("trace_label"),
+                "reason": message.get("reason"),
+                "output_token_count": message.get("output_token_count"),
+                "node_id": self.node_worker.node_id,
+                "node_addr": self.node_worker.node_addr,
+                "timestamp": time.time(),
+            },
+        )
 
     def _start_pipeline_clear(self, done_message: dict[str, Any]) -> None:
         request_id = done_message["request_id"]

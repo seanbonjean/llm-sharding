@@ -119,6 +119,25 @@ Pipeline config 兼容旧字段，并新增：
    - 运行原 profiling 入口。
    - 预期：仍 import `utils.node_worker.NodeWorker` ，不会进入 pipeline 版本。
 
+## KV Cache 实验
+
+`test/pipeline_test.py` 的菜单第 5 项为 `run KV cache growth experiments`，用于在 pipeline/distributed 环境下收集 KV Cache 增长数据。实验脚本会在中控设备绑定一个 telemetry PULL 端口，并把可连接地址随测试请求发送给 owner 节点；worker 只在请求带 `telemetry_addr` 时回传测量结果，普通推理不受影响。
+
+运行时需要输入 `Telemetry callback host/IP visible to Jetson nodes`，这里应填写 Jetson 节点能连到的中控设备 IP，端口默认 `40900`。结果会保存到：
+
+```text
+results/pipeline_kv_cache/<timestamp>/
+```
+
+当前包含 4 类实验：
+
+1. prefill 后 KV Cache 大小随 input token length 增长。
+2. decode 过程中 KV Cache 大小随 output token length 增长。
+3. 两个相同 input prompt 顺序执行时，比较各自 prefill 后 KV Cache 大小是否一致。
+4. 两个相同 input prompt 间隔进入并重叠执行时，记录每个 request 和总 KV Cache 随时间变化。
+
+每类实验都会输出 CSV；可拟合的实验会额外保存散点图和一次函数拟合结果 CSV。
+
 ## 调试建议
 
 * 如果消息没有继续向下游走，先检查每个节点的 `node_addr` 是否是可连接地址。

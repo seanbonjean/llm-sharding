@@ -39,7 +39,7 @@ DEFAULT_TELEMETRY_HOST = "172.16.0.1"
 DEFAULT_TELEMETRY_PORT = 40900
 DEFAULT_PREFILL_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
 DEFAULT_DECODE_OUTPUT_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
-PLOT_MAX_SCATTER_POINTS_PER_GROUP = 64
+OVERLAP_TIME_SAMPLE_INTERVAL_S = 1.0
 PROMPT_FRAGMENT = (
     "Distributed inference splits a language model across multiple edge devices so "
     "that each device processes part of the network while cooperating with the others. "
@@ -503,31 +503,37 @@ def plot_scatter_with_fit(
     return fit_rows
 
 
-def sample_rows_evenly(
+def sample_rows_by_x_interval(
     rows: list[dict],
     x_key: str,
-    max_points: int = PLOT_MAX_SCATTER_POINTS_PER_GROUP,
+    interval: float,
     group_key: str | None = None,
 ) -> list[dict]:
     """
-    为绘图均匀抽样散点，保留完整 rows 给拟合使用。
+    按横轴数值间隔采样散点，保留完整 rows 给拟合使用。
 
-    decode/overlap 实验会收集 token 级数据；如果全部画成散点，图上会变成一条
-    很粗的带。这里按 x 轴均匀抽样，效果类似 node_profiler.py 中只标出
-    sampled checkpoints。
+    overlap 图的横轴是 elapsed_s，因此 interval 的单位就是秒。每个 group 内
+    保留首尾点，并在相邻采样点的 elapsed_s 至少相差 interval 时保留新点。
     """
+
+    if interval <= 0:
+        return rows
 
     def sample_one(group_rows: list[dict]) -> list[dict]:
         sorted_rows = sorted(group_rows, key=lambda row: float(row[x_key]))
-        if len(sorted_rows) <= max_points:
+        if len(sorted_rows) <= 2:
             return sorted_rows
-        if max_points <= 1:
-            return [sorted_rows[0]]
-        indices = {
-            round(index * (len(sorted_rows) - 1) / (max_points - 1))
-            for index in range(max_points)
-        }
-        return [sorted_rows[index] for index in sorted(indices)]
+
+        sampled = [sorted_rows[0]]
+        last_sample_x = float(sorted_rows[0][x_key])
+        for row in sorted_rows[1:-1]:
+            current_x = float(row[x_key])
+            if current_x - last_sample_x >= interval:
+                sampled.append(row)
+                last_sample_x = current_x
+        if sampled[-1] is not sorted_rows[-1]:
+            sampled.append(sorted_rows[-1])
+        return sampled
 
     if group_key is None:
         return sample_one(rows)
@@ -832,8 +838,6 @@ def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> N
         for row in decode_rows
         if int(row.get("output_token_length") or 0) in sample_steps
     ]
-    if not sampled_decode_rows:
-        sampled_decode_rows = sample_rows_evenly(decode_rows, x_key="output_token_length")
     write_csv(result_dir / "decode_kv_summary.csv", aggregate_rows)
     write_csv(result_dir / "decode_kv_per_node.csv", per_node_rows)
     fit_rows = plot_scatter_with_fit(
@@ -1056,9 +1060,10 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
 
     write_csv(result_dir / "overlap_same_prompt_requests.csv", request_rows)
     write_csv(result_dir / "overlap_same_prompt_total.csv", total_rows)
-    sampled_request_rows = sample_rows_evenly(
+    sampled_request_rows = sample_rows_by_x_interval(
         request_rows,
         x_key="elapsed_s",
+        interval=OVERLAP_TIME_SAMPLE_INTERVAL_S,
         group_key="request_order",
     )
     request_fit_rows = plot_scatter_with_fit(
@@ -1086,9 +1091,10 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
     ] + [
         {**row, "segment": "after_second"} for row in after_rows
     ]
-    sampled_total_rows = sample_rows_evenly(
+    sampled_total_rows = sample_rows_by_x_interval(
         total_fit_input_rows,
         x_key="elapsed_s",
+        interval=OVERLAP_TIME_SAMPLE_INTERVAL_S,
         group_key="segment",
     )
     total_fit_rows = plot_scatter_with_fit(

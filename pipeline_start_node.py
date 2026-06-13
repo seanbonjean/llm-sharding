@@ -4,7 +4,7 @@ Pipeline inference 节点启动入口
 运行方式和旧 start_node.py 基本一致：
     python pipeline_start_node.py --port 40700
 
-该进程启动后会等待中控设备或 pipeline_debug.py / pipeline_send_config.py 发送 config
+该进程启动后会等待中控设备或 test/pipeline_test.py / test/pipeline_send_config.py 发送 config
 pipeline 版本在旧 config 基础上新增以下字段：
     node_addr: 当前节点可被其他节点 connect 的地址，例如 tcp://172.16.0.2:40800
     first_node_addr: 模型链首分片地址

@@ -85,12 +85,12 @@ Pipeline config 兼容旧字段，并新增：
    python pipeline_start_node.py --port 40700
    ```
 
-2. 修改 `pipeline_debug.py` 或 `pipeline_send_config.py` 中的 IP、切片边界和 `pipeline_depth`，然后在中控设备执行：
+2. 修改 `test/pipeline_test.py` 或 `test/pipeline_send_config.py` 中的 IP、切片边界和 `pipeline_depth`，然后在中控设备执行：
 
    
 
 ```bash
-   python pipeline_debug.py
+   python test/pipeline_test.py
    ```
 
 3. 单请求测试：

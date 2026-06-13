@@ -463,14 +463,16 @@ def plot_scatter_with_fit(
         if len(xs) >= 2:
             fit = linear_fit(xs, ys_mib)
             sorted_xs = sorted(xs)
-            y0 = fit["slope"] * sorted_xs[0] + fit["intercept"]
-            y1 = fit["slope"] * sorted_xs[-1] + fit["intercept"]
+            fitted_ys = [
+                fit["slope"] * x_value + fit["intercept"]
+                for x_value in sorted_xs
+            ]
             fit_label = (
                 "linear fit"
                 if group_key is None
                 else f"{group_name} fit"
             )
-            plt.plot(sorted_xs, [y0, y1], label=fit_label)
+            plt.plot(sorted_xs, fitted_ys, label=fit_label)
             fit_rows.append({"group": group_name, **fit})
 
     if vertical_line_x is not None:

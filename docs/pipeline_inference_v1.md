@@ -150,12 +150,12 @@ payload，因此它是按 request 隔离的 KV Cache 逻辑大小。`cuda_memory
 会在带 `telemetry_addr` 且开启 `trace_kv_cache` 的请求第一次进入每个分片 forward 前记录
 `cuda_memory_baseline_bytes`，并在报告中额外给出
 `cuda_memory_delta_bytes = cuda_memory_allocated_bytes - cuda_memory_baseline_bytes`。
-当前图中的 CUDA 曲线使用 delta 字段；raw allocated 字段仍保留在 CSV 中用于排查单节点显存状态。
+当前图中的 CUDA 曲线使用 delta 字段，图例统一为 `cuda memory baseline delta`；
+raw allocated 字段仍保留在 CSV 中用于排查单节点显存状态，但不会画到图上，避免纵轴比例被拉大。
 
 除全 pipeline 求和图外，实验脚本还会为每个节点额外生成 per-node 图，文件名形如
 `<experiment>_per_node_<node_id>_shards_<shards_start>~<shards_end>.png`。这些图不会跨节点
-求和，会同时画出该节点的 `kv_cache_bytes`、`cuda_memory_delta_bytes` 和 raw
-`cuda_memory_allocated_bytes`，更适合判断单台 Jetson 的显存占用。
+求和，会画出该节点的 `kv_cache_bytes` 和 `cuda_memory_delta_bytes`。
 
 ## 调试建议
 

@@ -527,9 +527,10 @@ def plot_scatter_with_fit(
     return fit_rows
 
 
+CUDA_MEMORY_BASELINE_DELTA_LABEL = "cuda memory baseline delta"
+
 PER_NODE_MEMORY_SERIES = [
-    ("cuda_memory_delta_bytes", "CUDA memory_allocated delta"),
-    ("cuda_memory_allocated_bytes", "CUDA memory_allocated raw"),
+    ("cuda_memory_delta_bytes", CUDA_MEMORY_BASELINE_DELTA_LABEL),
 ]
 
 
@@ -562,8 +563,8 @@ def plot_per_node_scatter_with_fit(
     """
     为每个 node_id 单独生成一张图，并把 node_id 与 shard 范围写入文件名。
 
-    聚合图适合观察整条 pipeline 的总 KV Cache；per-node 图则保留单节点的
-    torch.cuda.memory_allocated() raw value，便于和该节点的 8GB/16GB 显存上限对照。
+    聚合图适合观察整条 pipeline 的总 KV Cache；per-node 图只画 baseline delta，
+    避免 raw torch.cuda.memory_allocated() 把纵轴比例拉得过大。
     """
 
     rows_by_node: dict[tuple[str, int, int], list[dict]] = {}
@@ -951,7 +952,7 @@ def run_prefill_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> 
         title="Pipeline KV cache after prefill",
         x_label="Input token length",
         y_label="Memory size (MiB)",
-        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
+        extra_y_series=[("cuda_memory_delta_bytes", CUDA_MEMORY_BASELINE_DELTA_LABEL)],
     )
     write_csv(result_dir / "prefill_kv_fit.csv", fit_rows)
     per_node_fit_rows = plot_per_node_scatter_with_fit(
@@ -1027,7 +1028,7 @@ def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> N
         x_label="Generated output token length",
         y_label="Memory size (MiB)",
         scatter_rows=sampled_decode_rows,
-        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
+        extra_y_series=[("cuda_memory_delta_bytes", CUDA_MEMORY_BASELINE_DELTA_LABEL)],
     )
     write_csv(result_dir / "decode_kv_fit.csv", fit_rows)
     decode_node_rows = [row for row in per_node_rows if row.get("phase") == "decode"]
@@ -1169,7 +1170,7 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
         x_label="Input token length",
         y_label="Memory size (MiB)",
         group_key="order",
-        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
+        extra_y_series=[("cuda_memory_delta_bytes", CUDA_MEMORY_BASELINE_DELTA_LABEL)],
     )
     write_csv(result_dir / "sequential_same_prompt_fit.csv", fit_rows)
     per_node_fit_rows = plot_per_node_scatter_with_fit(
@@ -1458,7 +1459,7 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         group_key="request_order",
         vertical_line_x=second_submit_elapsed,
         scatter_rows=sampled_request_rows,
-        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
+        extra_y_series=[("cuda_memory_delta_bytes", CUDA_MEMORY_BASELINE_DELTA_LABEL)],
     )
     write_csv(result_dir / "overlap_same_prompt_per_request_fit.csv", request_fit_rows)
     sampled_node_request_rows = sample_rows_by_x_interval(
@@ -1515,7 +1516,7 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         vertical_line_x=second_submit_elapsed,
         scatter_rows=sampled_total_rows,
         extra_y_series=[
-            ("total_cuda_memory_delta_bytes", "CUDA memory_allocated delta from start")
+            ("total_cuda_memory_delta_bytes", CUDA_MEMORY_BASELINE_DELTA_LABEL)
         ],
     )
     write_csv(result_dir / "overlap_same_prompt_total_fit.csv", total_fit_rows)
@@ -1555,8 +1556,7 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         vertical_line_x=second_submit_elapsed,
         scatter_rows=sampled_node_total_rows,
         extra_y_series=[
-            ("cuda_memory_delta_from_start_bytes", "CUDA memory_allocated delta from start"),
-            ("cuda_memory_allocated_bytes", "CUDA memory_allocated raw"),
+            ("cuda_memory_delta_from_start_bytes", CUDA_MEMORY_BASELINE_DELTA_LABEL),
         ],
     )
     write_csv(

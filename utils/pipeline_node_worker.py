@@ -42,7 +42,7 @@ class PipelineProtocol:
 
     TELEMETRY_FIELDS = (
         "client_request_id",
-        "telemetry_addr",
+        "telemetry_addr",  # 观测/测量回传地址，用于 kv_cache_report 和 pipeline_done_report
         "trace_kv_cache",
         "trace_label",
     )
@@ -81,6 +81,8 @@ class PipelineProtocol:
 
         这些字段只在 pipeline_test.py 发起 KV cache 实验时存在；普通推理消息
         不带这些字段，因此不会产生额外回传，也不会改变原有 pipeline 行为。
+        telemetry_addr 是统一回传地址：owner 用它返回 user_request_ack，
+        各分片用它返回 kv_cache_report，first node 用它返回 pipeline_done_report。
         """
 
         for field in cls.TELEMETRY_FIELDS:
@@ -654,7 +656,13 @@ class PipelineNodeWorker:
         }
 
     def _cuda_memory_allocated_bytes(self) -> int | None:
-        """返回当前 CUDA memory_allocated；非 CUDA 设备返回 None。"""
+        """
+        返回当前 torch.cuda.memory_allocated()；非 CUDA 设备返回 None。
+
+        该方法只由 build_kv_cache_report() 调用，而 report 只会在消息携带
+        telemetry_addr 的测试/查询路径中构造，普通 pipeline 推理不会触发
+        CUDA memory 统计和同步。
+        """
 
         if self.device.type != "cuda":
             return None
@@ -666,6 +674,7 @@ class PipelineNodeWorker:
         request_id: str,
         source_message: dict[str, Any] | None = None,
         event: str = "query",
+        include_cuda_memory: bool = False,
     ) -> dict[str, Any]:
         """
         构造当前节点某个 request_id 的 KV cache 测量结果。
@@ -689,7 +698,11 @@ class PipelineNodeWorker:
             "has_session": session is not None,
             "session_step": session.step if session is not None else None,
             "timestamp": time.time(),
-            "cuda_memory_allocated_bytes": self._cuda_memory_allocated_bytes(),
+            "cuda_memory_allocated_bytes": (
+                self._cuda_memory_allocated_bytes()
+                if include_cuda_memory
+                else None
+            ),
         }
         report.update(cache_stats)
         if source_message is not None:
@@ -733,6 +746,7 @@ class PipelineNodeWorker:
             request_id=request_id,
             source_message=source_message,
             event=event,
+            include_cuda_memory=True,
         )
         self.communicator.send_to(telemetry_addr, report)
 
@@ -1323,9 +1337,13 @@ class PipelineNodeController:
         该入口复用节点的 40800 PULL socket，消息类型为 user_request。为了
         避免一次错误外部请求直接杀掉长驻 worker，这里捕获异常并打印；正常的
         pipeline 内部状态错误仍会在对应分支 fail-fast。
+
+        telemetry_addr 只服务测试/观测路径：如果存在，owner 会向它发送
+        user_request_ack；同一个地址也会随请求进入模型链，用于 KV cache 和
+        done report 回传。普通推理请求不带 telemetry_addr，不会产生这些回传。
         """
 
-        response_addr = message.get("response_addr") or message.get("telemetry_addr")
+        telemetry_addr = message.get("telemetry_addr")
         client_request_id = message.get("client_request_id")
         request_metadata = {
             field: message[field]
@@ -1351,9 +1369,9 @@ class PipelineNodeController:
             )
         except Exception as exc:
             print(f"[REQUEST ERROR] failed to submit user request: {exc}")
-            if response_addr:
+            if telemetry_addr:
                 self.node_worker.communicator.send_to(
-                    response_addr,
+                    telemetry_addr,
                     {
                         PipelineProtocol.TYPE_KEY: PipelineProtocol.USER_REQUEST_ACK,
                         "ok": False,
@@ -1368,10 +1386,10 @@ class PipelineNodeController:
             return
 
         print(f"[REQUEST] submitted request_id={request_id}")
-        if response_addr:
+        if telemetry_addr:
             session = self.node_worker.sessions.get(request_id)
             self.node_worker.communicator.send_to(
-                response_addr,
+                telemetry_addr,
                 {
                     PipelineProtocol.TYPE_KEY: PipelineProtocol.USER_REQUEST_ACK,
                     "ok": True,
@@ -1391,12 +1409,14 @@ class PipelineNodeController:
         处理测试脚本发来的 KV cache 查询。
 
         查询不参与模型链调度，也不会清理 session；它只是把本节点当前保存的
-        某个 request_id 的 DynamicCache 统计结果回传到 response_addr。
+        某个 request_id 的 DynamicCache 统计结果回传到 telemetry_addr。
+        当前 query 默认 include_cuda_memory=True，因此 report 中也会包含
+        torch.cuda.memory_allocated() 的结果。
         """
 
-        response_addr = message.get("response_addr") or message.get("telemetry_addr")
-        if not response_addr:
-            print("[REQUEST ERROR] kv_cache_query missing response_addr.")
+        telemetry_addr = message.get("telemetry_addr")
+        if not telemetry_addr:
+            print("[REQUEST ERROR] kv_cache_query missing telemetry_addr.")
             return
 
         request_id = message.get("request_id")
@@ -1412,6 +1432,7 @@ class PipelineNodeController:
                 request_id=current_request_id,
                 source_message=None,
                 event="query",
+                include_cuda_memory=True,
             )
             report.update(
                 {
@@ -1420,7 +1441,7 @@ class PipelineNodeController:
                     "query_id": message.get("query_id"),
                 }
             )
-            self.node_worker.communicator.send_to(response_addr, report)
+            self.node_worker.communicator.send_to(telemetry_addr, report)
 
     def _handle_first_stage_input(self, message: dict[str, Any]) -> None:
         request_id = message["request_id"]

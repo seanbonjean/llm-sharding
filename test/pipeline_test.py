@@ -259,7 +259,6 @@ class PipelineDebugClient:
                 raise RuntimeError("[ERROR] telemetry must be configured before tracing KV cache.")
             payload.update(
                 {
-                    "response_addr": self.telemetry_public_addr,
                     "telemetry_addr": self.telemetry_public_addr,
                     "trace_kv_cache": True,
                     "trace_label": trace_label,
@@ -303,7 +302,7 @@ class PipelineDebugClient:
             payload = {
                 "type": KV_CACHE_QUERY,
                 "request_id": request_id,
-                "response_addr": self.telemetry_public_addr,
+                "telemetry_addr": self.telemetry_public_addr,
                 "query_id": query_id,
                 "trace_label": trace_label,
             }
@@ -439,6 +438,7 @@ def plot_scatter_with_fit(
     group_key: str | None = None,
     vertical_line_x: float | None = None,
     scatter_rows: list[dict] | None = None,
+    extra_y_series: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
     if not rows:
         print(f"[TEST] no rows to plot for {output_path}")
@@ -465,29 +465,53 @@ def plot_scatter_with_fit(
 
     fit_rows = []
     plt.figure(figsize=(8, 5))
+    y_series = [(y_key, "KV cache")]
+    if extra_y_series:
+        y_series.extend(extra_y_series)
+
     for group_name, group_rows in groups.items():
-        xs = [float(row[x_key]) for row in group_rows]
-        ys_mib = [bytes_to_mib(row[y_key]) for row in group_rows]
         sampled_group_rows = scatter_groups.get(group_name, [])
-        scatter_xs = [float(row[x_key]) for row in sampled_group_rows]
-        scatter_ys_mib = [bytes_to_mib(row[y_key]) for row in sampled_group_rows]
-        label = "sampled checkpoints" if group_key is None else f"{group_name} sampled"
-        if scatter_xs:
-            plt.scatter(scatter_xs, scatter_ys_mib, label=label)
-        if len(xs) >= 2:
-            fit = linear_fit(xs, ys_mib)
-            sorted_xs = sorted(xs)
-            fitted_ys = [
-                fit["slope"] * x_value + fit["intercept"]
-                for x_value in sorted_xs
+        for series_key, series_label in y_series:
+            usable_rows = [
+                row for row in group_rows if row.get(series_key) is not None
             ]
-            fit_label = (
-                "linear fit"
-                if group_key is None
-                else f"{group_name} fit"
-            )
-            plt.plot(sorted_xs, fitted_ys, label=fit_label)
-            fit_rows.append({"group": group_name, **fit})
+            if not usable_rows:
+                continue
+
+            xs = [float(row[x_key]) for row in usable_rows]
+            ys_mib = [bytes_to_mib(row[series_key]) for row in usable_rows]
+            usable_sampled_rows = [
+                row for row in sampled_group_rows if row.get(series_key) is not None
+            ]
+            scatter_xs = [float(row[x_key]) for row in usable_sampled_rows]
+            scatter_ys_mib = [
+                bytes_to_mib(row[series_key])
+                for row in usable_sampled_rows
+            ]
+            if group_key is None:
+                scatter_label = f"{series_label} sampled"
+                fit_label = f"{series_label} linear fit"
+            else:
+                scatter_label = f"{group_name} {series_label} sampled"
+                fit_label = f"{group_name} {series_label} fit"
+            if scatter_xs:
+                plt.scatter(scatter_xs, scatter_ys_mib, label=scatter_label)
+            if len(xs) >= 2:
+                fit = linear_fit(xs, ys_mib)
+                sorted_xs = sorted(xs)
+                fitted_ys = [
+                    fit["slope"] * x_value + fit["intercept"]
+                    for x_value in sorted_xs
+                ]
+                plt.plot(sorted_xs, fitted_ys, label=fit_label)
+                fit_rows.append(
+                    {
+                        "group": group_name,
+                        "metric": series_key,
+                        "metric_label": series_label,
+                        **fit,
+                    }
+                )
 
     if vertical_line_x is not None:
         plt.axvline(vertical_line_x, color="tab:red", linestyle="--", linewidth=1)
@@ -571,6 +595,12 @@ def aggregate_reports(reports_by_node: dict[str, dict]) -> dict:
     total_numel = sum(int(report.get("kv_cache_numel") or 0) for report in reports)
     total_tensors = sum(int(report.get("kv_cache_tensor_count") or 0) for report in reports)
     max_cache_tokens = max(int(report.get("kv_cache_token_length") or 0) for report in reports)
+    cuda_values = [
+        int(report["cuda_memory_allocated_bytes"])
+        for report in reports
+        if report.get("cuda_memory_allocated_bytes") is not None
+    ]
+    total_cuda_memory_allocated = sum(cuda_values) if cuda_values else None
     timestamps = [float(report.get("timestamp") or 0.0) for report in reports]
     first = reports[0]
     return {
@@ -586,6 +616,12 @@ def aggregate_reports(reports_by_node: dict[str, dict]) -> dict:
         "kv_cache_numel": total_numel,
         "kv_cache_tensor_count": total_tensors,
         "kv_cache_token_length": max_cache_tokens,
+        "cuda_memory_allocated_bytes": total_cuda_memory_allocated,
+        "cuda_memory_allocated_mib": (
+            bytes_to_mib(total_cuda_memory_allocated)
+            if total_cuda_memory_allocated is not None
+            else None
+        ),
         "first_timestamp": min(timestamps),
         "last_timestamp": max(timestamps),
     }
@@ -773,10 +809,17 @@ def run_prefill_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> 
             summary_rows.append(aggregate)
             per_node_rows.extend(reports)
             client.wait_for_done(client_request_id, timeout_s=60.0)
+            cuda_info = ""
+            if aggregate.get("cuda_memory_allocated_bytes") is not None:
+                cuda_info = (
+                    f", CUDA allocated="
+                    f"{bytes_to_mib(aggregate['cuda_memory_allocated_bytes']):.6f} MiB"
+                )
             print(
                 "[TEST] prefill sample: "
                 f"tokens={ack.get('input_token_length')}, "
                 f"KV={aggregate['kv_cache_mib']:.6f} MiB"
+                f"{cuda_info}"
             )
 
     write_csv(result_dir / "prefill_kv_summary.csv", summary_rows)
@@ -788,6 +831,8 @@ def run_prefill_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> 
         output_path=result_dir / "prefill_kv_fit.png",
         title="Pipeline KV cache after prefill",
         x_label="Input token length",
+        y_label="Memory size (MiB)",
+        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
     )
     write_csv(result_dir / "prefill_kv_fit.csv", fit_rows)
 
@@ -847,7 +892,9 @@ def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> N
         output_path=result_dir / "decode_kv_fit.png",
         title="Pipeline KV cache during decode",
         x_label="Generated output token length",
+        y_label="Memory size (MiB)",
         scatter_rows=sampled_decode_rows,
+        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
     )
     write_csv(result_dir / "decode_kv_fit.csv", fit_rows)
     if done_event:
@@ -901,6 +948,13 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
         first, second = pair_rows
         first_bytes = int(first["kv_cache_bytes"])
         second_bytes = int(second["kv_cache_bytes"])
+        first_cuda_bytes = first.get("cuda_memory_allocated_bytes")
+        second_cuda_bytes = second.get("cuda_memory_allocated_bytes")
+        cuda_delta_bytes = (
+            None
+            if first_cuda_bytes is None or second_cuda_bytes is None
+            else int(second_cuda_bytes) - int(first_cuda_bytes)
+        )
         comparison_rows.append(
             {
                 "target_input_token_length": token_length,
@@ -911,6 +965,9 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
                 "relative_delta": (
                     0.0 if first_bytes == 0 else (second_bytes - first_bytes) / first_bytes
                 ),
+                "first_cuda_memory_allocated_bytes": first_cuda_bytes,
+                "second_cuda_memory_allocated_bytes": second_cuda_bytes,
+                "cuda_memory_allocated_delta_bytes": cuda_delta_bytes,
             }
         )
         print(
@@ -918,6 +975,14 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
             f"tokens={first.get('actual_input_token_length')}, "
             f"first={bytes_to_mib(first_bytes):.6f} MiB, "
             f"second={bytes_to_mib(second_bytes):.6f} MiB"
+            + (
+                ""
+                if first_cuda_bytes is None or second_cuda_bytes is None
+                else (
+                    f", CUDA first={bytes_to_mib(first_cuda_bytes):.6f} MiB, "
+                    f"CUDA second={bytes_to_mib(second_cuda_bytes):.6f} MiB"
+                )
+            )
         )
 
     write_csv(result_dir / "sequential_same_prompt_summary.csv", summary_rows)
@@ -929,7 +994,9 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
         output_path=result_dir / "sequential_same_prompt_fit.png",
         title="Sequential same-prompt prefill KV cache",
         x_label="Input token length",
+        y_label="Memory size (MiB)",
         group_key="order",
+        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
     )
     write_csv(result_dir / "sequential_same_prompt_fit.csv", fit_rows)
 
@@ -985,6 +1052,8 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
                     "elapsed_s": elapsed,
                     "total_kv_cache_bytes": sum(latest_bytes_by_client.values()),
                     "total_kv_cache_mib": bytes_to_mib(sum(latest_bytes_by_client.values())),
+                    "total_cuda_memory_allocated_bytes": None,
+                    "total_cuda_memory_allocated_mib": None,
                     "event": "done",
                     "client_request_id": current_client_id,
                     "request_order": client_ids[current_client_id],
@@ -1028,6 +1097,8 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
                 "elapsed_s": elapsed,
                 "total_kv_cache_bytes": total_bytes,
                 "total_kv_cache_mib": bytes_to_mib(total_bytes),
+                "total_cuda_memory_allocated_bytes": aggregate.get("cuda_memory_allocated_bytes"),
+                "total_cuda_memory_allocated_mib": aggregate.get("cuda_memory_allocated_mib"),
                 "event": f"{client_ids[current_client_id]}_{phase}_{step}",
                 "client_request_id": current_client_id,
                 "request_order": client_ids[current_client_id],
@@ -1073,9 +1144,11 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         output_path=result_dir / "overlap_same_prompt_per_request.png",
         title="Overlapped requests KV cache by request",
         x_label="Elapsed time (s)",
+        y_label="Memory size (MiB)",
         group_key="request_order",
         vertical_line_x=second_submit_elapsed,
         scatter_rows=sampled_request_rows,
+        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
     )
     write_csv(result_dir / "overlap_same_prompt_per_request_fit.csv", request_fit_rows)
 
@@ -1104,9 +1177,11 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         output_path=result_dir / "overlap_same_prompt_total.png",
         title="Total KV cache before/after second request",
         x_label="Elapsed time (s)",
+        y_label="Memory size (MiB)",
         group_key="segment",
         vertical_line_x=second_submit_elapsed,
         scatter_rows=sampled_total_rows,
+        extra_y_series=[("total_cuda_memory_allocated_bytes", "CUDA memory_allocated")],
     )
     write_csv(result_dir / "overlap_same_prompt_total_fit.csv", total_fit_rows)
 

@@ -1844,6 +1844,8 @@ def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> Non
         )
     else:
         print(f"[TEST] warm-up request {warmup_client_id} completed.")
+    print("[TEST] waiting 2 seconds after warm-up for runtime state to settle...")
+    time.sleep(2.0)
     client.drain_events()
 
     client_request_ids = client.submit_burst_requests(

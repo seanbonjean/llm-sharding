@@ -140,6 +140,7 @@ class PipelineDebugClient:
         input_ids: torch.Tensor | None = None,
         trace_kv_cache: bool = False,
         trace_forward_measurement: bool = False,
+        telemetry_only: bool = False,
         trace_label: str = "",
     ) -> tuple[str, dict]:
         client_request_id = self._new_client_request_id()
@@ -151,7 +152,7 @@ class PipelineDebugClient:
         }
         if input_ids is not None:
             payload["input_ids"] = input_ids.cpu()
-        if trace_kv_cache or trace_forward_measurement:
+        if trace_kv_cache or trace_forward_measurement or telemetry_only:
             if not self.telemetry_public_addr:
                 raise RuntimeError("[ERROR] telemetry must be configured before tracing.")
             payload["telemetry_addr"] = self.telemetry_public_addr
@@ -271,6 +272,7 @@ class PipelineDebugClient:
         input_ids: torch.Tensor | None = None,
         trace_kv_cache: bool = False,
         trace_forward_measurement: bool = False,
+        telemetry_only: bool = False,
         trace_label: str = "",
     ) -> str:
         """Send one user request to the selected owner node."""
@@ -282,6 +284,7 @@ class PipelineDebugClient:
             input_ids=input_ids,
             trace_kv_cache=trace_kv_cache,
             trace_forward_measurement=trace_forward_measurement,
+            telemetry_only=telemetry_only,
             trace_label=trace_label,
         )
         self._data_socket(owner.node_addr).send(self._serialize(payload))
@@ -1822,6 +1825,25 @@ def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> Non
 
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
     timeout_s = float(input("Forward report timeout seconds [120]: ").strip() or "120")
+    client.drain_events()
+
+    print("[TEST] running one warm-up request without measurement...")
+    warmup_client_id = client.submit_request(
+        owner_index=owner_index,
+        prompt=prompt,
+        max_new_tokens=1,
+        telemetry_only=True,
+        trace_label="simultaneous_pair_warmup",
+    )
+    client.wait_for_ack(warmup_client_id, timeout_s=15.0)
+    warmup_done = client.wait_for_done(warmup_client_id, timeout_s=timeout_s)
+    if warmup_done is None:
+        print(
+            f"[WARNING] warm-up request {warmup_client_id} did not report done before timeout; "
+            "continuing with the measured burst."
+        )
+    else:
+        print(f"[TEST] warm-up request {warmup_client_id} completed.")
     client.drain_events()
 
     client_request_ids = client.submit_burst_requests(

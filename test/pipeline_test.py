@@ -527,6 +527,107 @@ def plot_scatter_with_fit(
     return fit_rows
 
 
+PER_NODE_MEMORY_SERIES = [
+    ("cuda_memory_delta_bytes", "CUDA memory_allocated delta"),
+    ("cuda_memory_allocated_bytes", "CUDA memory_allocated raw"),
+]
+
+
+def safe_filename_part(value: object) -> str:
+    text = str(value)
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", "~") else "_" for ch in text)
+
+
+def node_plot_filename(prefix: str, node_id: object, shards_start: object, shards_end: object) -> str:
+    return (
+        f"{prefix}_{safe_filename_part(node_id)}_"
+        f"shards_{safe_filename_part(shards_start)}~{safe_filename_part(shards_end)}.png"
+    )
+
+
+def plot_per_node_scatter_with_fit(
+    rows: list[dict],
+    output_dir: Path,
+    filename_prefix: str,
+    x_key: str,
+    y_key: str,
+    title_prefix: str,
+    x_label: str,
+    y_label: str = "Memory size (MiB)",
+    group_key: str | None = None,
+    vertical_line_x: float | None = None,
+    scatter_rows: list[dict] | None = None,
+    extra_y_series: list[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """
+    为每个 node_id 单独生成一张图，并把 node_id 与 shard 范围写入文件名。
+
+    聚合图适合观察整条 pipeline 的总 KV Cache；per-node 图则保留单节点的
+    torch.cuda.memory_allocated() raw value，便于和该节点的 8GB/16GB 显存上限对照。
+    """
+
+    rows_by_node: dict[tuple[str, int, int], list[dict]] = {}
+    for row in rows:
+        if row.get("node_id") is None:
+            continue
+        key = (
+            str(row.get("node_id")),
+            int(row.get("shards_start") or 0),
+            int(row.get("shards_end") or 0),
+        )
+        rows_by_node.setdefault(key, []).append(row)
+
+    scatter_by_node: dict[tuple[str, int, int], list[dict]] = {}
+    if scatter_rows is not None:
+        for row in scatter_rows:
+            if row.get("node_id") is None:
+                continue
+            key = (
+                str(row.get("node_id")),
+                int(row.get("shards_start") or 0),
+                int(row.get("shards_end") or 0),
+            )
+            scatter_by_node.setdefault(key, []).append(row)
+
+    all_fit_rows: list[dict] = []
+    for (node_id, shards_start, shards_end), node_rows in sorted(rows_by_node.items()):
+        output_path = output_dir / node_plot_filename(
+            filename_prefix,
+            node_id,
+            shards_start,
+            shards_end,
+        )
+        node_scatter_rows = (
+            scatter_by_node.get((node_id, shards_start, shards_end))
+            if scatter_rows is not None
+            else None
+        )
+        fit_rows = plot_scatter_with_fit(
+            node_rows,
+            x_key=x_key,
+            y_key=y_key,
+            output_path=output_path,
+            title=f"{title_prefix} - {node_id} shards {shards_start}~{shards_end}",
+            x_label=x_label,
+            y_label=y_label,
+            group_key=group_key,
+            vertical_line_x=vertical_line_x,
+            scatter_rows=node_scatter_rows,
+            extra_y_series=extra_y_series,
+        )
+        for fit_row in fit_rows:
+            fit_row.update(
+                {
+                    "node_id": node_id,
+                    "shards_start": shards_start,
+                    "shards_end": shards_end,
+                    "plot_file": output_path.name,
+                }
+            )
+        all_fit_rows.extend(fit_rows)
+    return all_fit_rows
+
+
 def sample_rows_by_x_interval(
     rows: list[dict],
     x_key: str,
@@ -595,12 +696,18 @@ def aggregate_reports(reports_by_node: dict[str, dict]) -> dict:
     total_numel = sum(int(report.get("kv_cache_numel") or 0) for report in reports)
     total_tensors = sum(int(report.get("kv_cache_tensor_count") or 0) for report in reports)
     max_cache_tokens = max(int(report.get("kv_cache_token_length") or 0) for report in reports)
-    cuda_values = [
-        int(report["cuda_memory_allocated_bytes"])
-        for report in reports
-        if report.get("cuda_memory_allocated_bytes") is not None
-    ]
-    total_cuda_memory_allocated = sum(cuda_values) if cuda_values else None
+
+    def sum_optional_int(key: str) -> int | None:
+        values = [
+            int(report[key])
+            for report in reports
+            if report.get(key) is not None
+        ]
+        return sum(values) if values else None
+
+    total_cuda_memory_allocated = sum_optional_int("cuda_memory_allocated_bytes")
+    total_cuda_memory_baseline = sum_optional_int("cuda_memory_baseline_bytes")
+    total_cuda_memory_delta = sum_optional_int("cuda_memory_delta_bytes")
     timestamps = [float(report.get("timestamp") or 0.0) for report in reports]
     first = reports[0]
     return {
@@ -620,6 +727,18 @@ def aggregate_reports(reports_by_node: dict[str, dict]) -> dict:
         "cuda_memory_allocated_mib": (
             bytes_to_mib(total_cuda_memory_allocated)
             if total_cuda_memory_allocated is not None
+            else None
+        ),
+        "cuda_memory_baseline_bytes": total_cuda_memory_baseline,
+        "cuda_memory_baseline_mib": (
+            bytes_to_mib(total_cuda_memory_baseline)
+            if total_cuda_memory_baseline is not None
+            else None
+        ),
+        "cuda_memory_delta_bytes": total_cuda_memory_delta,
+        "cuda_memory_delta_mib": (
+            bytes_to_mib(total_cuda_memory_delta)
+            if total_cuda_memory_delta is not None
             else None
         ),
         "first_timestamp": min(timestamps),
@@ -810,10 +929,10 @@ def run_prefill_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> 
             per_node_rows.extend(reports)
             client.wait_for_done(client_request_id, timeout_s=60.0)
             cuda_info = ""
-            if aggregate.get("cuda_memory_allocated_bytes") is not None:
+            if aggregate.get("cuda_memory_delta_bytes") is not None:
                 cuda_info = (
-                    f", CUDA allocated="
-                    f"{bytes_to_mib(aggregate['cuda_memory_allocated_bytes']):.6f} MiB"
+                    f", CUDA delta="
+                    f"{bytes_to_mib(aggregate['cuda_memory_delta_bytes']):.6f} MiB"
                 )
             print(
                 "[TEST] prefill sample: "
@@ -832,9 +951,20 @@ def run_prefill_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> 
         title="Pipeline KV cache after prefill",
         x_label="Input token length",
         y_label="Memory size (MiB)",
-        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
+        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
     )
     write_csv(result_dir / "prefill_kv_fit.csv", fit_rows)
+    per_node_fit_rows = plot_per_node_scatter_with_fit(
+        per_node_rows,
+        output_dir=result_dir,
+        filename_prefix="prefill_kv_per_node",
+        x_key="actual_input_token_length",
+        y_key="kv_cache_bytes",
+        title_prefix="Pipeline KV cache after prefill",
+        x_label="Input token length",
+        extra_y_series=PER_NODE_MEMORY_SERIES,
+    )
+    write_csv(result_dir / "prefill_kv_per_node_fit.csv", per_node_fit_rows)
 
 
 def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> None:
@@ -872,6 +1002,9 @@ def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> N
             {
                 "experiment": "decode_by_output_length",
                 "input_token_length": ack.get("input_token_length"),
+                "output_token_length": (
+                    0 if row.get("phase") == "prefill" else int(row.get("step") or 0)
+                ),
             }
         )
     if done_event is None:
@@ -894,9 +1027,27 @@ def run_decode_kv_experiment(client: PipelineDebugClient, result_dir: Path) -> N
         x_label="Generated output token length",
         y_label="Memory size (MiB)",
         scatter_rows=sampled_decode_rows,
-        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
+        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
     )
     write_csv(result_dir / "decode_kv_fit.csv", fit_rows)
+    decode_node_rows = [row for row in per_node_rows if row.get("phase") == "decode"]
+    sampled_decode_node_rows = [
+        row
+        for row in decode_node_rows
+        if int(row.get("output_token_length") or 0) in sample_steps
+    ]
+    per_node_fit_rows = plot_per_node_scatter_with_fit(
+        decode_node_rows,
+        output_dir=result_dir,
+        filename_prefix="decode_kv_per_node",
+        x_key="output_token_length",
+        y_key="kv_cache_bytes",
+        title_prefix="Pipeline KV cache during decode",
+        x_label="Generated output token length",
+        scatter_rows=sampled_decode_node_rows,
+        extra_y_series=PER_NODE_MEMORY_SERIES,
+    )
+    write_csv(result_dir / "decode_kv_per_node_fit.csv", per_node_fit_rows)
     if done_event:
         write_csv(result_dir / "decode_done.csv", [done_event])
 
@@ -910,6 +1061,7 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
     input_ids_by_length = build_input_ids_for_lengths(tokenizer, token_lengths)
 
     summary_rows: list[dict] = []
+    per_node_rows: list[dict] = []
     comparison_rows: list[dict] = []
     client.drain_events()
 
@@ -926,7 +1078,7 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
                 trace_label=trace_label,
             )
             ack = client.wait_for_ack(client_request_id)
-            aggregate, _ = collect_complete_aggregate(
+            aggregate, reports = collect_complete_aggregate(
                 client,
                 client_request_id=client_request_id,
                 phase="prefill",
@@ -941,19 +1093,36 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
                     "order": order,
                 }
             )
+            for report in reports:
+                report.update(
+                    {
+                        "experiment": "sequential_same_prompt",
+                        "target_input_token_length": token_length,
+                        "actual_input_token_length": ack.get("input_token_length"),
+                        "order": order,
+                    }
+                )
             summary_rows.append(aggregate)
+            per_node_rows.extend(reports)
             pair_rows.append(aggregate)
             client.wait_for_done(client_request_id, timeout_s=60.0)
 
         first, second = pair_rows
         first_bytes = int(first["kv_cache_bytes"])
         second_bytes = int(second["kv_cache_bytes"])
-        first_cuda_bytes = first.get("cuda_memory_allocated_bytes")
-        second_cuda_bytes = second.get("cuda_memory_allocated_bytes")
-        cuda_delta_bytes = (
+        first_cuda_allocated_bytes = first.get("cuda_memory_allocated_bytes")
+        second_cuda_allocated_bytes = second.get("cuda_memory_allocated_bytes")
+        cuda_allocated_difference_bytes = (
             None
-            if first_cuda_bytes is None or second_cuda_bytes is None
-            else int(second_cuda_bytes) - int(first_cuda_bytes)
+            if first_cuda_allocated_bytes is None or second_cuda_allocated_bytes is None
+            else int(second_cuda_allocated_bytes) - int(first_cuda_allocated_bytes)
+        )
+        first_cuda_delta_bytes = first.get("cuda_memory_delta_bytes")
+        second_cuda_delta_bytes = second.get("cuda_memory_delta_bytes")
+        cuda_delta_difference_bytes = (
+            None
+            if first_cuda_delta_bytes is None or second_cuda_delta_bytes is None
+            else int(second_cuda_delta_bytes) - int(first_cuda_delta_bytes)
         )
         comparison_rows.append(
             {
@@ -965,9 +1134,12 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
                 "relative_delta": (
                     0.0 if first_bytes == 0 else (second_bytes - first_bytes) / first_bytes
                 ),
-                "first_cuda_memory_allocated_bytes": first_cuda_bytes,
-                "second_cuda_memory_allocated_bytes": second_cuda_bytes,
-                "cuda_memory_allocated_delta_bytes": cuda_delta_bytes,
+                "first_cuda_memory_allocated_bytes": first_cuda_allocated_bytes,
+                "second_cuda_memory_allocated_bytes": second_cuda_allocated_bytes,
+                "cuda_memory_allocated_difference_bytes": cuda_allocated_difference_bytes,
+                "first_cuda_memory_delta_bytes": first_cuda_delta_bytes,
+                "second_cuda_memory_delta_bytes": second_cuda_delta_bytes,
+                "cuda_memory_delta_difference_bytes": cuda_delta_difference_bytes,
             }
         )
         print(
@@ -977,15 +1149,16 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
             f"second={bytes_to_mib(second_bytes):.6f} MiB"
             + (
                 ""
-                if first_cuda_bytes is None or second_cuda_bytes is None
+                if first_cuda_delta_bytes is None or second_cuda_delta_bytes is None
                 else (
-                    f", CUDA first={bytes_to_mib(first_cuda_bytes):.6f} MiB, "
-                    f"CUDA second={bytes_to_mib(second_cuda_bytes):.6f} MiB"
+                    f", CUDA delta first={bytes_to_mib(first_cuda_delta_bytes):.6f} MiB, "
+                    f"CUDA delta second={bytes_to_mib(second_cuda_delta_bytes):.6f} MiB"
                 )
             )
         )
 
     write_csv(result_dir / "sequential_same_prompt_summary.csv", summary_rows)
+    write_csv(result_dir / "sequential_same_prompt_per_node.csv", per_node_rows)
     write_csv(result_dir / "sequential_same_prompt_comparison.csv", comparison_rows)
     fit_rows = plot_scatter_with_fit(
         summary_rows,
@@ -996,9 +1169,21 @@ def run_sequential_same_prompt_experiment(client: PipelineDebugClient, result_di
         x_label="Input token length",
         y_label="Memory size (MiB)",
         group_key="order",
-        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
+        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
     )
     write_csv(result_dir / "sequential_same_prompt_fit.csv", fit_rows)
+    per_node_fit_rows = plot_per_node_scatter_with_fit(
+        per_node_rows,
+        output_dir=result_dir,
+        filename_prefix="sequential_same_prompt_per_node",
+        x_key="actual_input_token_length",
+        y_key="kv_cache_bytes",
+        title_prefix="Sequential same-prompt prefill KV cache",
+        x_label="Input token length",
+        group_key="order",
+        extra_y_series=PER_NODE_MEMORY_SERIES,
+    )
+    write_csv(result_dir / "sequential_same_prompt_per_node_fit.csv", per_node_fit_rows)
 
 
 def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: Path) -> None:
@@ -1033,10 +1218,14 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
     expected_node_ids = {node.node_id for node in client.nodes}
     reports_by_key: dict[tuple[str, str, int], dict[str, dict]] = {}
     request_rows: list[dict] = []
+    per_node_rows: list[dict] = []
     total_rows: list[dict] = []
+    node_total_rows: list[dict] = []
     done_requests: set[str] = set()
     client_ids = {first_client_id: "first"}
     latest_bytes_by_client: dict[str, int] = {}
+    latest_bytes_by_node_client: dict[tuple[str, str], int] = {}
+    cuda_initial_baseline_by_node: dict[str, int] = {}
     second_client_id = None
     second_submit_elapsed = second_delay_s
 
@@ -1046,6 +1235,8 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
             current_client_id = str(event.get("client_request_id"))
             done_requests.add(current_client_id)
             latest_bytes_by_client[current_client_id] = 0
+            for node_id in expected_node_ids:
+                latest_bytes_by_node_client[(node_id, current_client_id)] = 0
             elapsed = float(event.get("timestamp") or time.time()) - start_time
             total_rows.append(
                 {
@@ -1054,12 +1245,38 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
                     "total_kv_cache_mib": bytes_to_mib(sum(latest_bytes_by_client.values())),
                     "total_cuda_memory_allocated_bytes": None,
                     "total_cuda_memory_allocated_mib": None,
+                    "total_cuda_memory_initial_baseline_bytes": None,
+                    "total_cuda_memory_initial_baseline_mib": None,
+                    "total_cuda_memory_delta_bytes": None,
+                    "total_cuda_memory_delta_mib": None,
                     "event": "done",
                     "client_request_id": current_client_id,
                     "request_order": client_ids[current_client_id],
                     "second_submit_elapsed_s": second_submit_elapsed,
                 }
             )
+            for node in client.nodes:
+                node_total_bytes = sum(
+                    value
+                    for (node_id, _), value in latest_bytes_by_node_client.items()
+                    if node_id == node.node_id
+                )
+                node_total_rows.append(
+                    {
+                        "node_id": node.node_id,
+                        "shards_start": node.shards_start,
+                        "shards_end": node.shards_end,
+                        "elapsed_s": elapsed,
+                        "node_total_kv_cache_bytes": node_total_bytes,
+                        "node_total_kv_cache_mib": bytes_to_mib(node_total_bytes),
+                        "cuda_memory_allocated_bytes": None,
+                        "cuda_memory_delta_from_start_bytes": None,
+                        "event": "done",
+                        "client_request_id": current_client_id,
+                        "request_order": client_ids[current_client_id],
+                        "second_submit_elapsed_s": second_submit_elapsed,
+                    }
+                )
             return
 
         if (
@@ -1077,6 +1294,34 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         if set(reports_by_key[key]) != expected_node_ids:
             return
 
+        current_reports = reports_by_key[key]
+        for node_id, report in current_reports.items():
+            if report.get("cuda_memory_baseline_bytes") is not None:
+                cuda_initial_baseline_by_node.setdefault(
+                    node_id,
+                    int(report["cuda_memory_baseline_bytes"]),
+                )
+        current_cuda_allocated_by_node = {
+            node_id: int(report["cuda_memory_allocated_bytes"])
+            for node_id, report in current_reports.items()
+            if report.get("cuda_memory_allocated_bytes") is not None
+        }
+        if (
+            set(current_cuda_allocated_by_node) == expected_node_ids
+            and set(cuda_initial_baseline_by_node) == expected_node_ids
+        ):
+            total_cuda_memory_allocated = sum(current_cuda_allocated_by_node.values())
+            total_cuda_memory_initial_baseline = sum(
+                cuda_initial_baseline_by_node.values()
+            )
+            total_cuda_memory_delta = (
+                total_cuda_memory_allocated - total_cuda_memory_initial_baseline
+            )
+        else:
+            total_cuda_memory_allocated = None
+            total_cuda_memory_initial_baseline = None
+            total_cuda_memory_delta = None
+
         aggregate = aggregate_reports(reports_by_key[key])
         output_tokens = 0 if phase == "prefill" else step
         elapsed = float(aggregate["last_timestamp"]) - start_time
@@ -1090,6 +1335,53 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
             "second_submit_elapsed_s": second_submit_elapsed,
         }
         request_rows.append(row)
+        for node_id, report in current_reports.items():
+            node_row = {
+                **report,
+                "experiment": "overlap_same_prompt",
+                "request_order": client_ids[current_client_id],
+                "elapsed_s": elapsed,
+                "output_token_length": output_tokens,
+                "input_token_length": first_ack.get("input_token_length"),
+                "second_submit_elapsed_s": second_submit_elapsed,
+                "node_request_group": f"{node_id}:{client_ids[current_client_id]}",
+            }
+            per_node_rows.append(node_row)
+            latest_bytes_by_node_client[(node_id, current_client_id)] = int(
+                report.get("kv_cache_bytes") or 0
+            )
+            node_total_bytes = sum(
+                value
+                for (current_node_id, _), value in latest_bytes_by_node_client.items()
+                if current_node_id == node_id
+            )
+            cuda_allocated_bytes = (
+                int(report["cuda_memory_allocated_bytes"])
+                if report.get("cuda_memory_allocated_bytes") is not None
+                else None
+            )
+            cuda_initial_baseline = cuda_initial_baseline_by_node.get(node_id)
+            cuda_delta_from_start = (
+                cuda_allocated_bytes - cuda_initial_baseline
+                if cuda_allocated_bytes is not None and cuda_initial_baseline is not None
+                else None
+            )
+            node_total_rows.append(
+                {
+                    "node_id": node_id,
+                    "shards_start": report.get("shards_start"),
+                    "shards_end": report.get("shards_end"),
+                    "elapsed_s": elapsed,
+                    "node_total_kv_cache_bytes": node_total_bytes,
+                    "node_total_kv_cache_mib": bytes_to_mib(node_total_bytes),
+                    "cuda_memory_allocated_bytes": cuda_allocated_bytes,
+                    "cuda_memory_delta_from_start_bytes": cuda_delta_from_start,
+                    "event": f"{client_ids[current_client_id]}_{phase}_{step}",
+                    "client_request_id": current_client_id,
+                    "request_order": client_ids[current_client_id],
+                    "second_submit_elapsed_s": second_submit_elapsed,
+                }
+            )
         latest_bytes_by_client[current_client_id] = int(aggregate["kv_cache_bytes"])
         total_bytes = sum(latest_bytes_by_client.values())
         total_rows.append(
@@ -1097,8 +1389,24 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
                 "elapsed_s": elapsed,
                 "total_kv_cache_bytes": total_bytes,
                 "total_kv_cache_mib": bytes_to_mib(total_bytes),
-                "total_cuda_memory_allocated_bytes": aggregate.get("cuda_memory_allocated_bytes"),
-                "total_cuda_memory_allocated_mib": aggregate.get("cuda_memory_allocated_mib"),
+                "total_cuda_memory_allocated_bytes": total_cuda_memory_allocated,
+                "total_cuda_memory_allocated_mib": bytes_to_mib(
+                    total_cuda_memory_allocated
+                )
+                if total_cuda_memory_allocated is not None
+                else None,
+                "total_cuda_memory_initial_baseline_bytes": (
+                    total_cuda_memory_initial_baseline
+                ),
+                "total_cuda_memory_initial_baseline_mib": bytes_to_mib(
+                    total_cuda_memory_initial_baseline
+                )
+                if total_cuda_memory_initial_baseline is not None
+                else None,
+                "total_cuda_memory_delta_bytes": total_cuda_memory_delta,
+                "total_cuda_memory_delta_mib": bytes_to_mib(total_cuda_memory_delta)
+                if total_cuda_memory_delta is not None
+                else None,
                 "event": f"{client_ids[current_client_id]}_{phase}_{step}",
                 "client_request_id": current_client_id,
                 "request_order": client_ids[current_client_id],
@@ -1130,7 +1438,9 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
             process_event(event)
 
     write_csv(result_dir / "overlap_same_prompt_requests.csv", request_rows)
+    write_csv(result_dir / "overlap_same_prompt_per_node.csv", per_node_rows)
     write_csv(result_dir / "overlap_same_prompt_total.csv", total_rows)
+    write_csv(result_dir / "overlap_same_prompt_total_per_node.csv", node_total_rows)
     sampled_request_rows = sample_rows_by_x_interval(
         request_rows,
         x_key="elapsed_s",
@@ -1148,9 +1458,32 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         group_key="request_order",
         vertical_line_x=second_submit_elapsed,
         scatter_rows=sampled_request_rows,
-        extra_y_series=[("cuda_memory_allocated_bytes", "CUDA memory_allocated")],
+        extra_y_series=[("cuda_memory_delta_bytes", "CUDA memory_allocated delta")],
     )
     write_csv(result_dir / "overlap_same_prompt_per_request_fit.csv", request_fit_rows)
+    sampled_node_request_rows = sample_rows_by_x_interval(
+        per_node_rows,
+        x_key="elapsed_s",
+        interval=OVERLAP_TIME_SAMPLE_INTERVAL_S,
+        group_key="node_request_group",
+    )
+    per_node_request_fit_rows = plot_per_node_scatter_with_fit(
+        per_node_rows,
+        output_dir=result_dir,
+        filename_prefix="overlap_same_prompt_request_per_node",
+        x_key="elapsed_s",
+        y_key="kv_cache_bytes",
+        title_prefix="Overlapped requests KV cache by request",
+        x_label="Elapsed time (s)",
+        group_key="request_order",
+        vertical_line_x=second_submit_elapsed,
+        scatter_rows=sampled_node_request_rows,
+        extra_y_series=PER_NODE_MEMORY_SERIES,
+    )
+    write_csv(
+        result_dir / "overlap_same_prompt_request_per_node_fit.csv",
+        per_node_request_fit_rows,
+    )
 
     growth_total_rows = [row for row in total_rows if row.get("event") != "done"]
     before_rows = [
@@ -1181,9 +1514,55 @@ def run_overlap_same_prompt_experiment(client: PipelineDebugClient, result_dir: 
         group_key="segment",
         vertical_line_x=second_submit_elapsed,
         scatter_rows=sampled_total_rows,
-        extra_y_series=[("total_cuda_memory_allocated_bytes", "CUDA memory_allocated")],
+        extra_y_series=[
+            ("total_cuda_memory_delta_bytes", "CUDA memory_allocated delta from start")
+        ],
     )
     write_csv(result_dir / "overlap_same_prompt_total_fit.csv", total_fit_rows)
+
+    node_growth_total_rows = [
+        row for row in node_total_rows if row.get("event") != "done"
+    ]
+    node_total_fit_input_rows = []
+    for row in node_growth_total_rows:
+        segment = (
+            "before_second"
+            if float(row["elapsed_s"]) < second_submit_elapsed
+            else "after_second"
+        )
+        node_total_fit_input_rows.append(
+            {
+                **row,
+                "segment": segment,
+                "node_segment_group": f"{row.get('node_id')}:{segment}",
+            }
+        )
+    sampled_node_total_rows = sample_rows_by_x_interval(
+        node_total_fit_input_rows,
+        x_key="elapsed_s",
+        interval=OVERLAP_TIME_SAMPLE_INTERVAL_S,
+        group_key="node_segment_group",
+    )
+    per_node_total_fit_rows = plot_per_node_scatter_with_fit(
+        node_total_fit_input_rows,
+        output_dir=result_dir,
+        filename_prefix="overlap_same_prompt_total_per_node",
+        x_key="elapsed_s",
+        y_key="node_total_kv_cache_bytes",
+        title_prefix="Total KV cache before/after second request",
+        x_label="Elapsed time (s)",
+        group_key="segment",
+        vertical_line_x=second_submit_elapsed,
+        scatter_rows=sampled_node_total_rows,
+        extra_y_series=[
+            ("cuda_memory_delta_from_start_bytes", "CUDA memory_allocated delta from start"),
+            ("cuda_memory_allocated_bytes", "CUDA memory_allocated raw"),
+        ],
+    )
+    write_csv(
+        result_dir / "overlap_same_prompt_total_per_node_fit.csv",
+        per_node_total_fit_rows,
+    )
 
 
 def run_kv_cache_experiments(client: PipelineDebugClient) -> None:

@@ -412,6 +412,7 @@ class PipelineSession:
     input_token_length: int | None = None
     max_new_tokens: int = 1024
     finished: bool = False
+    cuda_memory_baseline_bytes: int | None = None
 
 
 class PipelineNodeWorker:
@@ -669,6 +670,28 @@ class PipelineNodeWorker:
         torch.cuda.synchronize(self.device)
         return int(torch.cuda.memory_allocated(self.device))
 
+    def _maybe_capture_cuda_memory_baseline(
+        self,
+        session: PipelineSession,
+        source_message: dict[str, Any],
+    ) -> None:
+        """
+        在测试/观测请求第一次进入本分片 forward 前记录 CUDA baseline。
+
+        只有消息携带 telemetry_addr 且开启 trace_kv_cache 时才会触发，因此普通
+        pipeline 推理不会因为 baseline 统计多做一次 CUDA 同步。baseline 是“本
+        request 在本节点创建 KV cache 之前”的 torch.cuda.memory_allocated()，
+        后续 report 中的 cuda_memory_delta_bytes 会用当前值减去这个 baseline。
+        """
+
+        if session.cuda_memory_baseline_bytes is not None:
+            return
+        if not source_message.get("telemetry_addr") or not bool(
+            source_message.get("trace_kv_cache", False)
+        ):
+            return
+        session.cuda_memory_baseline_bytes = self._cuda_memory_allocated_bytes()
+
     def build_kv_cache_report(
         self,
         request_id: str,
@@ -687,6 +710,19 @@ class PipelineNodeWorker:
         cache_stats = self._dynamic_cache_payload_stats(
             session.past_key_value if session is not None else None
         )
+        cuda_allocated_bytes = (
+            self._cuda_memory_allocated_bytes() if include_cuda_memory else None
+        )
+        cuda_baseline_bytes = (
+            session.cuda_memory_baseline_bytes
+            if include_cuda_memory and session is not None
+            else None
+        )
+        cuda_delta_bytes = (
+            cuda_allocated_bytes - cuda_baseline_bytes
+            if cuda_allocated_bytes is not None and cuda_baseline_bytes is not None
+            else None
+        )
         report: dict[str, Any] = {
             PipelineProtocol.TYPE_KEY: PipelineProtocol.KV_CACHE_REPORT,
             "event": event,
@@ -698,11 +734,9 @@ class PipelineNodeWorker:
             "has_session": session is not None,
             "session_step": session.step if session is not None else None,
             "timestamp": time.time(),
-            "cuda_memory_allocated_bytes": (
-                self._cuda_memory_allocated_bytes()
-                if include_cuda_memory
-                else None
-            ),
+            "cuda_memory_allocated_bytes": cuda_allocated_bytes,
+            "cuda_memory_baseline_bytes": cuda_baseline_bytes,
+            "cuda_memory_delta_bytes": cuda_delta_bytes,
         }
         report.update(cache_stats)
         if source_message is not None:
@@ -836,6 +870,7 @@ class PipelineNodeWorker:
             session = self._get_or_create_session(message["request_id"])
             session.batch_size = int(message["batch_size"])
             session.step = int(message["step"])
+            self._maybe_capture_cuda_memory_baseline(session, message)
 
             position_ids = build_position_ids(
                 session.past_key_value,
@@ -856,6 +891,7 @@ class PipelineNodeWorker:
             sin = message["sin"].to(device=self.device, dtype=self.dtype)
             session = self._get_or_create_session(message["request_id"])
             session.step = int(message["step"])
+            self._maybe_capture_cuda_memory_baseline(session, message)
         else:
             raise RuntimeError(
                 f"[ERROR] unsupported message for shard forward: {message.get('type')}"

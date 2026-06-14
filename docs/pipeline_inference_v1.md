@@ -138,6 +138,25 @@ results/pipeline_kv_cache/<timestamp>/
 
 每类实验都会输出 CSV；可拟合的实验会额外保存散点图和一次函数拟合结果 CSV。
 
+### KV Cache 与 CUDA memory 字段
+
+CSV 中的 `*_bytes` 字段单位都是 byte；图中的纵轴使用 `MiB`，计算方式是
+`bytes / 1024 / 1024`，不是 megabit。
+
+`kv_cache_bytes` 直接递归统计当前 request 的 `DynamicCache` 中 key/value tensor
+payload，因此它是按 request 隔离的 KV Cache 逻辑大小。`cuda_memory_allocated_bytes`
+来自 `torch.cuda.memory_allocated()`，表示该节点 PyTorch 当前已分配显存总量，会包含
+模型权重、其他 request、临时 tensor 等非 KV 内容。为了便于和 KV 增长趋势对照，worker
+会在带 `telemetry_addr` 且开启 `trace_kv_cache` 的请求第一次进入每个分片 forward 前记录
+`cuda_memory_baseline_bytes`，并在报告中额外给出
+`cuda_memory_delta_bytes = cuda_memory_allocated_bytes - cuda_memory_baseline_bytes`。
+当前图中的 CUDA 曲线使用 delta 字段；raw allocated 字段仍保留在 CSV 中用于排查单节点显存状态。
+
+除全 pipeline 求和图外，实验脚本还会为每个节点额外生成 per-node 图，文件名形如
+`<experiment>_per_node_<node_id>_shards_<shards_start>~<shards_end>.png`。这些图不会跨节点
+求和，会同时画出该节点的 `kv_cache_bytes`、`cuda_memory_delta_bytes` 和 raw
+`cuda_memory_allocated_bytes`，更适合判断单台 Jetson 的显存占用。
+
 ## 调试建议
 
 * 如果消息没有继续向下游走，先检查每个节点的 `node_addr` 是否是可连接地址。

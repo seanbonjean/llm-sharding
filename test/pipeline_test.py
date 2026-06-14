@@ -31,6 +31,7 @@ USER_REQUEST = "user_request"
 USER_REQUEST_ACK = "user_request_ack"
 KV_CACHE_QUERY = "kv_cache_query"
 KV_CACHE_REPORT = "kv_cache_report"
+SHARD_FORWARD_REPORT = "shard_forward_report"
 PIPELINE_DONE_REPORT = "pipeline_done_report"
 
 TOKENIZER_PATH = "shards/Llama-3___2-3B-Instruct_float16"
@@ -131,6 +132,35 @@ class PipelineDebugClient:
     def _new_client_request_id(self) -> str:
         self._request_seq += 1
         return f"client-{int(time.time() * 1000)}-{self._request_seq}"
+
+    def _build_user_request_payload(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        input_ids: torch.Tensor | None = None,
+        trace_kv_cache: bool = False,
+        trace_forward_measurement: bool = False,
+        trace_label: str = "",
+    ) -> tuple[str, dict]:
+        client_request_id = self._new_client_request_id()
+        payload = {
+            "type": USER_REQUEST,
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "client_request_id": client_request_id,
+        }
+        if input_ids is not None:
+            payload["input_ids"] = input_ids.cpu()
+        if trace_kv_cache or trace_forward_measurement:
+            if not self.telemetry_public_addr:
+                raise RuntimeError("[ERROR] telemetry must be configured before tracing.")
+            payload["telemetry_addr"] = self.telemetry_public_addr
+            payload["trace_label"] = trace_label
+            if trace_kv_cache:
+                payload["trace_kv_cache"] = True
+            if trace_forward_measurement:
+                payload["trace_forward_measurement"] = True
+        return client_request_id, payload
 
     def build_config(self, index: int) -> dict:
         node = self.nodes[index]
@@ -240,36 +270,60 @@ class PipelineDebugClient:
         max_new_tokens: int,
         input_ids: torch.Tensor | None = None,
         trace_kv_cache: bool = False,
+        trace_forward_measurement: bool = False,
         trace_label: str = "",
     ) -> str:
         """Send one user request to the selected owner node."""
 
         owner = self.nodes[owner_index]
-        client_request_id = self._new_client_request_id()
-        payload = {
-            "type": USER_REQUEST,
-            "prompt": prompt,
-            "max_new_tokens": max_new_tokens,
-            "client_request_id": client_request_id,
-        }
-        if input_ids is not None:
-            payload["input_ids"] = input_ids.cpu()
-        if trace_kv_cache:
-            if not self.telemetry_public_addr:
-                raise RuntimeError("[ERROR] telemetry must be configured before tracing KV cache.")
-            payload.update(
-                {
-                    "telemetry_addr": self.telemetry_public_addr,
-                    "trace_kv_cache": True,
-                    "trace_label": trace_label,
-                }
-            )
+        client_request_id, payload = self._build_user_request_payload(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            input_ids=input_ids,
+            trace_kv_cache=trace_kv_cache,
+            trace_forward_measurement=trace_forward_measurement,
+            trace_label=trace_label,
+        )
         self._data_socket(owner.node_addr).send(self._serialize(payload))
         print(
             f"[REQUEST] sent to {owner.node_id} ({owner.node_addr}), "
             f"client_request_id={client_request_id}, max_new_tokens={max_new_tokens}"
         )
         return client_request_id
+
+    def submit_burst_requests(
+        self,
+        owner_index: int,
+        prompts: list[str],
+        max_new_tokens: int,
+        trace_forward_measurement: bool = False,
+        trace_label_prefix: str = "burst",
+    ) -> list[str]:
+        """Send several requests back-to-back on one socket with minimal delay."""
+
+        owner = self.nodes[owner_index]
+        payloads: list[tuple[str, dict]] = []
+        for index, prompt in enumerate(prompts, start=1):
+            payloads.append(
+                self._build_user_request_payload(
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    trace_forward_measurement=trace_forward_measurement,
+                    trace_label=f"{trace_label_prefix}_request{index}",
+                )
+            )
+        socket = self._data_socket(owner.node_addr)
+        started = time.perf_counter()
+        for _, payload in payloads:
+            socket.send(self._serialize(payload))
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        client_request_ids = [client_request_id for client_request_id, _ in payloads]
+        print(
+            f"[REQUEST] burst sent {len(payloads)} requests to {owner.node_id} "
+            f"({owner.node_addr}) in {elapsed_ms:.3f} ms; "
+            f"client_request_ids={client_request_ids}"
+        )
+        return client_request_ids
 
     def wait_for_ack(self, client_request_id: str, timeout_s: float = 15.0) -> dict:
         ack = self.wait_for_event(
@@ -627,6 +681,83 @@ def plot_per_node_scatter_with_fit(
             )
         all_fit_rows.extend(fit_rows)
     return all_fit_rows
+
+
+def plot_pair_forward_bars(
+    rows: list[dict],
+    value_key: str,
+    output_path: Path,
+    title: str,
+    y_label: str,
+    value_transform: Callable[[float], float] | None = None,
+) -> None:
+    if not rows:
+        print(f"[TEST] no rows to plot for {output_path}")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    node_keys = sorted(
+        {
+            (
+                str(row.get("node_id")),
+                int(row.get("shards_start") or 0),
+                int(row.get("shards_end") or 0),
+            )
+            for row in rows
+        },
+        key=lambda item: item[1],
+    )
+    request_orders = sorted({int(row.get("request_order") or 0) for row in rows})
+    values_by_key = {
+        (
+            str(row.get("node_id")),
+            int(row.get("shards_start") or 0),
+            int(row.get("shards_end") or 0),
+            int(row.get("request_order") or 0),
+        ): row.get(value_key)
+        for row in rows
+    }
+
+    x_positions = list(range(len(node_keys)))
+    width = 0.8 / max(1, len(request_orders))
+    plt.figure(figsize=(9, 5))
+    for offset_index, request_order in enumerate(request_orders):
+        bar_positions = [
+            x + (offset_index - (len(request_orders) - 1) / 2) * width
+            for x in x_positions
+        ]
+        bar_values = []
+        for node_id, shards_start, shards_end in node_keys:
+            raw_value = values_by_key.get(
+                (node_id, shards_start, shards_end, request_order)
+            )
+            if raw_value is None:
+                bar_values.append(0.0)
+            else:
+                value = float(raw_value)
+                bar_values.append(value_transform(value) if value_transform else value)
+        plt.bar(
+            bar_positions,
+            bar_values,
+            width=width,
+            label=f"request {request_order}",
+        )
+
+    plt.xticks(
+        x_positions,
+        [f"{node_id}\n{start}~{end}" for node_id, start, end in node_keys],
+    )
+    plt.ylabel(y_label)
+    plt.title(title)
+    plt.grid(axis="y", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {output_path}")
 
 
 def sample_rows_by_x_interval(
@@ -1616,6 +1747,198 @@ def run_kv_cache_experiments(client: PipelineDebugClient) -> None:
     print(f"[TEST] results directory: {result_dir}")
 
 
+def collect_shard_forward_reports(
+    client: PipelineDebugClient,
+    client_request_ids: list[str],
+    timeout_s: float,
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    expected_node_ids = {node.node_id for node in client.nodes}
+    expected_pairs = {
+        (client_request_id, node_id)
+        for client_request_id in client_request_ids
+        for node_id in expected_node_ids
+    }
+    reports_by_pair: dict[tuple[str, str], dict] = {}
+    held_events: list[dict] = []
+    deadline = time.time() + timeout_s
+
+    try:
+        while time.time() < deadline and set(reports_by_pair) != expected_pairs:
+            event = client.receive_event(
+                timeout_s=max(0.05, min(0.5, deadline - time.time()))
+            )
+            if event is None:
+                continue
+            if (
+                event.get("type") == SHARD_FORWARD_REPORT
+                and event.get("client_request_id") in client_request_ids
+                and event.get("event") == "shard_forward_measurement"
+                and event.get("phase") == "prefill"
+                and int(event.get("step") or 0) == 0
+            ):
+                key = (str(event.get("client_request_id")), str(event.get("node_id")))
+                reports_by_pair[key] = event
+            else:
+                held_events.append(event)
+    finally:
+        client._event_backlog[:0] = held_events
+
+    missing = sorted(expected_pairs - set(reports_by_pair))
+    reports = list(reports_by_pair.values())
+    reports.sort(
+        key=lambda row: (
+            client_request_ids.index(str(row.get("client_request_id"))),
+            int(row.get("shards_start") or 0),
+        )
+    )
+    return reports, missing
+
+
+def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> None:
+    """
+    Back-to-back 提交两个相同 prompt，收集每个 request 在每个 node 的前向耗时和 KV 增量。
+
+    该实验只采 prefill step=0：max_new_tokens=1 会让请求在首个 token 产生后立即结束，
+    因此不会混入后续 decode forward report。
+    """
+
+    result_dir = make_result_dir()
+    print(
+        "\n[TEST] Simultaneous same-prompt shard forward measurement\n"
+        "This test sends two identical prompts back-to-back to the first node as owner, "
+        "then collects one prefill forward report per request per node.\n"
+    )
+    ask_telemetry(client)
+    owner_index = 0
+    owner = client.nodes[owner_index]
+    if owner.shards_start != 0:
+        print(
+            f"[WARNING] node index 0 is configured as first_node_addr but shards_start={owner.shards_start}; "
+            "the test will still send to index 0."
+        )
+    if client.max_active_requests < 2:
+        client.max_active_requests = 2
+        client.send_config()
+
+    prompt = ask_prompt(DEFAULT_PROMPTS[4])
+    timeout_s = float(input("Forward report timeout seconds [120]: ").strip() or "120")
+    client.drain_events()
+
+    client_request_ids = client.submit_burst_requests(
+        owner_index=owner_index,
+        prompts=[prompt, prompt],
+        max_new_tokens=1,
+        trace_forward_measurement=True,
+        trace_label_prefix="simultaneous_pair",
+    )
+    ack_by_client_id = {
+        client_request_id: client.wait_for_ack(client_request_id, timeout_s=15.0)
+        for client_request_id in client_request_ids
+    }
+    request_id_by_client_id = {
+        client_request_id: ack.get("request_id")
+        for client_request_id, ack in ack_by_client_id.items()
+    }
+
+    reports, missing = collect_shard_forward_reports(
+        client,
+        client_request_ids=client_request_ids,
+        timeout_s=timeout_s,
+    )
+
+    summary_rows: list[dict] = []
+    memory_rows: list[dict] = []
+    request_order_by_client_id = {
+        client_request_id: index
+        for index, client_request_id in enumerate(client_request_ids, start=1)
+    }
+    for report in reports:
+        client_request_id = str(report.get("client_request_id"))
+        kv_delta_bytes = report.get("kv_cache_delta_bytes")
+        cuda_delta_bytes = report.get("cuda_memory_forward_delta_bytes")
+        row = {
+            "experiment": "simultaneous_pair_forward_measurement",
+            "request_order": request_order_by_client_id[client_request_id],
+            "client_request_id": client_request_id,
+            "request_id": request_id_by_client_id.get(client_request_id),
+            "node_id": report.get("node_id"),
+            "node_addr": report.get("node_addr"),
+            "shards_start": report.get("shards_start"),
+            "shards_end": report.get("shards_end"),
+            "phase": report.get("phase"),
+            "step": report.get("step"),
+            "input_token_length": ack_by_client_id[client_request_id].get(
+                "input_token_length"
+            ),
+            "started_timestamp": report.get("started_timestamp"),
+            "finished_timestamp": report.get("finished_timestamp"),
+            "forward_elapsed_ms": report.get("forward_elapsed_ms"),
+            "shard_forward_elapsed_ms": report.get("shard_forward_elapsed_ms"),
+            "owner_embedding_elapsed_ms": report.get("owner_embedding_elapsed_ms"),
+            "kv_cache_before_bytes": report.get("kv_cache_before_bytes"),
+            "kv_cache_after_bytes": report.get("kv_cache_after_bytes"),
+            "kv_cache_delta_bytes": kv_delta_bytes,
+            "kv_cache_delta_mib": bytes_to_mib(kv_delta_bytes),
+            "cuda_memory_before_bytes": report.get("cuda_memory_before_bytes"),
+            "cuda_memory_after_bytes": report.get("cuda_memory_after_bytes"),
+            "cuda_memory_forward_delta_bytes": cuda_delta_bytes,
+            "cuda_memory_forward_delta_mib": bytes_to_mib(cuda_delta_bytes),
+        }
+        summary_rows.append(row)
+        for method, value in (
+            ("dynamiccache", kv_delta_bytes),
+            ("cuda_memory_allocated", cuda_delta_bytes),
+        ):
+            memory_rows.append(
+                {
+                    "experiment": "simultaneous_pair_forward_measurement",
+                    "request_order": row["request_order"],
+                    "client_request_id": client_request_id,
+                    "request_id": row["request_id"],
+                    "node_id": row["node_id"],
+                    "shards_start": row["shards_start"],
+                    "shards_end": row["shards_end"],
+                    "method": method,
+                    "delta_bytes": value,
+                    "delta_mib": bytes_to_mib(value),
+                }
+            )
+
+    write_csv(result_dir / "simultaneous_pair_forward_summary.csv", summary_rows)
+    write_csv(result_dir / "simultaneous_pair_forward_memory_long.csv", memory_rows)
+    plot_pair_forward_bars(
+        summary_rows,
+        value_key="forward_elapsed_ms",
+        output_path=result_dir / "simultaneous_pair_forward_elapsed_ms.png",
+        title="Two same-prompt requests: forward elapsed by node",
+        y_label="Elapsed time (ms)",
+    )
+    plot_pair_forward_bars(
+        summary_rows,
+        value_key="kv_cache_delta_bytes",
+        output_path=result_dir / "simultaneous_pair_dynamiccache_delta_mib.png",
+        title="Two same-prompt requests: DynamicCache delta by node",
+        y_label="DynamicCache delta (MiB)",
+        value_transform=bytes_to_mib,
+    )
+    plot_pair_forward_bars(
+        summary_rows,
+        value_key="cuda_memory_forward_delta_bytes",
+        output_path=result_dir / "simultaneous_pair_cuda_delta_mib.png",
+        title="Two same-prompt requests: cuda memory baseline delta by node",
+        y_label="cuda memory baseline delta (MiB)",
+        value_transform=bytes_to_mib,
+    )
+
+    for client_request_id in client_request_ids:
+        client.wait_for_done(client_request_id, timeout_s=30.0)
+
+    if missing:
+        print(f"[WARNING] missing forward reports: {missing}")
+    print(f"[TEST] collected {len(summary_rows)} shard forward reports.")
+    print(f"[TEST] results directory: {result_dir}")
+
+
 def run_scenario(client: PipelineDebugClient) -> None:
     print(
         "\nScenarios:\n"
@@ -1664,8 +1987,9 @@ def menu_loop(client: PipelineDebugClient) -> None:
             "  3. submit multiple requests\n"
             "  4. change max_active_requests and send config\n"
             "  5. run KV cache growth experiments\n"
-            "  6. run predefined Jetson test scenario\n"
-            "  7. show topology/config\n"
+            "  6. run simultaneous pair forward measurement\n"
+            "  7. run predefined Jetson test scenario\n"
+            "  8. show topology/config\n"
             "  q. quit\n"
         )
         choice = input("Select: ").strip().lower()
@@ -1680,8 +2004,10 @@ def menu_loop(client: PipelineDebugClient) -> None:
         elif choice == "5":
             run_kv_cache_experiments(client)
         elif choice == "6":
-            run_scenario(client)
+            run_simultaneous_pair_forward_experiment(client)
         elif choice == "7":
+            run_scenario(client)
+        elif choice == "8":
             client.show_topology()
         elif choice in {"q", "quit", "exit"}:
             return

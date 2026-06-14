@@ -38,12 +38,14 @@ class PipelineProtocol:
     USER_REQUEST_ACK = "user_request_ack"
     KV_CACHE_QUERY = "kv_cache_query"
     KV_CACHE_REPORT = "kv_cache_report"
+    SHARD_FORWARD_REPORT = "shard_forward_report"
     PIPELINE_DONE_REPORT = "pipeline_done_report"
 
     TELEMETRY_FIELDS = (
         "client_request_id",
         "telemetry_addr",  # 观测/测量回传地址，用于 kv_cache_report 和 pipeline_done_report
         "trace_kv_cache",
+        "trace_forward_measurement",
         "trace_label",
     )
 
@@ -79,10 +81,11 @@ class PipelineProtocol:
         """
         复制测试/观测用的可选字段。
 
-        这些字段只在 pipeline_test.py 发起 KV cache 实验时存在；普通推理消息
+        这些字段只在 pipeline_test.py 发起观测/实验时存在；普通推理消息
         不带这些字段，因此不会产生额外回传，也不会改变原有 pipeline 行为。
         telemetry_addr 是统一回传地址：owner 用它返回 user_request_ack，
-        各分片用它返回 kv_cache_report，first node 用它返回 pipeline_done_report。
+        各分片用它返回 kv_cache_report/shard_forward_report，first node 用它返回
+        pipeline_done_report。
         """
 
         for field in cls.TELEMETRY_FIELDS:
@@ -784,6 +787,116 @@ class PipelineNodeWorker:
         )
         self.communicator.send_to(telemetry_addr, report)
 
+    def _should_trace_forward_measurement(self, message: dict[str, Any]) -> bool:
+        """
+        判断当前消息是否开启 shard forward 细粒度测量。
+
+        该测量仅服务 pipeline_test.py 的双请求并发实验；普通请求不带
+        trace_forward_measurement，因此不会产生额外 CUDA 同步或 telemetry 回传。
+        """
+
+        return bool(
+            message.get("telemetry_addr")
+            and message.get("trace_forward_measurement", False)
+        )
+
+    def _capture_forward_measurement_start(
+        self, session: PipelineSession
+    ) -> tuple[dict[str, int], int | None, float, float]:
+        """
+        在 shard forward 前采集 KV/CUDA 起点，并返回计时起点。
+
+        CUDA 计时前先 synchronize，避免把上一条异步 kernel 的尾巴算到本次
+        forward 中；真正的 elapsed_ms 从该方法返回之后开始计算。
+        """
+
+        cache_before = self._dynamic_cache_payload_stats(session.past_key_value)
+        cuda_before = None
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            cuda_before = int(torch.cuda.memory_allocated(self.device))
+        return cache_before, cuda_before, time.perf_counter(), time.time()
+
+    def _emit_forward_measurement_report(
+        self,
+        message: dict[str, Any],
+        session: PipelineSession,
+        cache_before: dict[str, int],
+        cuda_before: int | None,
+        started_perf: float,
+        started_wall: float,
+    ) -> None:
+        """
+        回传单条消息经过本节点 shard 的耗时与 KV 增量。
+
+        report 中同时给出 DynamicCache payload 增量和
+        torch.cuda.memory_allocated() 增量；后者是设备进程级观测值，只用于
+        辅助对照，不替代按 request 隔离的 DynamicCache 统计。
+        """
+
+        telemetry_addr = message.get("telemetry_addr")
+        if not telemetry_addr:
+            return
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            cuda_after = int(torch.cuda.memory_allocated(self.device))
+        else:
+            cuda_after = None
+        finished_perf = time.perf_counter()
+        finished_wall = time.time()
+
+        cache_after = self._dynamic_cache_payload_stats(session.past_key_value)
+        kv_before_bytes = int(cache_before["kv_cache_bytes"])
+        kv_after_bytes = int(cache_after["kv_cache_bytes"])
+        cuda_delta = (
+            cuda_after - cuda_before
+            if cuda_after is not None and cuda_before is not None
+            else None
+        )
+        shard_elapsed_ms = (finished_perf - started_perf) * 1000.0
+        owner_embedding_elapsed_ms = 0.0
+        if (
+            self.is_first_stage
+            and message.get("owner_addr") == self.node_addr
+            and message.get("owner_embedding_elapsed_ms") is not None
+        ):
+            owner_embedding_elapsed_ms = float(message["owner_embedding_elapsed_ms"])
+
+        report = {
+            PipelineProtocol.TYPE_KEY: PipelineProtocol.SHARD_FORWARD_REPORT,
+            "event": "shard_forward_measurement",
+            "request_id": message["request_id"],
+            "client_request_id": message.get("client_request_id"),
+            "trace_label": message.get("trace_label"),
+            "phase": message.get("phase"),
+            "step": message.get("step"),
+            "node_id": self.node_id,
+            "node_addr": self.node_addr,
+            "shards_start": self.start,
+            "shards_end": self.end,
+            "is_first_stage": self.is_first_stage,
+            "is_last_stage": self.is_last_stage,
+            "started_timestamp": started_wall,
+            "finished_timestamp": finished_wall,
+            "shard_forward_elapsed_ms": shard_elapsed_ms,
+            "owner_embedding_elapsed_ms": owner_embedding_elapsed_ms,
+            "forward_elapsed_ms": shard_elapsed_ms + owner_embedding_elapsed_ms,
+            "kv_cache_before_bytes": kv_before_bytes,
+            "kv_cache_after_bytes": kv_after_bytes,
+            "kv_cache_delta_bytes": kv_after_bytes - kv_before_bytes,
+            "kv_cache_before_numel": int(cache_before["kv_cache_numel"]),
+            "kv_cache_after_numel": int(cache_after["kv_cache_numel"]),
+            "kv_cache_delta_numel": int(cache_after["kv_cache_numel"])
+            - int(cache_before["kv_cache_numel"]),
+            "kv_cache_before_token_length": int(cache_before["kv_cache_token_length"]),
+            "kv_cache_after_token_length": int(cache_after["kv_cache_token_length"]),
+            "cuda_memory_before_bytes": cuda_before,
+            "cuda_memory_after_bytes": cuda_after,
+            "cuda_memory_forward_delta_bytes": cuda_delta,
+        }
+        self.communicator.send_to(telemetry_addr, report)
+
     @torch.inference_mode()
     def receive_user_request(
         self,
@@ -832,7 +945,17 @@ class PipelineNodeWorker:
         print(
             f"[REQUEST] request_id={request_id} input token number: {session.input_token_length}"
         )
+        trace_forward_measurement = bool(
+            request_metadata
+            and request_metadata.get("trace_forward_measurement", False)
+        )
+        embedding_started = time.perf_counter() if trace_forward_measurement else None
         hidden_states = self.embed_tokens(input_ids)
+        embedding_elapsed_ms = (
+            (time.perf_counter() - embedding_started) * 1000.0
+            if embedding_started is not None
+            else None
+        )
         batch_size, seq_len, _ = hidden_states.shape
 
         message = PipelineProtocol.build_input(
@@ -847,6 +970,8 @@ class PipelineNodeWorker:
         )
         if request_metadata:
             PipelineProtocol.copy_telemetry_fields(request_metadata, message)
+        if embedding_elapsed_ms is not None:
+            message["owner_embedding_elapsed_ms"] = embedding_elapsed_ms
         return message
 
     @torch.inference_mode()
@@ -859,18 +984,32 @@ class PipelineNodeWorker:
         - 末分片返回 pipeline_token，由 controller 直接发给 owner。
         """
 
+        trace_forward_measurement = self._should_trace_forward_measurement(message)
+        cache_before = None
+        cuda_before = None
+        forward_started_perf = None
+        forward_started_wall = None
+
         if PipelineProtocol.is_type(message, PipelineProtocol.PIPELINE_INPUT):
             if not self.is_first_stage:
                 raise RuntimeError(
                     "[ERROR] pipeline_input should only be processed by the first stage."
                 )
-            hidden_states = message["hidden_states"].to(
-                device=self.device, dtype=self.dtype
-            )
             session = self._get_or_create_session(message["request_id"])
             session.batch_size = int(message["batch_size"])
             session.step = int(message["step"])
             self._maybe_capture_cuda_memory_baseline(session, message)
+            if trace_forward_measurement:
+                (
+                    cache_before,
+                    cuda_before,
+                    forward_started_perf,
+                    forward_started_wall,
+                ) = self._capture_forward_measurement_start(session)
+
+            hidden_states = message["hidden_states"].to(
+                device=self.device, dtype=self.dtype
+            )
 
             position_ids = build_position_ids(
                 session.past_key_value,
@@ -884,14 +1023,22 @@ class PipelineNodeWorker:
                 raise RuntimeError(
                     "[ERROR] first stage should not receive pipeline_state."
                 )
+            session = self._get_or_create_session(message["request_id"])
+            session.step = int(message["step"])
+            self._maybe_capture_cuda_memory_baseline(session, message)
+            if trace_forward_measurement:
+                (
+                    cache_before,
+                    cuda_before,
+                    forward_started_perf,
+                    forward_started_wall,
+                ) = self._capture_forward_measurement_start(session)
+
             hidden_states = message["hidden_states"].to(
                 device=self.device, dtype=self.dtype
             )
             cos = message["cos"].to(device=self.device, dtype=self.dtype)
             sin = message["sin"].to(device=self.device, dtype=self.dtype)
-            session = self._get_or_create_session(message["request_id"])
-            session.step = int(message["step"])
-            self._maybe_capture_cuda_memory_baseline(session, message)
         else:
             raise RuntimeError(
                 f"[ERROR] unsupported message for shard forward: {message.get('type')}"
@@ -907,9 +1054,25 @@ class PipelineNodeWorker:
         if self.is_last_stage:
             logits = self.lm_head(next_hidden_states)
             next_token_id = torch.argmax(logits[:, -1, :], dim=-1)
-            return PipelineProtocol.build_token(message, next_token_id)
+            next_message = PipelineProtocol.build_token(message, next_token_id)
+        else:
+            next_message = PipelineProtocol.build_state(
+                message,
+                next_hidden_states,
+                cos,
+                sin,
+            )
 
-        return PipelineProtocol.build_state(message, next_hidden_states, cos, sin)
+        if trace_forward_measurement:
+            self._emit_forward_measurement_report(
+                message=message,
+                session=session,
+                cache_before=cache_before,
+                cuda_before=cuda_before,
+                started_perf=forward_started_perf,
+                started_wall=forward_started_wall,
+            )
+        return next_message
 
     @torch.inference_mode()
     def receive_next_token(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -960,7 +1123,16 @@ class PipelineNodeWorker:
             return PipelineProtocol.build_done(message, reason, output_token_count)
 
         session.step = output_token_count
+        trace_forward_measurement = bool(
+            message.get("trace_forward_measurement", False)
+        )
+        embedding_started = time.perf_counter() if trace_forward_measurement else None
         hidden_states = self.embed_tokens(next_token_id.unsqueeze(0))
+        embedding_elapsed_ms = (
+            (time.perf_counter() - embedding_started) * 1000.0
+            if embedding_started is not None
+            else None
+        )
         next_input = PipelineProtocol.build_input(
             request_id=request_id,
             phase=PipelineProtocol.PHASE_DECODE,
@@ -971,7 +1143,10 @@ class PipelineNodeWorker:
             batch_size=1,
             seq_len=1,
         )
-        return PipelineProtocol.copy_telemetry_fields(message, next_input)
+        PipelineProtocol.copy_telemetry_fields(message, next_input)
+        if embedding_elapsed_ms is not None:
+            next_input["owner_embedding_elapsed_ms"] = embedding_elapsed_ms
+        return next_input
 
     def clear_request_state(self, request_id: str) -> None:
         """

@@ -157,6 +157,13 @@ raw allocated 字段仍保留在 CSV 中用于排查单节点显存状态，但�
 `<experiment>_per_node_<node_id>_shards_<shards_start>~<shards_end>.png`。这些图不会跨节点
 求和，会画出该节点的 `kv_cache_bytes` 和 `cuda_memory_delta_bytes`。
 
+`test/pipeline_test.py` 的主菜单第 6 项为 `run simultaneous pair forward measurement`。
+该测试会把两个相同 prompt 尽可能 back-to-back 发送给 first node/owner，并收集每个
+request 在每个 node 上的 prefill forward 耗时、DynamicCache 增量和
+`torch.cuda.memory_allocated()` 前后差值。结果保存为
+`simultaneous_pair_forward_summary.csv` 和
+`simultaneous_pair_forward_memory_long.csv`，并额外输出三张柱状图用于快速查看。
+
 ## 调试建议
 
 * 如果消息没有继续向下游走，先检查每个节点的 `node_addr` 是否是可连接地址。

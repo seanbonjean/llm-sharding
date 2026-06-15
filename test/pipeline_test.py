@@ -2330,7 +2330,8 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         "  2. 2 nodes, 3 simultaneous requests, max_new_tokens=2; request 3 should wait in pending queue\n"
         "  3. 4 nodes, 3 simultaneous requests, max_new_tokens=2\n"
         "  4. 4 nodes, 4 simultaneous requests, max_new_tokens=2\n"
-        "  5. run all scenarios\n"
+        "  5. 3 nodes, 4 simultaneous requests, max_new_tokens=2\n"
+        "  6. run all scenarios\n"
     )
     choice = input("Experiment: ").strip()
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
@@ -2358,6 +2359,10 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         )
     elif choice == "5":
         run_two_round_pipeline_latency_scenario(
+            client, result_dir, 3, 4, prompt, timeout_s, config_settle_s
+        )
+    elif choice == "6":
+        run_two_round_pipeline_latency_scenario(
             client, result_dir, 3, 3, prompt, timeout_s, config_settle_s
         )
         run_two_round_pipeline_latency_scenario(
@@ -2368,6 +2373,9 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         )
         run_two_round_pipeline_latency_scenario(
             client, result_dir, 4, 4, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 3, 4, prompt, timeout_s, config_settle_s
         )
     else:
         print("Unknown experiment.")

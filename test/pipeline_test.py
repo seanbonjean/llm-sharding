@@ -1955,7 +1955,7 @@ def wait_for_warmup_batch(
         trace_label_prefix=trace_label_prefix,
     )
     for warmup_client_id in warmup_client_ids:
-        client.wait_for_ack(warmup_client_id, timeout_s=15.0)
+        client.wait_for_ack(warmup_client_id, timeout_s=timeout_s)
     missing_warmups = []
     for warmup_client_id in warmup_client_ids:
         warmup_done = client.wait_for_done(warmup_client_id, timeout_s=timeout_s)
@@ -2009,7 +2009,7 @@ def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> Non
         trace_label_prefix="simultaneous_pair_warmup",
     )
     for warmup_client_id in warmup_client_ids:
-        client.wait_for_ack(warmup_client_id, timeout_s=15.0)
+        client.wait_for_ack(warmup_client_id, timeout_s=timeout_s)
     missing_warmups = []
     for warmup_client_id in warmup_client_ids:
         warmup_done = client.wait_for_done(warmup_client_id, timeout_s=timeout_s)
@@ -2147,6 +2147,7 @@ def run_two_round_pipeline_latency_scenario(
     node_count: int,
     prompt: str,
     timeout_s: float,
+    config_settle_s: float,
 ) -> None:
     request_count = 3
     max_new_tokens = 2
@@ -2160,8 +2161,10 @@ def run_two_round_pipeline_latency_scenario(
         f"\n[TEST] {node_count} nodes, 3 simultaneous requests, max_new_tokens=2"
     )
     configure_even_split_topology(client, node_count)
-    print("[TEST] waiting 2 seconds after config for nodes to settle...")
-    time.sleep(2.0)
+    print(
+        f"[TEST] waiting {config_settle_s:.1f} seconds after config for nodes to load layers..."
+    )
+    time.sleep(config_settle_s)
     client.drain_events()
 
     print("[TEST] running topology-matched warm-up batch without measurement...")
@@ -2330,15 +2333,26 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
     choice = input("Experiment: ").strip()
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
     timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
+    config_settle_s = float(
+        input("Config settle seconds after each topology config [30]: ").strip() or "30"
+    )
     ask_telemetry(client)
 
     if choice == "1":
-        run_two_round_pipeline_latency_scenario(client, result_dir, 3, prompt, timeout_s)
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 3, prompt, timeout_s, config_settle_s
+        )
     elif choice == "2":
-        run_two_round_pipeline_latency_scenario(client, result_dir, 2, prompt, timeout_s)
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 2, prompt, timeout_s, config_settle_s
+        )
     elif choice == "3":
-        run_two_round_pipeline_latency_scenario(client, result_dir, 3, prompt, timeout_s)
-        run_two_round_pipeline_latency_scenario(client, result_dir, 2, prompt, timeout_s)
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 3, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 2, prompt, timeout_s, config_settle_s
+        )
     else:
         print("Unknown experiment.")
     print(f"[TEST] results directory: {result_dir}")

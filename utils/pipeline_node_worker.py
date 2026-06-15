@@ -35,6 +35,7 @@ class PipelineProtocol:
     PIPELINE_DONE = "pipeline_done"
     PIPELINE_CLEAR = "pipeline_clear"
     USER_REQUEST = "user_request"
+    USER_REQUEST_BATCH = "user_request_batch"
     USER_REQUEST_ACK = "user_request_ack"
     KV_CACHE_QUERY = "kv_cache_query"
     KV_CACHE_REPORT = "kv_cache_report"
@@ -291,6 +292,7 @@ class PipelineProtocol:
             cls.PIPELINE_DONE,
             cls.PIPELINE_CLEAR,
             cls.USER_REQUEST,
+            cls.USER_REQUEST_BATCH,
             cls.KV_CACHE_QUERY,
         }
 
@@ -1538,8 +1540,29 @@ class PipelineNodeController:
             self._handle_pipeline_clear(data)
         elif PipelineProtocol.is_type(data, PipelineProtocol.USER_REQUEST):
             self._handle_user_request(data)
+        elif PipelineProtocol.is_type(data, PipelineProtocol.USER_REQUEST_BATCH):
+            self._handle_user_request_batch(data)
         elif PipelineProtocol.is_type(data, PipelineProtocol.KV_CACHE_QUERY):
             self._handle_kv_cache_query(data)
+
+    def _handle_user_request_batch(self, message: dict[str, Any]) -> None:
+        """
+        处理测试脚本一次性发送的多个用户请求。
+
+        这个入口只用于并发测量实验。它会在同一个 worker-loop 轮次内把 batch
+        中的请求全部提交到 first-stage queue，然后才回到主循环推进队列，从而
+        避免“第一个请求刚收到就先开始 forward，第二个请求还没进入 active queue”
+        的实验偏差。
+        """
+
+        requests = message.get("requests")
+        if not isinstance(requests, list):
+            raise RuntimeError("[ERROR] user_request_batch requires a requests list.")
+        for request in requests:
+            if not isinstance(request, dict):
+                raise RuntimeError("[ERROR] each batched user request must be a dict.")
+            request.setdefault(PipelineProtocol.TYPE_KEY, PipelineProtocol.USER_REQUEST)
+            self._handle_user_request(request)
 
     def _handle_user_request(self, message: dict[str, Any]) -> None:
         """

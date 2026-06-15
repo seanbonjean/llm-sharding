@@ -158,9 +158,11 @@ raw allocated 字段仍保留在 CSV 中用于排查单节点显存状态，但�
 求和，会画出该节点的 `kv_cache_bytes` 和 `cuda_memory_delta_bytes`。
 
 `test/pipeline_test.py` 的主菜单第 6 项为 `run simultaneous pair forward measurement`。
-该测试会先用相同 prompt 跑一次不带测量 flag 的 warm-up request，等它完成后再等待
-2 秒，让运行时状态稳定，然后把两个相同 prompt 尽可能 back-to-back 发送给
-first node/owner，并收集每个 request 在每个 node 上的 prefill forward 耗时、DynamicCache 增量和
+该测试会先用相同 prompt 跑两个不带测量 flag 的 warm-up request，等它们完成后再等待
+2 秒，让运行时状态稳定，然后把两个相同 prompt 作为一个 batch 发送给 first node/owner。
+batch 入口会先把两个请求都放入 first-stage queue，再开始推进队列，避免第一个请求先被
+forward、第二个请求还没进入 active queue 的实验偏差。测试会收集每个 request 在每个 node 上的
+prefill forward 耗时、DynamicCache 增量和
 `torch.cuda.memory_allocated()` 前后差值。结果保存为
 `simultaneous_pair_forward_summary.csv` 和
 `simultaneous_pair_forward_memory_long.csv`，并额外输出三张柱状图用于快速查看。

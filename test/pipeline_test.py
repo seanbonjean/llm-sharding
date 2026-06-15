@@ -28,6 +28,7 @@ import zmq
 
 
 USER_REQUEST = "user_request"
+USER_REQUEST_BATCH = "user_request_batch"
 USER_REQUEST_ACK = "user_request_ack"
 KV_CACHE_QUERY = "kv_cache_query"
 KV_CACHE_REPORT = "kv_cache_report"
@@ -300,9 +301,10 @@ class PipelineDebugClient:
         prompts: list[str],
         max_new_tokens: int,
         trace_forward_measurement: bool = False,
+        telemetry_only: bool = False,
         trace_label_prefix: str = "burst",
     ) -> list[str]:
-        """Send several requests back-to-back on one socket with minimal delay."""
+        """Send several requests as one batch so the owner enqueues them in one loop turn."""
 
         owner = self.nodes[owner_index]
         payloads: list[tuple[str, dict]] = []
@@ -312,17 +314,21 @@ class PipelineDebugClient:
                     prompt=prompt,
                     max_new_tokens=max_new_tokens,
                     trace_forward_measurement=trace_forward_measurement,
+                    telemetry_only=telemetry_only,
                     trace_label=f"{trace_label_prefix}_request{index}",
                 )
             )
         socket = self._data_socket(owner.node_addr)
+        batch_payload = {
+            "type": USER_REQUEST_BATCH,
+            "requests": [payload for _, payload in payloads],
+        }
         started = time.perf_counter()
-        for _, payload in payloads:
-            socket.send(self._serialize(payload))
+        socket.send(self._serialize(batch_payload))
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         client_request_ids = [client_request_id for client_request_id, _ in payloads]
         print(
-            f"[REQUEST] burst sent {len(payloads)} requests to {owner.node_id} "
+            f"[REQUEST] batch sent {len(payloads)} requests to {owner.node_id} "
             f"({owner.node_addr}) in {elapsed_ms:.3f} ms; "
             f"client_request_ids={client_request_ids}"
         )
@@ -1827,23 +1833,28 @@ def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> Non
     timeout_s = float(input("Forward report timeout seconds [120]: ").strip() or "120")
     client.drain_events()
 
-    print("[TEST] running one warm-up request without measurement...")
-    warmup_client_id = client.submit_request(
+    print("[TEST] running two warm-up requests without measurement...")
+    warmup_client_ids = client.submit_burst_requests(
         owner_index=owner_index,
-        prompt=prompt,
+        prompts=[prompt, prompt],
         max_new_tokens=1,
         telemetry_only=True,
-        trace_label="simultaneous_pair_warmup",
+        trace_label_prefix="simultaneous_pair_warmup",
     )
-    client.wait_for_ack(warmup_client_id, timeout_s=15.0)
-    warmup_done = client.wait_for_done(warmup_client_id, timeout_s=timeout_s)
-    if warmup_done is None:
+    for warmup_client_id in warmup_client_ids:
+        client.wait_for_ack(warmup_client_id, timeout_s=15.0)
+    missing_warmups = []
+    for warmup_client_id in warmup_client_ids:
+        warmup_done = client.wait_for_done(warmup_client_id, timeout_s=timeout_s)
+        if warmup_done is None:
+            missing_warmups.append(warmup_client_id)
+    if missing_warmups:
         print(
-            f"[WARNING] warm-up request {warmup_client_id} did not report done before timeout; "
-            "continuing with the measured burst."
+            f"[WARNING] warm-up requests did not report done before timeout: "
+            f"{missing_warmups}; continuing with the measured burst."
         )
     else:
-        print(f"[TEST] warm-up request {warmup_client_id} completed.")
+        print(f"[TEST] warm-up requests completed: {warmup_client_ids}.")
     print("[TEST] waiting 2 seconds after warm-up for runtime state to settle...")
     time.sleep(2.0)
     client.drain_events()

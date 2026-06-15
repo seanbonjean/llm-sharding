@@ -73,6 +73,7 @@ DEFAULT_NODES = [
     PipelineNodeSpec("node2", "172.16.0.6", 14, 21),
     PipelineNodeSpec("node3", "172.16.0.7", 21, 28),
 ]
+DEFAULT_LAYER_COUNT = DEFAULT_NODES[-1].shards_end
 
 DEFAULT_PROMPTS = [
     "Write a poem about the blue sky.",
@@ -414,6 +415,46 @@ def ask_int(prompt: str, default: int, minimum: int | None = None) -> int:
 def ask_node(client: PipelineDebugClient, prompt: str = "Choose owner node") -> int:
     client.show_topology()
     return ask_int(prompt, 0, minimum=0) % client.pipeline_depth
+
+
+def build_even_split_nodes(node_count: int) -> list[PipelineNodeSpec]:
+    if node_count < 1 or node_count > len(DEFAULT_NODES):
+        raise ValueError(f"[ERROR] node_count must be in [1, {len(DEFAULT_NODES)}].")
+
+    nodes: list[PipelineNodeSpec] = []
+    for index, base_node in enumerate(DEFAULT_NODES[:node_count]):
+        start = (DEFAULT_LAYER_COUNT * index) // node_count
+        end = (DEFAULT_LAYER_COUNT * (index + 1)) // node_count
+        nodes.append(
+            PipelineNodeSpec(
+                node_id=base_node.node_id,
+                ip=base_node.ip,
+                shards_start=start,
+                shards_end=end,
+                can_receive_user_request=True,
+                config_port=base_node.config_port,
+                data_port=base_node.data_port,
+            )
+        )
+    return nodes
+
+
+def configure_even_split_topology(client: PipelineDebugClient, node_count: int) -> None:
+    """
+    临时把测试 CLI 的拓扑切到前 node_count 台设备，并发送对应 config。
+
+    该 helper 只影响测试脚本管理的 pipeline config；没有修改 worker 主逻辑。
+    """
+
+    client.nodes = build_even_split_nodes(node_count)
+    client.pipeline_depth = node_count
+    client.max_active_requests = node_count
+    print(
+        f"[TEST] applying {node_count}-node topology with "
+        f"max_active_requests={client.max_active_requests}."
+    )
+    client.show_topology()
+    client.send_config()
 
 
 def ask_prompt(default: str = DEFAULT_PROMPTS[0]) -> str:
@@ -1803,6 +1844,132 @@ def collect_shard_forward_reports(
     return reports, missing
 
 
+def collect_forward_reports_and_done(
+    client: PipelineDebugClient,
+    client_request_ids: list[str],
+    expected_phase_steps: list[tuple[str, int]],
+    process_started_perf: float,
+    timeout_s: float,
+) -> tuple[
+    list[dict],
+    list[dict],
+    dict[str, dict],
+    list[tuple[str, str, str, int]],
+    list[str],
+    list[str],
+]:
+    expected_node_ids = {node.node_id for node in client.nodes}
+    expected_report_keys = {
+        (client_request_id, node_id, phase, step)
+        for client_request_id in client_request_ids
+        for node_id in expected_node_ids
+        for phase, step in expected_phase_steps
+    }
+    expected_done_ids = set(client_request_ids)
+    expected_ack_ids = set(client_request_ids)
+    reports_by_key: dict[tuple[str, str, str, int], dict] = {}
+    done_by_client_id: dict[str, dict] = {}
+    ack_by_client_id: dict[str, dict] = {}
+    held_events: list[dict] = []
+    deadline = time.time() + timeout_s
+
+    try:
+        while time.time() < deadline:
+            if (
+                set(ack_by_client_id) == expected_ack_ids
+                and set(reports_by_key) == expected_report_keys
+                and set(done_by_client_id) == expected_done_ids
+            ):
+                break
+            event = client.receive_event(
+                timeout_s=max(0.05, min(0.5, deadline - time.time()))
+            )
+            if event is None:
+                continue
+            event_type = event.get("type")
+            client_request_id = str(event.get("client_request_id"))
+            if event_type == USER_REQUEST_ACK and client_request_id in expected_ack_ids:
+                ack_by_client_id[client_request_id] = event
+                continue
+            if (
+                event_type == SHARD_FORWARD_REPORT
+                and client_request_id in expected_done_ids
+                and event.get("event") == "shard_forward_measurement"
+            ):
+                phase = str(event.get("phase"))
+                step = int(event.get("step") or 0)
+                key = (
+                    client_request_id,
+                    str(event.get("node_id")),
+                    phase,
+                    step,
+                )
+                if key in expected_report_keys:
+                    reports_by_key[key] = event
+                continue
+            if event_type == PIPELINE_DONE_REPORT and client_request_id in expected_done_ids:
+                event["done_received_elapsed_ms"] = (
+                    time.perf_counter() - process_started_perf
+                ) * 1000.0
+                done_by_client_id[client_request_id] = event
+                continue
+            held_events.append(event)
+    finally:
+        client._event_backlog[:0] = held_events
+
+    phase_step_order = {
+        phase_step: index for index, phase_step in enumerate(expected_phase_steps)
+    }
+    reports = list(reports_by_key.values())
+    reports.sort(
+        key=lambda row: (
+            client_request_ids.index(str(row.get("client_request_id"))),
+            phase_step_order.get((str(row.get("phase")), int(row.get("step") or 0)), 999),
+            int(row.get("shards_start") or 0),
+        )
+    )
+    done_reports = list(done_by_client_id.values())
+    done_reports.sort(
+        key=lambda row: client_request_ids.index(str(row.get("client_request_id")))
+    )
+    missing_reports = sorted(expected_report_keys - set(reports_by_key))
+    missing_done = sorted(expected_done_ids - set(done_by_client_id))
+    missing_ack = sorted(expected_ack_ids - set(ack_by_client_id))
+    return reports, done_reports, ack_by_client_id, missing_reports, missing_done, missing_ack
+
+
+def wait_for_warmup_batch(
+    client: PipelineDebugClient,
+    owner_index: int,
+    prompt: str,
+    request_count: int,
+    max_new_tokens: int,
+    timeout_s: float,
+    trace_label_prefix: str,
+) -> None:
+    warmup_client_ids = client.submit_burst_requests(
+        owner_index=owner_index,
+        prompts=[prompt] * request_count,
+        max_new_tokens=max_new_tokens,
+        telemetry_only=True,
+        trace_label_prefix=trace_label_prefix,
+    )
+    for warmup_client_id in warmup_client_ids:
+        client.wait_for_ack(warmup_client_id, timeout_s=15.0)
+    missing_warmups = []
+    for warmup_client_id in warmup_client_ids:
+        warmup_done = client.wait_for_done(warmup_client_id, timeout_s=timeout_s)
+        if warmup_done is None:
+            missing_warmups.append(warmup_client_id)
+    if missing_warmups:
+        print(
+            f"[WARNING] warm-up requests did not report done before timeout: "
+            f"{missing_warmups}; continuing with measured run."
+        )
+    else:
+        print(f"[TEST] warm-up requests completed: {warmup_client_ids}.")
+
+
 def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> None:
     """
     Back-to-back 提交两个相同 prompt，收集每个 request 在每个 node 的前向耗时和 KV 增量。
@@ -1974,6 +2141,209 @@ def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> Non
     print(f"[TEST] results directory: {result_dir}")
 
 
+def run_two_round_pipeline_latency_scenario(
+    client: PipelineDebugClient,
+    result_dir: Path,
+    node_count: int,
+    prompt: str,
+    timeout_s: float,
+) -> None:
+    request_count = 3
+    max_new_tokens = 2
+    expected_phase_steps = [
+        ("prefill", 0),
+        ("decode", 1),
+    ]
+    prefix = f"{node_count}node_3request_2round"
+
+    print(
+        f"\n[TEST] {node_count} nodes, 3 simultaneous requests, max_new_tokens=2"
+    )
+    configure_even_split_topology(client, node_count)
+    print("[TEST] waiting 2 seconds after config for nodes to settle...")
+    time.sleep(2.0)
+    client.drain_events()
+
+    print("[TEST] running topology-matched warm-up batch without measurement...")
+    wait_for_warmup_batch(
+        client=client,
+        owner_index=0,
+        prompt=prompt,
+        request_count=request_count,
+        max_new_tokens=max_new_tokens,
+        timeout_s=timeout_s,
+        trace_label_prefix=f"{prefix}_warmup",
+    )
+    print("[TEST] waiting 2 seconds after warm-up for runtime state to settle...")
+    time.sleep(2.0)
+    client.drain_events()
+
+    process_started_perf = time.perf_counter()
+    client_request_ids = client.submit_burst_requests(
+        owner_index=0,
+        prompts=[prompt] * request_count,
+        max_new_tokens=max_new_tokens,
+        trace_forward_measurement=True,
+        trace_label_prefix=prefix,
+    )
+    (
+        reports,
+        done_reports,
+        ack_by_client_id,
+        missing_reports,
+        missing_done,
+        missing_ack,
+    ) = collect_forward_reports_and_done(
+        client=client,
+        client_request_ids=client_request_ids,
+        expected_phase_steps=expected_phase_steps,
+        process_started_perf=process_started_perf,
+        timeout_s=timeout_s,
+    )
+    request_id_by_client_id = {
+        client_request_id: ack.get("request_id")
+        for client_request_id, ack in ack_by_client_id.items()
+    }
+
+    request_order_by_client_id = {
+        client_request_id: index
+        for index, client_request_id in enumerate(client_request_ids, start=1)
+    }
+    phase_step_order = {
+        phase_step: index + 1 for index, phase_step in enumerate(expected_phase_steps)
+    }
+    forward_rows: list[dict] = []
+    for report in reports:
+        client_request_id = str(report.get("client_request_id"))
+        phase = str(report.get("phase"))
+        step = int(report.get("step") or 0)
+        forward_rows.append(
+            {
+                "experiment": "two_round_pipeline_latency",
+                "topology_node_count": node_count,
+                "request_count": request_count,
+                "max_active_requests": client.max_active_requests,
+                "max_new_tokens": max_new_tokens,
+                "request_order": request_order_by_client_id[client_request_id],
+                "client_request_id": client_request_id,
+                "request_id": request_id_by_client_id.get(client_request_id),
+                "node_id": report.get("node_id"),
+                "node_addr": report.get("node_addr"),
+                "shards_start": report.get("shards_start"),
+                "shards_end": report.get("shards_end"),
+                "phase": phase,
+                "step": step,
+                "phase_step_order": phase_step_order.get((phase, step)),
+                "input_token_length": ack_by_client_id.get(client_request_id, {}).get(
+                    "input_token_length"
+                ),
+                "started_timestamp": report.get("started_timestamp"),
+                "finished_timestamp": report.get("finished_timestamp"),
+                "forward_elapsed_ms": report.get("forward_elapsed_ms"),
+                "shard_forward_elapsed_ms": report.get("shard_forward_elapsed_ms"),
+                "owner_embedding_elapsed_ms": report.get("owner_embedding_elapsed_ms"),
+                "kv_cache_delta_bytes": report.get("kv_cache_delta_bytes"),
+                "kv_cache_delta_mib": bytes_to_mib(report.get("kv_cache_delta_bytes")),
+                "cuda_memory_forward_delta_bytes": report.get(
+                    "cuda_memory_forward_delta_bytes"
+                ),
+                "cuda_memory_forward_delta_mib": bytes_to_mib(
+                    report.get("cuda_memory_forward_delta_bytes")
+                ),
+            }
+        )
+
+    done_rows: list[dict] = []
+    for done_report in done_reports:
+        client_request_id = str(done_report.get("client_request_id"))
+        done_rows.append(
+            {
+                "experiment": "two_round_pipeline_latency",
+                "topology_node_count": node_count,
+                "request_count": request_count,
+                "max_active_requests": client.max_active_requests,
+                "max_new_tokens": max_new_tokens,
+                "request_order": request_order_by_client_id[client_request_id],
+                "client_request_id": client_request_id,
+                "request_id": request_id_by_client_id.get(client_request_id),
+                "reason": done_report.get("reason"),
+                "output_token_count": done_report.get("output_token_count"),
+                "done_received_elapsed_ms": done_report.get(
+                    "done_received_elapsed_ms"
+                ),
+            }
+        )
+
+    total_elapsed_ms = (
+        max(float(row["done_received_elapsed_ms"]) for row in done_rows)
+        if done_rows and not missing_done
+        else None
+    )
+    expected_report_count = (
+        request_count * node_count * len(expected_phase_steps)
+    )
+    summary_rows = [
+        {
+            "experiment": "two_round_pipeline_latency",
+            "topology_node_count": node_count,
+            "request_count": request_count,
+            "max_active_requests": client.max_active_requests,
+            "max_new_tokens": max_new_tokens,
+            "expected_forward_report_count": expected_report_count,
+            "collected_forward_report_count": len(forward_rows),
+            "ack_report_count": len(ack_by_client_id),
+            "missing_ack_count": len(missing_ack),
+            "missing_forward_report_count": len(missing_reports),
+            "done_report_count": len(done_rows),
+            "missing_done_count": len(missing_done),
+            "total_process_elapsed_ms": total_elapsed_ms,
+            "missing_ack_client_request_ids": repr(missing_ack),
+            "missing_forward_reports": repr(missing_reports),
+            "missing_done_client_request_ids": repr(missing_done),
+        }
+    ]
+
+    write_csv(result_dir / f"{prefix}_forward_reports.csv", forward_rows)
+    write_csv(result_dir / f"{prefix}_done_reports.csv", done_rows)
+    write_csv(result_dir / f"{prefix}_summary.csv", summary_rows)
+
+    if missing_ack:
+        print(f"[WARNING] missing ack reports for {node_count}-node scenario: {missing_ack}")
+    if missing_reports:
+        print(f"[WARNING] missing forward reports for {node_count}-node scenario: {missing_reports}")
+    if missing_done:
+        print(f"[WARNING] missing done reports for {node_count}-node scenario: {missing_done}")
+    print(
+        f"[TEST] {node_count}-node scenario total elapsed: "
+        f"{total_elapsed_ms if total_elapsed_ms is not None else 'N/A'} ms"
+    )
+
+
+def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> None:
+    result_dir = make_result_dir()
+    print(
+        "\nTwo-round pipeline latency experiments:\n"
+        "  1. 3 nodes, 3 simultaneous requests, max_new_tokens=2\n"
+        "  2. 2 nodes, 3 simultaneous requests, max_new_tokens=2; request 3 should wait in pending queue\n"
+        "  3. run both scenarios\n"
+    )
+    choice = input("Experiment: ").strip()
+    prompt = ask_prompt(DEFAULT_PROMPTS[4])
+    timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
+    ask_telemetry(client)
+
+    if choice == "1":
+        run_two_round_pipeline_latency_scenario(client, result_dir, 3, prompt, timeout_s)
+    elif choice == "2":
+        run_two_round_pipeline_latency_scenario(client, result_dir, 2, prompt, timeout_s)
+    elif choice == "3":
+        run_two_round_pipeline_latency_scenario(client, result_dir, 3, prompt, timeout_s)
+        run_two_round_pipeline_latency_scenario(client, result_dir, 2, prompt, timeout_s)
+    else:
+        print("Unknown experiment.")
+    print(f"[TEST] results directory: {result_dir}")
+
+
 def run_scenario(client: PipelineDebugClient) -> None:
     print(
         "\nScenarios:\n"
@@ -2023,8 +2393,9 @@ def menu_loop(client: PipelineDebugClient) -> None:
             "  4. change max_active_requests and send config\n"
             "  5. run KV cache growth experiments\n"
             "  6. run simultaneous pair forward measurement\n"
-            "  7. run predefined Jetson test scenario\n"
-            "  8. show topology/config\n"
+            "  7. run two-round pipeline latency experiments\n"
+            "  8. run predefined Jetson test scenario\n"
+            "  9. show topology/config\n"
             "  q. quit\n"
         )
         choice = input("Select: ").strip().lower()
@@ -2041,8 +2412,10 @@ def menu_loop(client: PipelineDebugClient) -> None:
         elif choice == "6":
             run_simultaneous_pair_forward_experiment(client)
         elif choice == "7":
-            run_scenario(client)
+            run_two_round_pipeline_latency_experiment(client)
         elif choice == "8":
+            run_scenario(client)
+        elif choice == "9":
             client.show_topology()
         elif choice in {"q", "quit", "exit"}:
             return

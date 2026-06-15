@@ -168,14 +168,14 @@ prefill forward 耗时、DynamicCache 增量和
 `simultaneous_pair_forward_memory_long.csv`，并额外输出三张柱状图用于快速查看。
 
 主菜单第 7 项为 `run two-round pipeline latency experiments`。该测试会临时把模型链
-切到前 3 台或前 2 台设备，并按 Llama 3.2 3B 的 28 层均匀切分：
-3 台设备为 `0~9/9~18/18~28`，2 台设备为 `0~14/14~28`。每个场景会先跑一次同形状
-warm-up batch；发送新 config 后会先等待 `Config settle seconds`，默认 30 秒，避免节点还在
-加载 layer 时就触发 warm-up。之后同时向 first node/owner 发送 3 个相同 prompt，
-`max_new_tokens=2`。
-3 台设备场景设置 `max_active_requests=3`；2 台设备场景设置 `max_active_requests=2`，
-因此第 3 个请求应进入 pending queue。结果会输出
-`<node_count>node_3request_2round_forward_reports.csv`、`done_reports.csv` 和
+切到前 2/3/4 台设备，并按 Llama 3.2 3B 的 28 层均匀切分：
+2 台设备为 `0~14/14~28`，3 台设备为 `0~9/9~18/18~28`，4 台设备为
+`0~7/7~14/14~21/21~28`。每个场景会先跑一次同形状 warm-up batch；发送新 config 后会先等待
+`Config settle seconds`，默认 30 秒，避免节点还在加载 layer 时就触发 warm-up。
+当前子场景包括 3 节点 3 请求、2 节点 3 请求、4 节点 3 请求和 4 节点 4 请求；
+每个请求 `max_new_tokens=2`。`max_active_requests` 等于节点数，因此 2 节点 3 请求场景中
+第 3 个请求应进入 pending queue。结果会输出
+`<node_count>node_<request_count>request_2round_forward_reports.csv`、`done_reports.csv` 和
 `summary.csv`；summary 中的 `total_process_elapsed_ms` 是从测试脚本发出 batch 到收到所有
 done report 的总时延。
 

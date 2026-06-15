@@ -2145,20 +2145,20 @@ def run_two_round_pipeline_latency_scenario(
     client: PipelineDebugClient,
     result_dir: Path,
     node_count: int,
+    request_count: int,
     prompt: str,
     timeout_s: float,
     config_settle_s: float,
 ) -> None:
-    request_count = 3
     max_new_tokens = 2
     expected_phase_steps = [
         ("prefill", 0),
         ("decode", 1),
     ]
-    prefix = f"{node_count}node_3request_2round"
+    prefix = f"{node_count}node_{request_count}request_2round"
 
     print(
-        f"\n[TEST] {node_count} nodes, 3 simultaneous requests, max_new_tokens=2"
+        f"\n[TEST] {node_count} nodes, {request_count} simultaneous requests, max_new_tokens=2"
     )
     configure_even_split_topology(client, node_count)
     print(
@@ -2328,7 +2328,9 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         "\nTwo-round pipeline latency experiments:\n"
         "  1. 3 nodes, 3 simultaneous requests, max_new_tokens=2\n"
         "  2. 2 nodes, 3 simultaneous requests, max_new_tokens=2; request 3 should wait in pending queue\n"
-        "  3. run both scenarios\n"
+        "  3. 4 nodes, 3 simultaneous requests, max_new_tokens=2\n"
+        "  4. 4 nodes, 4 simultaneous requests, max_new_tokens=2\n"
+        "  5. run all scenarios\n"
     )
     choice = input("Experiment: ").strip()
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
@@ -2340,18 +2342,32 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
 
     if choice == "1":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 3, 3, prompt, timeout_s, config_settle_s
         )
     elif choice == "2":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 2, prompt, timeout_s, config_settle_s
+            client, result_dir, 2, 3, prompt, timeout_s, config_settle_s
         )
     elif choice == "3":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 4, 3, prompt, timeout_s, config_settle_s
+        )
+    elif choice == "4":
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 4, 4, prompt, timeout_s, config_settle_s
+        )
+    elif choice == "5":
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 3, 3, prompt, timeout_s, config_settle_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 2, prompt, timeout_s, config_settle_s
+            client, result_dir, 2, 3, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 4, 3, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 4, 4, prompt, timeout_s, config_settle_s
         )
     else:
         print("Unknown experiment.")

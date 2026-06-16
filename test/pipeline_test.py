@@ -67,13 +67,15 @@ class PipelineNodeSpec:
         return f"tcp://{self.ip}:{self.config_port}"
 
 
-DEFAULT_NODES = [
+AVAILABLE_NODES = [
     PipelineNodeSpec("node0", "172.16.0.4", 0, 7),
     PipelineNodeSpec("node1", "172.16.0.5", 7, 14),
     PipelineNodeSpec("node2", "172.16.0.6", 14, 21),
     PipelineNodeSpec("node3", "172.16.0.7", 21, 28),
+    PipelineNodeSpec("node4", "172.16.0.2", 23, 28),
 ]
-DEFAULT_LAYER_COUNT = DEFAULT_NODES[-1].shards_end
+DEFAULT_NODES = AVAILABLE_NODES[:4]
+DEFAULT_LAYER_COUNT = 28
 
 DEFAULT_PROMPTS = [
     "Write a poem about the blue sky.",
@@ -418,11 +420,11 @@ def ask_node(client: PipelineDebugClient, prompt: str = "Choose owner node") -> 
 
 
 def build_even_split_nodes(node_count: int) -> list[PipelineNodeSpec]:
-    if node_count < 1 or node_count > len(DEFAULT_NODES):
-        raise ValueError(f"[ERROR] node_count must be in [1, {len(DEFAULT_NODES)}].")
+    if node_count < 1 or node_count > len(AVAILABLE_NODES):
+        raise ValueError(f"[ERROR] node_count must be in [1, {len(AVAILABLE_NODES)}].")
 
     nodes: list[PipelineNodeSpec] = []
-    for index, base_node in enumerate(DEFAULT_NODES[:node_count]):
+    for index, base_node in enumerate(AVAILABLE_NODES[:node_count]):
         start = (DEFAULT_LAYER_COUNT * index) // node_count
         end = (DEFAULT_LAYER_COUNT * (index + 1)) // node_count
         nodes.append(
@@ -2331,7 +2333,11 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         "  3. 4 nodes, 3 simultaneous requests, max_new_tokens=2\n"
         "  4. 4 nodes, 4 simultaneous requests, max_new_tokens=2\n"
         "  5. 3 nodes, 4 simultaneous requests, max_new_tokens=2\n"
-        "  6. run all scenarios\n"
+        "  6. 5 nodes, 4 simultaneous requests, max_new_tokens=2\n"
+        "  7. 5 nodes, 5 simultaneous requests, max_new_tokens=2\n"
+        "  8. 5 nodes, 6 simultaneous requests, max_new_tokens=2\n"
+        "  9. run scenarios 6, 7, and 8\n"
+        "  10. run all scenarios\n"
     )
     choice = input("Experiment: ").strip()
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
@@ -2363,6 +2369,28 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         )
     elif choice == "6":
         run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 4, prompt, timeout_s, config_settle_s
+        )
+    elif choice == "7":
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 5, prompt, timeout_s, config_settle_s
+        )
+    elif choice == "8":
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 6, prompt, timeout_s, config_settle_s
+        )
+    elif choice == "9":
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 4, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 5, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 6, prompt, timeout_s, config_settle_s
+        )
+    elif choice == "10":
+        run_two_round_pipeline_latency_scenario(
             client, result_dir, 3, 3, prompt, timeout_s, config_settle_s
         )
         run_two_round_pipeline_latency_scenario(
@@ -2376,6 +2404,15 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         )
         run_two_round_pipeline_latency_scenario(
             client, result_dir, 3, 4, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 4, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 5, prompt, timeout_s, config_settle_s
+        )
+        run_two_round_pipeline_latency_scenario(
+            client, result_dir, 5, 6, prompt, timeout_s, config_settle_s
         )
     else:
         print("Unknown experiment.")

@@ -186,6 +186,9 @@ done report 的总时延。
 先构造足够长的文本，tokenize 后直接截取固定长度的 `input_ids`；不同 request 使用不同顺序的
 fragment，因此内容不同，但输入 token length 由截断后的 `input_ids` 保证一致。结果文件名前缀为
 `<node_count>node_<request_count>request_distinct_same_len<input_token_length>_2round`。
+另一个自定义测试项使用和固定子场景 1~8 相同的请求内容构造方式：所有 request 发送同一个 prompt，
+但节点数可输入 3~5，请求数可输入 2~7。结果文件名前缀为
+`<node_count>node_<request_count>request_same_prompt_custom_2round`。
 
 ## 调试建议
 

@@ -2482,6 +2482,38 @@ def run_two_round_distinct_same_length_custom_scenario(
     )
 
 
+def run_two_round_same_prompt_custom_scenario(
+    client: PipelineDebugClient,
+    result_dir: Path,
+) -> None:
+    print(
+        "\n[TEST] Custom two-round latency with identical request content\n"
+        "This scenario uses the same prompt for every request, matching scenarios 1-8, "
+        "but lets you choose node_count and request_count interactively.\n"
+    )
+    node_count = ask_int("Node count", 3, minimum=3, maximum=5)
+    request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
+    prompt = ask_prompt(DEFAULT_PROMPTS[4])
+    timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
+    config_settle_s = float(
+        input("Config settle seconds after topology config [30]: ").strip() or "30"
+    )
+    ask_telemetry(client)
+
+    prefix = f"{node_count}node_{request_count}request_same_prompt_custom_2round"
+    run_two_round_pipeline_latency_scenario(
+        client=client,
+        result_dir=result_dir,
+        node_count=node_count,
+        request_count=request_count,
+        prompt=prompt,
+        timeout_s=timeout_s,
+        config_settle_s=config_settle_s,
+        prefix=prefix,
+        experiment_name="two_round_same_prompt_custom_latency",
+    )
+
+
 def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> None:
     result_dir = make_result_dir()
     print(
@@ -2497,10 +2529,15 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         "  9. run scenarios 6, 7, and 8\n"
         "  10. run all scenarios\n"
         "  11. custom nodes/requests with different requests but equal input token length\n"
+        "  12. custom nodes/requests with identical request content\n"
     )
     choice = input("Experiment: ").strip()
     if choice == "11":
         run_two_round_distinct_same_length_custom_scenario(client, result_dir)
+        print(f"[TEST] results directory: {result_dir}")
+        return
+    if choice == "12":
+        run_two_round_same_prompt_custom_scenario(client, result_dir)
         print(f"[TEST] results directory: {result_dir}")
         return
 

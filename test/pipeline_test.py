@@ -46,6 +46,16 @@ PROMPT_FRAGMENT = (
     "Distributed inference splits a language model across multiple edge devices so "
     "that each device processes part of the network while cooperating with the others. "
 )
+DISTINCT_PROMPT_FRAGMENTS = [
+    "Dense routing sends hidden states across pipeline stages while preserving request order. ",
+    "Careful scheduling admits active requests first and leaves extra work in a pending queue. ",
+    "Memory telemetry records cache tensors, CUDA allocation deltas, and shard timing reports. ",
+    "Network links move intermediate activations between devices before the next layer runs. ",
+    "Owner nodes keep generated token history and return decode inputs to the first stage. ",
+    "Layer shards compute transformer blocks in sequence without changing model semantics. ",
+    "Warm-up requests stabilize kernels, caches, and communication sockets before measurement. ",
+    "Controller scripts collect acknowledgements, forward reports, and completion timestamps. ",
+]
 
 
 @dataclass
@@ -303,6 +313,7 @@ class PipelineDebugClient:
         owner_index: int,
         prompts: list[str],
         max_new_tokens: int,
+        input_ids_list: list[torch.Tensor] | None = None,
         trace_forward_measurement: bool = False,
         telemetry_only: bool = False,
         trace_label_prefix: str = "burst",
@@ -310,12 +321,19 @@ class PipelineDebugClient:
         """Send several requests as one batch so the owner enqueues them in one loop turn."""
 
         owner = self.nodes[owner_index]
+        if input_ids_list is not None and len(input_ids_list) != len(prompts):
+            raise ValueError("[ERROR] input_ids_list length must match prompts length.")
         payloads: list[tuple[str, dict]] = []
         for index, prompt in enumerate(prompts, start=1):
             payloads.append(
                 self._build_user_request_payload(
                     prompt=prompt,
                     max_new_tokens=max_new_tokens,
+                    input_ids=(
+                        input_ids_list[index - 1]
+                        if input_ids_list is not None
+                        else None
+                    ),
                     trace_forward_measurement=trace_forward_measurement,
                     telemetry_only=telemetry_only,
                     trace_label=f"{trace_label_prefix}_request{index}",
@@ -405,13 +423,22 @@ def ask_int_list(prompt: str, default: list[int]) -> list[int]:
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
 
-def ask_int(prompt: str, default: int, minimum: int | None = None) -> int:
+def ask_int(
+    prompt: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
     while True:
         raw = input(f"{prompt} [{default}]: ").strip()
         value = default if not raw else int(raw)
-        if minimum is None or value >= minimum:
-            return value
-        print(f"Value must be >= {minimum}.")
+        if minimum is not None and value < minimum:
+            print(f"Value must be >= {minimum}.")
+            continue
+        if maximum is not None and value > maximum:
+            print(f"Value must be <= {maximum}.")
+            continue
+        return value
 
 
 def ask_node(client: PipelineDebugClient, prompt: str = "Choose owner node") -> int:
@@ -872,6 +899,49 @@ def build_input_ids_for_lengths(tokenizer, token_lengths: list[int]) -> dict[int
         token_length: long_input_ids[:, :token_length].clone()
         for token_length in token_lengths
     }
+
+
+def build_distinct_input_ids_for_same_length(
+    tokenizer,
+    token_length: int,
+    request_count: int,
+) -> list[torch.Tensor]:
+    """
+    Profiler-style equal-length prompt construction for different requests.
+
+    This mirrors the profiler path: build text long enough for the target,
+    tokenize it, then slice exact-length input ids. The only addition is that
+    each request starts from a different fragment order, so token length is
+    identical while the token-id sequence is different.
+    """
+
+    if token_length < 8:
+        raise ValueError(
+            "[ERROR] token_length must be at least 8 for distinct same-length prompts."
+        )
+    if request_count < 1:
+        raise ValueError("[ERROR] request_count must be positive.")
+
+    input_ids_list: list[torch.Tensor] = []
+    for request_index in range(request_count):
+        text = ""
+        fragment_index = request_index
+        while len(tokenizer(text, return_tensors="pt")["input_ids"][0]) < token_length:
+            text += DISTINCT_PROMPT_FRAGMENTS[
+                fragment_index % len(DISTINCT_PROMPT_FRAGMENTS)
+            ]
+            fragment_index += 1
+        input_ids = tokenizer(text, return_tensors="pt")["input_ids"][
+            :, :token_length
+        ].clone()
+        input_ids_list.append(input_ids)
+
+    unique_sequences = {tuple(input_ids[0].tolist()) for input_ids in input_ids_list}
+    if len(unique_sequences) != request_count:
+        raise RuntimeError(
+            "[ERROR] generated duplicate input_ids; increase token_length or adjust fragments."
+        )
+    return input_ids_list
 
 
 def aggregate_reports(reports_by_node: dict[str, dict]) -> dict:
@@ -1948,11 +2018,15 @@ def wait_for_warmup_batch(
     max_new_tokens: int,
     timeout_s: float,
     trace_label_prefix: str,
+    prompts: list[str] | None = None,
+    input_ids_list: list[torch.Tensor] | None = None,
 ) -> None:
+    warmup_prompts = prompts if prompts is not None else [prompt] * request_count
     warmup_client_ids = client.submit_burst_requests(
         owner_index=owner_index,
-        prompts=[prompt] * request_count,
+        prompts=warmup_prompts,
         max_new_tokens=max_new_tokens,
+        input_ids_list=input_ids_list,
         telemetry_only=True,
         trace_label_prefix=trace_label_prefix,
     )
@@ -2151,13 +2225,27 @@ def run_two_round_pipeline_latency_scenario(
     prompt: str,
     timeout_s: float,
     config_settle_s: float,
+    prompts: list[str] | None = None,
+    input_ids_list: list[torch.Tensor] | None = None,
+    prefix: str | None = None,
+    experiment_name: str = "two_round_pipeline_latency",
 ) -> None:
     max_new_tokens = 2
     expected_phase_steps = [
         ("prefill", 0),
         ("decode", 1),
     ]
-    prefix = f"{node_count}node_{request_count}request_2round"
+    prefix = prefix or f"{node_count}node_{request_count}request_2round"
+    request_prompts = prompts if prompts is not None else [prompt] * request_count
+    if len(request_prompts) != request_count:
+        raise ValueError("[ERROR] prompts length must match request_count.")
+    if input_ids_list is not None and len(input_ids_list) != request_count:
+        raise ValueError("[ERROR] input_ids_list length must match request_count.")
+    target_input_lengths = (
+        [int(input_ids.shape[-1]) for input_ids in input_ids_list]
+        if input_ids_list is not None
+        else [None] * request_count
+    )
 
     print(
         f"\n[TEST] {node_count} nodes, {request_count} simultaneous requests, max_new_tokens=2"
@@ -2178,6 +2266,8 @@ def run_two_round_pipeline_latency_scenario(
         max_new_tokens=max_new_tokens,
         timeout_s=timeout_s,
         trace_label_prefix=f"{prefix}_warmup",
+        prompts=request_prompts,
+        input_ids_list=input_ids_list,
     )
     print("[TEST] waiting 2 seconds after warm-up for runtime state to settle...")
     time.sleep(2.0)
@@ -2186,8 +2276,9 @@ def run_two_round_pipeline_latency_scenario(
     process_started_perf = time.perf_counter()
     client_request_ids = client.submit_burst_requests(
         owner_index=0,
-        prompts=[prompt] * request_count,
+        prompts=request_prompts,
         max_new_tokens=max_new_tokens,
+        input_ids_list=input_ids_list,
         trace_forward_measurement=True,
         trace_label_prefix=prefix,
     )
@@ -2209,6 +2300,15 @@ def run_two_round_pipeline_latency_scenario(
         client_request_id: ack.get("request_id")
         for client_request_id, ack in ack_by_client_id.items()
     }
+    actual_input_lengths = [
+        ack_by_client_id.get(client_request_id, {}).get("input_token_length")
+        for client_request_id in client_request_ids
+    ]
+    if input_ids_list is not None and actual_input_lengths != target_input_lengths:
+        print(
+            "[WARNING] owner-reported input token lengths do not match targets: "
+            f"target={target_input_lengths}, actual={actual_input_lengths}"
+        )
 
     request_order_by_client_id = {
         client_request_id: index
@@ -2222,14 +2322,15 @@ def run_two_round_pipeline_latency_scenario(
         client_request_id = str(report.get("client_request_id"))
         phase = str(report.get("phase"))
         step = int(report.get("step") or 0)
+        request_order = request_order_by_client_id[client_request_id]
         forward_rows.append(
             {
-                "experiment": "two_round_pipeline_latency",
+                "experiment": experiment_name,
                 "topology_node_count": node_count,
                 "request_count": request_count,
                 "max_active_requests": client.max_active_requests,
                 "max_new_tokens": max_new_tokens,
-                "request_order": request_order_by_client_id[client_request_id],
+                "request_order": request_order,
                 "client_request_id": client_request_id,
                 "request_id": request_id_by_client_id.get(client_request_id),
                 "node_id": report.get("node_id"),
@@ -2242,6 +2343,7 @@ def run_two_round_pipeline_latency_scenario(
                 "input_token_length": ack_by_client_id.get(client_request_id, {}).get(
                     "input_token_length"
                 ),
+                "target_input_token_length": target_input_lengths[request_order - 1],
                 "started_timestamp": report.get("started_timestamp"),
                 "finished_timestamp": report.get("finished_timestamp"),
                 "forward_elapsed_ms": report.get("forward_elapsed_ms"),
@@ -2261,16 +2363,21 @@ def run_two_round_pipeline_latency_scenario(
     done_rows: list[dict] = []
     for done_report in done_reports:
         client_request_id = str(done_report.get("client_request_id"))
+        request_order = request_order_by_client_id[client_request_id]
         done_rows.append(
             {
-                "experiment": "two_round_pipeline_latency",
+                "experiment": experiment_name,
                 "topology_node_count": node_count,
                 "request_count": request_count,
                 "max_active_requests": client.max_active_requests,
                 "max_new_tokens": max_new_tokens,
-                "request_order": request_order_by_client_id[client_request_id],
+                "request_order": request_order,
                 "client_request_id": client_request_id,
                 "request_id": request_id_by_client_id.get(client_request_id),
+                "target_input_token_length": target_input_lengths[request_order - 1],
+                "input_token_length": ack_by_client_id.get(client_request_id, {}).get(
+                    "input_token_length"
+                ),
                 "reason": done_report.get("reason"),
                 "output_token_count": done_report.get("output_token_count"),
                 "done_received_elapsed_ms": done_report.get(
@@ -2289,11 +2396,13 @@ def run_two_round_pipeline_latency_scenario(
     )
     summary_rows = [
         {
-            "experiment": "two_round_pipeline_latency",
+            "experiment": experiment_name,
             "topology_node_count": node_count,
             "request_count": request_count,
             "max_active_requests": client.max_active_requests,
             "max_new_tokens": max_new_tokens,
+            "target_input_token_lengths": repr(target_input_lengths),
+            "actual_input_token_lengths": repr(actual_input_lengths),
             "expected_forward_report_count": expected_report_count,
             "collected_forward_report_count": len(forward_rows),
             "ack_report_count": len(ack_by_client_id),
@@ -2324,6 +2433,55 @@ def run_two_round_pipeline_latency_scenario(
     )
 
 
+def run_two_round_distinct_same_length_custom_scenario(
+    client: PipelineDebugClient,
+    result_dir: Path,
+) -> None:
+    print(
+        "\n[TEST] Custom two-round latency with different requests but equal input token length\n"
+        "This scenario builds each request with the profiler-style method: construct "
+        "a long text, tokenize it, then slice exact-length input ids. Each request "
+        "uses a different fragment order, so the token ids differ while length stays equal.\n"
+    )
+    node_count = ask_int("Node count", 3, minimum=3, maximum=5)
+    request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
+    input_token_length = ask_int("Input token length for every request", 64, minimum=8)
+    timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
+    config_settle_s = float(
+        input("Config settle seconds after topology config [30]: ").strip() or "30"
+    )
+    ask_telemetry(client)
+
+    tokenizer = load_tokenizer()
+    input_ids_list = build_distinct_input_ids_for_same_length(
+        tokenizer=tokenizer,
+        token_length=input_token_length,
+        request_count=request_count,
+    )
+    prompts = [""] * request_count
+    prefix = (
+        f"{node_count}node_{request_count}request_"
+        f"distinct_same_len{input_token_length}_2round"
+    )
+    print(
+        f"[TEST] generated {request_count} distinct input_id sequences; "
+        f"target_input_token_length={input_token_length}."
+    )
+    run_two_round_pipeline_latency_scenario(
+        client=client,
+        result_dir=result_dir,
+        node_count=node_count,
+        request_count=request_count,
+        prompt="",
+        timeout_s=timeout_s,
+        config_settle_s=config_settle_s,
+        prompts=prompts,
+        input_ids_list=input_ids_list,
+        prefix=prefix,
+        experiment_name="two_round_distinct_same_length_latency",
+    )
+
+
 def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> None:
     result_dir = make_result_dir()
     print(
@@ -2338,8 +2496,14 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         "  8. 5 nodes, 6 simultaneous requests, max_new_tokens=2\n"
         "  9. run scenarios 6, 7, and 8\n"
         "  10. run all scenarios\n"
+        "  11. custom nodes/requests with different requests but equal input token length\n"
     )
     choice = input("Experiment: ").strip()
+    if choice == "11":
+        run_two_round_distinct_same_length_custom_scenario(client, result_dir)
+        print(f"[TEST] results directory: {result_dir}")
+        return
+
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
     timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
     config_settle_s = float(

@@ -181,6 +181,12 @@ prefill forward 耗时、DynamicCache 增量和
 `summary.csv`；summary 中的 `total_process_elapsed_ms` 是从测试脚本发出 batch 到收到所有
 done report 的总时延。
 
+该菜单还提供一个自定义等长不同内容测试项：节点数可输入 3~5，请求数可输入 2~7，
+每个请求仍为 `max_new_tokens=2`。该测试参考 `utils/node_profiler.py` 的 prompt 构造方式：
+先构造足够长的文本，tokenize 后直接截取固定长度的 `input_ids`；不同 request 使用不同顺序的
+fragment，因此内容不同，但输入 token length 由截断后的 `input_ids` 保证一致。结果文件名前缀为
+`<node_count>node_<request_count>request_distinct_same_len<input_token_length>_2round`。
+
 ## 调试建议
 
 * 如果消息没有继续向下游走，先检查每个节点的 `node_addr` 是否是可连接地址。

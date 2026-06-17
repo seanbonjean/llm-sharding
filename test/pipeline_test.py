@@ -2480,7 +2480,7 @@ def run_two_round_distinct_same_length_custom_scenario(
         "a long text, tokenize it, then slice exact-length input ids. Each request "
         "uses a different fragment order, so the token ids differ while length stays equal.\n"
     )
-    node_count = ask_int("Node count", 3, minimum=3, maximum=5)
+    node_count = ask_int("Node count", 2, minimum=2, maximum=5)
     request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
     input_token_length = ask_int("Input token length for every request", 64, minimum=8)
     max_new_tokens = (
@@ -2540,7 +2540,7 @@ def run_two_round_same_prompt_custom_scenario(
         "This scenario uses the same prompt for every request, matching scenarios 1-8, "
         "but lets you choose node_count and request_count interactively.\n"
     )
-    node_count = ask_int("Node count", 3, minimum=3, maximum=5)
+    node_count = ask_int("Node count", 2, minimum=2, maximum=5)
     request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
     max_new_tokens = (

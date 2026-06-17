@@ -189,6 +189,10 @@ fragment，因此内容不同，但输入 token length 由截断后的 `input_id
 另一个自定义测试项使用和固定子场景 1~8 相同的请求内容构造方式：所有 request 发送同一个 prompt，
 但节点数可输入 3~5，请求数可输入 2~7。结果文件名前缀为
 `<node_count>node_<request_count>request_same_prompt_custom_2round`。
+另外还有两个对应的可变输出长度测试项：一个沿用“不同内容但等长 input_ids”的构造方式，
+另一个沿用“相同 prompt”的构造方式；二者都可额外输入 `max_new_tokens`。当 `max_new_tokens`
+不是 2 时，结果文件名前缀会使用 `maxnew<max_new_tokens>`，并且 forward report 会按
+`prefill step=0` 加 `decode step=1..max_new_tokens-1` 收集。
 
 ## 调试建议
 

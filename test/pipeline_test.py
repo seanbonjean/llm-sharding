@@ -2225,17 +2225,23 @@ def run_two_round_pipeline_latency_scenario(
     prompt: str,
     timeout_s: float,
     config_settle_s: float,
+    max_new_tokens: int = 2,
     prompts: list[str] | None = None,
     input_ids_list: list[torch.Tensor] | None = None,
     prefix: str | None = None,
     experiment_name: str = "two_round_pipeline_latency",
 ) -> None:
-    max_new_tokens = 2
-    expected_phase_steps = [
-        ("prefill", 0),
-        ("decode", 1),
+    if max_new_tokens < 1:
+        raise ValueError("[ERROR] max_new_tokens must be >= 1.")
+    expected_phase_steps = [("prefill", 0)] + [
+        ("decode", step) for step in range(1, max_new_tokens)
     ]
-    prefix = prefix or f"{node_count}node_{request_count}request_2round"
+    if prefix is None:
+        prefix = (
+            f"{node_count}node_{request_count}request_2round"
+            if max_new_tokens == 2
+            else f"{node_count}node_{request_count}request_maxnew{max_new_tokens}"
+        )
     request_prompts = prompts if prompts is not None else [prompt] * request_count
     if len(request_prompts) != request_count:
         raise ValueError("[ERROR] prompts length must match request_count.")
@@ -2248,7 +2254,8 @@ def run_two_round_pipeline_latency_scenario(
     )
 
     print(
-        f"\n[TEST] {node_count} nodes, {request_count} simultaneous requests, max_new_tokens=2"
+        f"\n[TEST] {node_count} nodes, {request_count} simultaneous requests, "
+        f"max_new_tokens={max_new_tokens}"
     )
     configure_even_split_topology(client, node_count)
     print(
@@ -2436,6 +2443,7 @@ def run_two_round_pipeline_latency_scenario(
 def run_two_round_distinct_same_length_custom_scenario(
     client: PipelineDebugClient,
     result_dir: Path,
+    custom_max_new_tokens: bool = False,
 ) -> None:
     print(
         "\n[TEST] Custom two-round latency with different requests but equal input token length\n"
@@ -2446,6 +2454,11 @@ def run_two_round_distinct_same_length_custom_scenario(
     node_count = ask_int("Node count", 3, minimum=3, maximum=5)
     request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
     input_token_length = ask_int("Input token length for every request", 64, minimum=8)
+    max_new_tokens = (
+        ask_int("max_new_tokens", 2, minimum=1)
+        if custom_max_new_tokens
+        else 2
+    )
     timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
     config_settle_s = float(
         input("Config settle seconds after topology config [30]: ").strip() or "30"
@@ -2461,7 +2474,8 @@ def run_two_round_distinct_same_length_custom_scenario(
     prompts = [""] * request_count
     prefix = (
         f"{node_count}node_{request_count}request_"
-        f"distinct_same_len{input_token_length}_2round"
+        f"distinct_same_len{input_token_length}_"
+        f"{'2round' if max_new_tokens == 2 else f'maxnew{max_new_tokens}'}"
     )
     print(
         f"[TEST] generated {request_count} distinct input_id sequences; "
@@ -2475,16 +2489,22 @@ def run_two_round_distinct_same_length_custom_scenario(
         prompt="",
         timeout_s=timeout_s,
         config_settle_s=config_settle_s,
+        max_new_tokens=max_new_tokens,
         prompts=prompts,
         input_ids_list=input_ids_list,
         prefix=prefix,
-        experiment_name="two_round_distinct_same_length_latency",
+        experiment_name=(
+            "two_round_distinct_same_length_latency"
+            if max_new_tokens == 2
+            else "custom_new_tokens_distinct_same_length_latency"
+        ),
     )
 
 
 def run_two_round_same_prompt_custom_scenario(
     client: PipelineDebugClient,
     result_dir: Path,
+    custom_max_new_tokens: bool = False,
 ) -> None:
     print(
         "\n[TEST] Custom two-round latency with identical request content\n"
@@ -2494,13 +2514,21 @@ def run_two_round_same_prompt_custom_scenario(
     node_count = ask_int("Node count", 3, minimum=3, maximum=5)
     request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
+    max_new_tokens = (
+        ask_int("max_new_tokens", 2, minimum=1)
+        if custom_max_new_tokens
+        else 2
+    )
     timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
     config_settle_s = float(
         input("Config settle seconds after topology config [30]: ").strip() or "30"
     )
     ask_telemetry(client)
 
-    prefix = f"{node_count}node_{request_count}request_same_prompt_custom_2round"
+    prefix = (
+        f"{node_count}node_{request_count}request_same_prompt_custom_"
+        f"{'2round' if max_new_tokens == 2 else f'maxnew{max_new_tokens}'}"
+    )
     run_two_round_pipeline_latency_scenario(
         client=client,
         result_dir=result_dir,
@@ -2509,8 +2537,13 @@ def run_two_round_same_prompt_custom_scenario(
         prompt=prompt,
         timeout_s=timeout_s,
         config_settle_s=config_settle_s,
+        max_new_tokens=max_new_tokens,
         prefix=prefix,
-        experiment_name="two_round_same_prompt_custom_latency",
+        experiment_name=(
+            "two_round_same_prompt_custom_latency"
+            if max_new_tokens == 2
+            else "custom_new_tokens_same_prompt_latency"
+        ),
     )
 
 
@@ -2530,6 +2563,8 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         "  10. run all scenarios\n"
         "  11. custom nodes/requests with different requests but equal input token length\n"
         "  12. custom nodes/requests with identical request content\n"
+        "  13. custom different requests with equal input token length and custom max_new_tokens\n"
+        "  14. custom identical requests with custom max_new_tokens\n"
     )
     choice = input("Experiment: ").strip()
     if choice == "11":
@@ -2538,6 +2573,18 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         return
     if choice == "12":
         run_two_round_same_prompt_custom_scenario(client, result_dir)
+        print(f"[TEST] results directory: {result_dir}")
+        return
+    if choice == "13":
+        run_two_round_distinct_same_length_custom_scenario(
+            client, result_dir, custom_max_new_tokens=True
+        )
+        print(f"[TEST] results directory: {result_dir}")
+        return
+    if choice == "14":
+        run_two_round_same_prompt_custom_scenario(
+            client, result_dir, custom_max_new_tokens=True
+        )
         print(f"[TEST] results directory: {result_dir}")
         return
 

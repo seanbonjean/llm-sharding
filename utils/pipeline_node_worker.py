@@ -48,6 +48,7 @@ class PipelineProtocol:
         "trace_kv_cache",
         "trace_forward_measurement",
         "trace_label",
+        "ignore_eos_for_measurement",
     )
 
     PHASE_PREFILL = "prefill"
@@ -417,6 +418,9 @@ class PipelineSession:
     input_token_length: int | None = None
     max_new_tokens: int = 1024
     finished: bool = False
+    ignore_eos_for_measurement: bool = False
+    eos_seen: bool = False
+    first_eos_step: int | None = None
     cuda_memory_baseline_bytes: int | None = None
 
 
@@ -936,11 +940,16 @@ class PipelineNodeWorker:
             )
 
         request_id = self._new_request_id()
+        ignore_eos_for_measurement = bool(
+            request_metadata
+            and request_metadata.get("ignore_eos_for_measurement", False)
+        )
         session = PipelineSession(
             request_id=request_id,
             generated_ids=[input_ids],
             input_token_length=input_ids.shape[1],
             max_new_tokens=max_new_tokens,
+            ignore_eos_for_measurement=ignore_eos_for_measurement,
         )
         self.sessions[request_id] = session
 
@@ -1109,11 +1118,17 @@ class PipelineNodeWorker:
         reached_eos = self.tokenizer.eos_token_id is not None and token_id == int(
             self.tokenizer.eos_token_id
         )
+        if reached_eos:
+            session.eos_seen = True
+            if session.first_eos_step is None:
+                session.first_eos_step = output_token_count
         reached_max_new_tokens = output_token_count >= session.max_new_tokens
 
-        if reached_eos or reached_max_new_tokens:
+        should_stop_on_eos = reached_eos and not session.ignore_eos_for_measurement
+
+        if should_stop_on_eos or reached_max_new_tokens:
             session.finished = True
-            reason = "eos" if reached_eos else "max_new_tokens"
+            reason = "eos" if should_stop_on_eos else "max_new_tokens"
             print()
             final_ids = torch.cat(session.generated_ids, dim=-1)
             print(
@@ -1122,7 +1137,18 @@ class PipelineNodeWorker:
             print(
                 f"[REQUEST] request_id={request_id} output token number: {output_token_count}"
             )
-            return PipelineProtocol.build_done(message, reason, output_token_count)
+            done_message = PipelineProtocol.build_done(message, reason, output_token_count)
+            done_message.update(
+                {
+                    "ignore_eos_for_measurement": session.ignore_eos_for_measurement,
+                    "eos_seen": session.eos_seen,
+                    "first_eos_step": session.first_eos_step,
+                    "semantic_output_valid": not (
+                        session.ignore_eos_for_measurement and session.eos_seen
+                    ),
+                }
+            )
+            return done_message
 
         session.step = output_token_count
         trace_forward_measurement = bool(
@@ -1634,6 +1660,11 @@ class PipelineNodeController:
                     "input_token_length": (
                         session.input_token_length if session is not None else None
                     ),
+                    "ignore_eos_for_measurement": (
+                        session.ignore_eos_for_measurement
+                        if session is not None
+                        else False
+                    ),
                     "timestamp": time.time(),
                 },
             )
@@ -1801,6 +1832,12 @@ class PipelineNodeController:
                 "trace_label": message.get("trace_label"),
                 "reason": message.get("reason"),
                 "output_token_count": message.get("output_token_count"),
+                "ignore_eos_for_measurement": message.get(
+                    "ignore_eos_for_measurement", False
+                ),
+                "eos_seen": message.get("eos_seen", False),
+                "first_eos_step": message.get("first_eos_step"),
+                "semantic_output_valid": message.get("semantic_output_valid", True),
                 "node_id": self.node_worker.node_id,
                 "node_addr": self.node_worker.node_addr,
                 "timestamp": time.time(),

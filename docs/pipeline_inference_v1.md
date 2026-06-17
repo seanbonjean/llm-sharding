@@ -193,6 +193,11 @@ fragment，因此内容不同，但输入 token length 由截断后的 `input_id
 另一个沿用“相同 prompt”的构造方式；二者都可额外输入 `max_new_tokens`。当 `max_new_tokens`
 不是 2 时，结果文件名前缀会使用 `maxnew<max_new_tokens>`，并且 forward report 会按
 `prefill step=0` 加 `decode step=1..max_new_tokens-1` 收集。
+为保证这些 latency 场景的 decode 轮数固定，menu 7 发出的测量请求会带
+`ignore_eos_for_measurement=True`：如果生成过程中出现 EOS，owner 会记录 `eos_seen` 和
+`first_eos_step`，但仍继续 decode 到 `max_new_tokens`。这种情况下 CSV 中
+`semantic_output_valid=False`，表示生成文本不应再用于语义分析，但 forward latency/KV cache
+测量仍可使用。
 
 ## 调试建议
 

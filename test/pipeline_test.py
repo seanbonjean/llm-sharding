@@ -156,6 +156,7 @@ class PipelineDebugClient:
         trace_forward_measurement: bool = False,
         telemetry_only: bool = False,
         trace_label: str = "",
+        ignore_eos_for_measurement: bool = False,
     ) -> tuple[str, dict]:
         client_request_id = self._new_client_request_id()
         payload = {
@@ -164,6 +165,8 @@ class PipelineDebugClient:
             "max_new_tokens": max_new_tokens,
             "client_request_id": client_request_id,
         }
+        if ignore_eos_for_measurement:
+            payload["ignore_eos_for_measurement"] = True
         if input_ids is not None:
             payload["input_ids"] = input_ids.cpu()
         if trace_kv_cache or trace_forward_measurement or telemetry_only:
@@ -317,6 +320,7 @@ class PipelineDebugClient:
         trace_forward_measurement: bool = False,
         telemetry_only: bool = False,
         trace_label_prefix: str = "burst",
+        ignore_eos_for_measurement: bool = False,
     ) -> list[str]:
         """Send several requests as one batch so the owner enqueues them in one loop turn."""
 
@@ -337,6 +341,7 @@ class PipelineDebugClient:
                     trace_forward_measurement=trace_forward_measurement,
                     telemetry_only=telemetry_only,
                     trace_label=f"{trace_label_prefix}_request{index}",
+                    ignore_eos_for_measurement=ignore_eos_for_measurement,
                 )
             )
         socket = self._data_socket(owner.node_addr)
@@ -2020,6 +2025,7 @@ def wait_for_warmup_batch(
     trace_label_prefix: str,
     prompts: list[str] | None = None,
     input_ids_list: list[torch.Tensor] | None = None,
+    ignore_eos_for_measurement: bool = False,
 ) -> None:
     warmup_prompts = prompts if prompts is not None else [prompt] * request_count
     warmup_client_ids = client.submit_burst_requests(
@@ -2029,6 +2035,7 @@ def wait_for_warmup_batch(
         input_ids_list=input_ids_list,
         telemetry_only=True,
         trace_label_prefix=trace_label_prefix,
+        ignore_eos_for_measurement=ignore_eos_for_measurement,
     )
     for warmup_client_id in warmup_client_ids:
         client.wait_for_ack(warmup_client_id, timeout_s=timeout_s)
@@ -2226,6 +2233,7 @@ def run_two_round_pipeline_latency_scenario(
     timeout_s: float,
     config_settle_s: float,
     max_new_tokens: int = 2,
+    ignore_eos_for_measurement: bool = True,
     prompts: list[str] | None = None,
     input_ids_list: list[torch.Tensor] | None = None,
     prefix: str | None = None,
@@ -2275,6 +2283,7 @@ def run_two_round_pipeline_latency_scenario(
         trace_label_prefix=f"{prefix}_warmup",
         prompts=request_prompts,
         input_ids_list=input_ids_list,
+        ignore_eos_for_measurement=ignore_eos_for_measurement,
     )
     print("[TEST] waiting 2 seconds after warm-up for runtime state to settle...")
     time.sleep(2.0)
@@ -2288,6 +2297,7 @@ def run_two_round_pipeline_latency_scenario(
         input_ids_list=input_ids_list,
         trace_forward_measurement=True,
         trace_label_prefix=prefix,
+        ignore_eos_for_measurement=ignore_eos_for_measurement,
     )
     (
         reports,
@@ -2387,6 +2397,12 @@ def run_two_round_pipeline_latency_scenario(
                 ),
                 "reason": done_report.get("reason"),
                 "output_token_count": done_report.get("output_token_count"),
+                "ignore_eos_for_measurement": done_report.get(
+                    "ignore_eos_for_measurement"
+                ),
+                "eos_seen": done_report.get("eos_seen"),
+                "first_eos_step": done_report.get("first_eos_step"),
+                "semantic_output_valid": done_report.get("semantic_output_valid"),
                 "done_received_elapsed_ms": done_report.get(
                     "done_received_elapsed_ms"
                 ),
@@ -2398,6 +2414,8 @@ def run_two_round_pipeline_latency_scenario(
         if done_rows and not missing_done
         else None
     )
+    eos_seen_values = [row.get("eos_seen") for row in done_rows]
+    first_eos_steps = [row.get("first_eos_step") for row in done_rows]
     expected_report_count = (
         request_count * node_count * len(expected_phase_steps)
     )
@@ -2408,6 +2426,12 @@ def run_two_round_pipeline_latency_scenario(
             "request_count": request_count,
             "max_active_requests": client.max_active_requests,
             "max_new_tokens": max_new_tokens,
+            "ignore_eos_for_measurement": ignore_eos_for_measurement,
+            "any_eos_seen": any(bool(value) for value in eos_seen_values),
+            "first_eos_steps": repr(first_eos_steps),
+            "all_semantic_outputs_valid": all(
+                bool(row.get("semantic_output_valid", True)) for row in done_rows
+            ),
             "target_input_token_lengths": repr(target_input_lengths),
             "actual_input_token_lengths": repr(actual_input_lengths),
             "expected_forward_report_count": expected_report_count,
@@ -2434,6 +2458,11 @@ def run_two_round_pipeline_latency_scenario(
         print(f"[WARNING] missing forward reports for {node_count}-node scenario: {missing_reports}")
     if missing_done:
         print(f"[WARNING] missing done reports for {node_count}-node scenario: {missing_done}")
+    if any(bool(value) for value in eos_seen_values):
+        print(
+            "[WARNING] EOS was generated during this measurement; "
+            "ignore_eos_for_measurement kept decoding until max_new_tokens."
+        )
     print(
         f"[TEST] {node_count}-node scenario total elapsed: "
         f"{total_elapsed_ms if total_elapsed_ms is not None else 'N/A'} ms"

@@ -177,9 +177,12 @@ prefill forward 耗时、DynamicCache 增量和
 5 节点 4 请求、5 节点 5 请求和 5 节点 6 请求；
 每个请求 `max_new_tokens=2`。`max_active_requests` 等于节点数，因此 2 节点 3 请求场景中
 第 3 个请求应进入 pending queue，5 节点 6 请求场景中第 6 个请求也应进入 pending queue。结果会输出
-`<node_count>node_<request_count>request_2round_forward_reports.csv`、`done_reports.csv` 和
-`summary.csv`；summary 中的 `total_process_elapsed_ms` 是从测试脚本发出 batch 到收到所有
-done report 的总时延。
+`<node_count>node_<request_count>request_2round_forward_reports.csv`、`done_reports.csv`、
+`critical_path_forward_rows.csv` 和 `summary.json`；summary 中的 `total_complete_time`
+是从测试脚本发出 batch 到收到所有 done report 的总时延，`inference_time` 是由
+forward report DAG critical path 累加得到的推理关键路径时延，`communication_and_noncompute_time`
+是二者差值。测试还会输出 latency breakdown 饼图，以及各 request 的
+`done_received_elapsed_ms` 横向条形图。
 
 该菜单还提供一个自定义等长不同内容测试项：节点数可输入 2~5，请求数可输入 2~7，
 每个请求仍为 `max_new_tokens=2`。该测试参考 `utils/node_profiler.py` 的 prompt 构造方式：

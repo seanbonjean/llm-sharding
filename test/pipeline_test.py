@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -533,6 +534,12 @@ def write_csv(path: Path, rows: list[dict], fieldnames: list[str] | None = None)
     print(f"[TEST] csv saved to {path}")
 
 
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[TEST] json saved to {path}")
+
+
 def linear_fit(xs: list[float], ys: list[float]) -> dict[str, float]:
     if len(xs) != len(ys):
         raise ValueError("[ERROR] xs and ys must have the same length.")
@@ -838,6 +845,242 @@ def plot_pair_forward_bars(
     plt.title(title)
     plt.grid(axis="y", alpha=0.3)
     plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {output_path}")
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def analyze_forward_critical_path(forward_rows: list[dict]) -> dict:
+    """
+    Build a DAG from menu-7 forward reports and return the compute critical path.
+
+    Edges model two constraints:
+    1. One request must pass through phase/step/stages in order.
+    2. One physical node executes its own forward calls serially; this order uses
+       only timestamps from that node, so no cross-device clock sync is required.
+    """
+
+    if not forward_rows:
+        return {
+            "inference_time": None,
+            "critical_path_rows": [],
+            "critical_path_cycle_detected": False,
+            "critical_path_node_count": 0,
+        }
+
+    indexed_rows = list(enumerate(forward_rows))
+    row_by_index = {index: row for index, row in indexed_rows}
+    weights = {
+        index: _float_or_none(row.get("forward_elapsed_ms")) or 0.0
+        for index, row in indexed_rows
+    }
+    successors: dict[int, set[int]] = {index: set() for index, _ in indexed_rows}
+    predecessors: dict[int, set[int]] = {index: set() for index, _ in indexed_rows}
+
+    def add_edge(src: int, dst: int) -> None:
+        if src == dst or dst in successors[src]:
+            return
+        successors[src].add(dst)
+        predecessors[dst].add(src)
+
+    def row_phase_order(row: dict) -> int:
+        explicit_order = row.get("phase_step_order")
+        if explicit_order is not None:
+            return int(explicit_order)
+        phase = str(row.get("phase") or "")
+        step = int(row.get("step") or 0)
+        return 1 if phase == "prefill" else step + 1
+
+    def request_sort_key(item: tuple[int, dict]) -> tuple[int, int, int]:
+        _, row = item
+        return (
+            row_phase_order(row),
+            int(row.get("shards_start") or 0),
+            int(row.get("shards_end") or 0),
+        )
+
+    rows_by_request: dict[str, list[tuple[int, dict]]] = {}
+    for item in indexed_rows:
+        _, row = item
+        request_key = str(row.get("client_request_id") or row.get("request_id"))
+        rows_by_request.setdefault(request_key, []).append(item)
+    for request_rows in rows_by_request.values():
+        ordered = sorted(request_rows, key=request_sort_key)
+        for (src, _), (dst, _) in zip(ordered, ordered[1:]):
+            add_edge(src, dst)
+
+    def node_sort_key(item: tuple[int, dict]) -> tuple[float, float, int, int, int]:
+        _, row = item
+        started = _float_or_none(row.get("started_timestamp"))
+        finished = _float_or_none(row.get("finished_timestamp"))
+        return (
+            started if started is not None else math.inf,
+            finished if finished is not None else math.inf,
+            int(row.get("request_order") or 0),
+            row_phase_order(row),
+            int(row.get("shards_start") or 0),
+        )
+
+    rows_by_node: dict[str, list[tuple[int, dict]]] = {}
+    for item in indexed_rows:
+        _, row = item
+        node_key = str(row.get("node_id") or row.get("node_addr") or "unknown")
+        rows_by_node.setdefault(node_key, []).append(item)
+    for node_rows in rows_by_node.values():
+        ordered = sorted(node_rows, key=node_sort_key)
+        for (src, _), (dst, _) in zip(ordered, ordered[1:]):
+            add_edge(src, dst)
+
+    indegree = {index: len(preds) for index, preds in predecessors.items()}
+    ready = sorted(index for index, degree in indegree.items() if degree == 0)
+    topo_order: list[int] = []
+    while ready:
+        current = ready.pop(0)
+        topo_order.append(current)
+        for successor in sorted(successors[current]):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                ready.append(successor)
+                ready.sort()
+
+    cycle_detected = len(topo_order) != len(indexed_rows)
+    if cycle_detected:
+        print("[WARNING] critical path graph has a cycle; inference_time is unavailable.")
+        return {
+            "inference_time": None,
+            "critical_path_rows": [],
+            "critical_path_cycle_detected": True,
+            "critical_path_node_count": 0,
+        }
+
+    distance = {index: weights[index] for index, _ in indexed_rows}
+    previous: dict[int, int | None] = {index: None for index, _ in indexed_rows}
+    for current in topo_order:
+        for successor in successors[current]:
+            candidate = distance[current] + weights[successor]
+            if candidate > distance[successor]:
+                distance[successor] = candidate
+                previous[successor] = current
+
+    end_index = max(distance, key=lambda index: distance[index])
+    critical_path_indices = []
+    current_index: int | None = end_index
+    while current_index is not None:
+        critical_path_indices.append(current_index)
+        current_index = previous[current_index]
+    critical_path_indices.reverse()
+
+    cumulative = 0.0
+    critical_path_rows = []
+    for path_index, row_index in enumerate(critical_path_indices, start=1):
+        row = row_by_index[row_index]
+        elapsed = weights[row_index]
+        cumulative += elapsed
+        critical_path_rows.append(
+            {
+                "critical_path_index": path_index,
+                "critical_path_cumulative_ms": cumulative,
+                "forward_elapsed_ms": elapsed,
+                "request_order": row.get("request_order"),
+                "client_request_id": row.get("client_request_id"),
+                "request_id": row.get("request_id"),
+                "node_id": row.get("node_id"),
+                "node_addr": row.get("node_addr"),
+                "shards_start": row.get("shards_start"),
+                "shards_end": row.get("shards_end"),
+                "phase": row.get("phase"),
+                "step": row.get("step"),
+                "phase_step_order": row.get("phase_step_order"),
+                "started_timestamp": row.get("started_timestamp"),
+                "finished_timestamp": row.get("finished_timestamp"),
+            }
+        )
+
+    return {
+        "inference_time": distance[end_index],
+        "critical_path_rows": critical_path_rows,
+        "critical_path_cycle_detected": False,
+        "critical_path_node_count": len(critical_path_rows),
+    }
+
+
+def plot_latency_breakdown_pie(summary: dict, output_path: Path) -> None:
+    inference_time = _float_or_none(summary.get("inference_time"))
+    residual_time = _float_or_none(summary.get("communication_and_noncompute_time"))
+    total_time = _float_or_none(summary.get("total_complete_time"))
+    if inference_time is None or residual_time is None or total_time is None:
+        print(f"[TEST] no complete latency breakdown to plot for {output_path}")
+        return
+    if residual_time < 0:
+        print(
+            f"[TEST] negative communication/non-forward time; "
+            f"skip latency breakdown pie for {output_path}"
+        )
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    values = [max(0.0, inference_time), residual_time]
+    if sum(values) <= 0:
+        print(f"[TEST] invalid latency breakdown values for {output_path}")
+        return
+
+    labels = ["critical-path inference", "communication + non-forward"]
+
+    def autopct(pct: float) -> str:
+        absolute = pct * sum(values) / 100.0
+        return f"{pct:.1f}%\n{absolute:.1f} ms"
+
+    plt.figure(figsize=(6, 6))
+    plt.pie(values, labels=labels, autopct=autopct, startangle=90)
+    plt.title(f"Latency breakdown, total={total_time:.1f} ms")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {output_path}")
+
+
+def plot_done_received_barh(done_rows: list[dict], output_path: Path) -> None:
+    usable_rows = [
+        row for row in done_rows if _float_or_none(row.get("done_received_elapsed_ms")) is not None
+    ]
+    if not usable_rows:
+        print(f"[TEST] no done rows to plot for {output_path}")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ordered_rows = sorted(usable_rows, key=lambda row: int(row.get("request_order") or 0))
+    labels = [f"request {int(row.get('request_order') or 0)}" for row in ordered_rows]
+    values = [
+        _float_or_none(row.get("done_received_elapsed_ms")) or 0.0
+        for row in ordered_rows
+    ]
+
+    height = max(4.0, 0.45 * len(ordered_rows) + 1.5)
+    plt.figure(figsize=(9, height))
+    plt.barh(labels, values)
+    plt.xlabel("done_received_elapsed_ms")
+    plt.ylabel("request order")
+    plt.title("Request completion time from batch submission")
+    plt.grid(axis="x", alpha=0.3)
+    for index, value in enumerate(values):
+        plt.text(value, index, f" {value:.1f} ms", va="center", fontsize=8)
+    plt.gca().invert_yaxis()
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -2414,43 +2657,70 @@ def run_two_round_pipeline_latency_scenario(
         if done_rows and not missing_done
         else None
     )
+    critical_path_analysis = analyze_forward_critical_path(forward_rows)
+    inference_time = critical_path_analysis["inference_time"]
+    communication_and_noncompute_time = (
+        total_elapsed_ms - inference_time
+        if total_elapsed_ms is not None and inference_time is not None
+        else None
+    )
     eos_seen_values = [row.get("eos_seen") for row in done_rows]
     first_eos_steps = [row.get("first_eos_step") for row in done_rows]
     expected_report_count = (
         request_count * node_count * len(expected_phase_steps)
     )
-    summary_rows = [
-        {
-            "experiment": experiment_name,
-            "topology_node_count": node_count,
-            "request_count": request_count,
-            "max_active_requests": client.max_active_requests,
-            "max_new_tokens": max_new_tokens,
-            "ignore_eos_for_measurement": ignore_eos_for_measurement,
-            "any_eos_seen": any(bool(value) for value in eos_seen_values),
-            "first_eos_steps": repr(first_eos_steps),
-            "all_semantic_outputs_valid": all(
-                bool(row.get("semantic_output_valid", True)) for row in done_rows
-            ),
-            "target_input_token_lengths": repr(target_input_lengths),
-            "actual_input_token_lengths": repr(actual_input_lengths),
-            "expected_forward_report_count": expected_report_count,
-            "collected_forward_report_count": len(forward_rows),
-            "ack_report_count": len(ack_by_client_id),
-            "missing_ack_count": len(missing_ack),
-            "missing_forward_report_count": len(missing_reports),
-            "done_report_count": len(done_rows),
-            "missing_done_count": len(missing_done),
-            "total_process_elapsed_ms": total_elapsed_ms,
-            "missing_ack_client_request_ids": repr(missing_ack),
-            "missing_forward_reports": repr(missing_reports),
-            "missing_done_client_request_ids": repr(missing_done),
-        }
-    ]
+    summary = {
+        "experiment": experiment_name,
+        "topology_node_count": node_count,
+        "request_count": request_count,
+        "max_active_requests": client.max_active_requests,
+        "max_new_tokens": max_new_tokens,
+        "time_unit": "ms",
+        "total_complete_time": total_elapsed_ms,
+        "inference_time": inference_time,
+        "communication_and_noncompute_time": communication_and_noncompute_time,
+        "total_process_elapsed_ms": total_elapsed_ms,
+        "critical_path_cycle_detected": critical_path_analysis[
+            "critical_path_cycle_detected"
+        ],
+        "critical_path_node_count": critical_path_analysis[
+            "critical_path_node_count"
+        ],
+        "ignore_eos_for_measurement": ignore_eos_for_measurement,
+        "any_eos_seen": any(bool(value) for value in eos_seen_values),
+        "first_eos_steps": first_eos_steps,
+        "all_semantic_outputs_valid": all(
+            bool(row.get("semantic_output_valid", True)) for row in done_rows
+        ),
+        "target_input_token_lengths": target_input_lengths,
+        "actual_input_token_lengths": actual_input_lengths,
+        "expected_forward_report_count": expected_report_count,
+        "collected_forward_report_count": len(forward_rows),
+        "ack_report_count": len(ack_by_client_id),
+        "missing_ack_count": len(missing_ack),
+        "missing_forward_report_count": len(missing_reports),
+        "done_report_count": len(done_rows),
+        "missing_done_count": len(missing_done),
+        "missing_ack_client_request_ids": missing_ack,
+        "missing_forward_reports": missing_reports,
+        "missing_done_client_request_ids": missing_done,
+    }
 
     write_csv(result_dir / f"{prefix}_forward_reports.csv", forward_rows)
     write_csv(result_dir / f"{prefix}_done_reports.csv", done_rows)
-    write_csv(result_dir / f"{prefix}_summary.csv", summary_rows)
+    write_csv(
+        result_dir / f"{prefix}_critical_path_forward_rows.csv",
+        critical_path_analysis["critical_path_rows"],
+    )
+    write_json(result_dir / f"{prefix}_summary.json", summary)
+    plot_latency_breakdown_pie(
+        summary,
+        result_dir / f"{prefix}_latency_breakdown_pie.png",
+    )
+    plot_done_received_barh(
+        done_rows,
+        result_dir / f"{prefix}_done_received_elapsed_ms_barh.png",
+    )
 
     if missing_ack:
         print(f"[WARNING] missing ack reports for {node_count}-node scenario: {missing_ack}")
@@ -2462,6 +2732,11 @@ def run_two_round_pipeline_latency_scenario(
         print(
             "[WARNING] EOS was generated during this measurement; "
             "ignore_eos_for_measurement kept decoding until max_new_tokens."
+        )
+    if communication_and_noncompute_time is not None and communication_and_noncompute_time < 0:
+        print(
+            "[WARNING] communication_and_noncompute_time is negative; "
+            "check critical path assumptions and measurement overhead."
         )
     print(
         f"[TEST] {node_count}-node scenario total elapsed: "

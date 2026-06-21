@@ -172,6 +172,9 @@ prefill forward 耗时、DynamicCache 增量和
 2 台设备为 `0~14/14~28`，3 台设备为 `0~9/9~18/18~28`，4 台设备为
 `0~7/7~14/14~21/21~28`，5 台设备为 `0~6/6~12/12~18/18~23/23~28`，6 台设备为
 `0~4/4~9/9~14/14~18/18~23/23~28`。
+6 台设备时，4 GiB Orin Nano（`node5`，`172.16.0.3`）会被固定放在倒数第二个
+stage，加载 `18~23` 层；其 `can_receive_user_request=False`，因此不会加载
+tokenizer/embedding。末 stage 由 `node4`（`172.16.0.2`）承载并加载 LM head。
 每个场景会先跑一次同形状 warm-up batch；发送新 config 后会先等待
 `Config settle seconds`，默认 30 秒，避免节点还在加载 layer 时就触发 warm-up。
 当前子场景包括 3 节点 3 请求、2 节点 3 请求、4 节点 3 请求、4 节点 4 请求、3 节点 4 请求、

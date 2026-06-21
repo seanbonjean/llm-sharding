@@ -84,7 +84,9 @@ AVAILABLE_NODES = [
     PipelineNodeSpec("node2", "172.16.0.6", 14, 21),
     PipelineNodeSpec("node3", "172.16.0.7", 21, 28),
     PipelineNodeSpec("node4", "172.16.0.2", 23, 28),
-    PipelineNodeSpec("node5", "172.16.0.3", 23, 28),
+    # node5 is a 4 GiB Orin Nano. It is used only as an intermediate stage in
+    # the six-node topology, so it must not load tokenizer/embedding or lm_head.
+    PipelineNodeSpec("node5", "172.16.0.3", 23, 28, can_receive_user_request=False),
 ]
 DEFAULT_NODES = AVAILABLE_NODES[:4]
 DEFAULT_LAYER_COUNT = 28
@@ -454,11 +456,27 @@ def ask_node(client: PipelineDebugClient, prompt: str = "Choose owner node") -> 
 
 
 def build_even_split_nodes(node_count: int) -> list[PipelineNodeSpec]:
+    """
+    Build a contiguous, even layer split for a menu-7 topology.
+
+    The regular topologies use the order in AVAILABLE_NODES. For six nodes,
+    node5 (172.16.0.3) is deliberately placed before node4: node5 is the 4 GiB
+    Orin Nano and therefore remains an intermediate shard without embedding or
+    LM-head weights, while node4 remains the final stage.
+    """
     if node_count < 1 or node_count > len(AVAILABLE_NODES):
         raise ValueError(f"[ERROR] node_count must be in [1, {len(AVAILABLE_NODES)}].")
 
+    topology_nodes = AVAILABLE_NODES[:node_count]
+    if node_count == 6:
+        topology_nodes = [
+            *AVAILABLE_NODES[:4],
+            AVAILABLE_NODES[5],
+            AVAILABLE_NODES[4],
+        ]
+
     nodes: list[PipelineNodeSpec] = []
-    for index, base_node in enumerate(AVAILABLE_NODES[:node_count]):
+    for index, base_node in enumerate(topology_nodes):
         start = (DEFAULT_LAYER_COUNT * index) // node_count
         end = (DEFAULT_LAYER_COUNT * (index + 1)) // node_count
         nodes.append(
@@ -467,7 +485,7 @@ def build_even_split_nodes(node_count: int) -> list[PipelineNodeSpec]:
                 ip=base_node.ip,
                 shards_start=start,
                 shards_end=end,
-                can_receive_user_request=True,
+                can_receive_user_request=base_node.can_receive_user_request,
                 config_port=base_node.config_port,
                 data_port=base_node.data_port,
             )

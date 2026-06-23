@@ -39,8 +39,28 @@ Pipeline config 兼容旧字段，并新增：
 * `pipeline_depth`: 模型链 stage 数。4 台设备各一个 stage 时填 `4`。
 * `max_active_requests`: 最大 active 请求数；建议默认等于 `pipeline_depth`。
 * `node_id`: request_id 和日志前缀，不参与路由。
+* `controller_addr`（可选）：中控可被节点连接的 PULL 地址。节点完成 layer 装载后，
+  会向此地址发送 `pipeline_node_ready`。
+* `config_id`（可选）：某次 config 广播的唯一标识。ready report 会原样回显它，供中控
+  区分当前拓扑与迟到的旧配置报告。
 
 末节点的 `dst_addr` 仍建议指回 first node，因为 `pipeline_clear` 需要沿模型链绕一圈后停止。
+
+## 节点就绪确认
+
+节点在初次收到 config 并完成 `load_shards()` 后，会在输出
+`[CONTROLLER] Pipeline node is ready.` 的同时，向可选的 `controller_addr` 发送一次
+`pipeline_node_ready`。重配置完成后也会发送同类型报告，`event` 为
+`reconfigured_ready`。报告包含 `node_id`、`node_addr`、分片范围、
+`can_receive_user_request`、`pipeline_depth`、`max_active_requests`、`config_id` 和时间戳。
+
+这是独立于推理数据流的 best-effort 非阻塞控制面消息：未配置 `controller_addr` 时不会发送；
+中控不可达或发送队列满时只会丢弃该报告，不会阻塞 pipeline 推理。中控应等待当前
+`config_id` 的所有节点 ready report 后，再投递新请求。`pipeline_test.py` 在 telemetry
+PULL 已启动时会将其地址作为 `controller_addr`；initial config 与 menu 7 会自动执行这一等待。
+启动 `pipeline_test.py` 时若选择发送 initial config，脚本会先启动该接收端，并以
+`Initial config-ready timeout seconds`（默认 60 秒）等待全部节点 ready；超时不会进入菜单。
+若 initial config 选择 `N`，脚本不会等待，直接显示菜单。
 
 ## 用户请求入口
 
@@ -158,8 +178,8 @@ raw allocated 字段仍保留在 CSV 中用于排查单节点显存状态，但�
 求和，会画出该节点的 `kv_cache_bytes` 和 `cuda_memory_delta_bytes`。
 
 `test/pipeline_test.py` 的主菜单第 6 项为 `run simultaneous pair forward measurement`。
-该测试会先用相同 prompt 跑两个不带测量 flag 的 warm-up request，等它们完成后再等待
-2 秒，让运行时状态稳定，然后把两个相同 prompt 作为一个 batch 发送给 first node/owner。
+该测试会用相同 prompt 跑两个不带测量 flag 的 warm-up request，等它们完成后再等待 2 秒，
+让运行时状态稳定，然后把两个相同 prompt 作为一个 batch 发送给 first node/owner。
 batch 入口会先把两个请求都放入 first-stage queue，再开始推进队列，避免第一个请求先被
 forward、第二个请求还没进入 active queue 的实验偏差。测试会收集每个 request 在每个 node 上的
 prefill forward 耗时、DynamicCache 增量和
@@ -178,8 +198,11 @@ stage，加载 `18~23` 层；其 `can_receive_user_request=False`，因此不会
 tokenizer/embedding。末 stage 由 `node4`（`172.16.0.2`）承载并加载 LM head。
 7 台设备时，`node5` 仍是中间 stage，加载 `20~24` 层；新增的 `node6`
 （`172.16.0.8`）作为末 stage，加载 `24~28` 层与 LM head。
-每个场景会先跑一次同形状 warm-up batch；发送新 config 后会先等待
-`Config settle seconds`，默认 30 秒，避免节点还在加载 layer 时就触发 warm-up。
+每个场景会在发送新 config 后等待所有节点回传当前 `config_id` 的 ready report；
+`Config-ready timeout seconds` 默认 60 秒，超时会直接停止该场景，避免节点还在加载 layer
+时就触发 warm-up。确认 ready 后会跑一条固定 warm-up 请求：其输入严格为 16 tokens，
+且 token 序列不会与任何正式请求的前 16 个 token 相同。该请求设置 `max_new_tokens=17` 并启用
+EOS 跳过，因此先经过一次 prefill，再恰好执行 16 次 decode；warm-up 超时会直接停止场景。
 当前子场景包括 3 节点 3 请求、2 节点 3 请求、4 节点 3 请求、4 节点 4 请求、3 节点 4 请求、
 5 节点 4 请求、5 节点 5 请求和 5 节点 6 请求；
 每个请求 `max_new_tokens=2`。`max_active_requests` 等于节点数，因此 2 节点 3 请求场景中

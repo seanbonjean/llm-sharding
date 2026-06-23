@@ -11,6 +11,8 @@ pipeline 版本在旧 config 基础上新增以下字段：
     pipeline_depth: 模型链 stage 数，例如：4 台设备各一个 stage 时填 4
     max_active_requests: 最大 active 请求数，默认建议等于 pipeline_depth
     node_id: 用于实现日志和 request_id 前缀，不参与路由
+    controller_addr: 可选，中控可被节点连接的地址；用于回传 layer 加载完成的 ready report
+    config_id: 可选，本次 config 广播的唯一标识；ready report 会原样回显
 
 用户请求入口复用 node_addr 对应的数据端口，默认是 40800。外部客户端发送
 type="user_request" 的 torch 序列化 dict 后，本节点会在本地调用 receive_request()。

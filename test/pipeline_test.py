@@ -35,6 +35,7 @@ KV_CACHE_QUERY = "kv_cache_query"
 KV_CACHE_REPORT = "kv_cache_report"
 SHARD_FORWARD_REPORT = "shard_forward_report"
 PIPELINE_DONE_REPORT = "pipeline_done_report"
+PIPELINE_NODE_READY = "pipeline_node_ready"
 
 TOKENIZER_PATH = "shards/Llama-3___2-3B-Instruct_float16"
 RESULT_ROOT = Path("results") / "pipeline_kv_cache"
@@ -43,6 +44,16 @@ DEFAULT_TELEMETRY_PORT = 40900
 DEFAULT_PREFILL_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
 DEFAULT_DECODE_OUTPUT_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
 OVERLAP_TIME_SAMPLE_INTERVAL_S = 1.0
+PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH = 16
+PIPELINE_LATENCY_WARMUP_DECODE_STEPS = 16
+PIPELINE_LATENCY_WARMUP_MAX_NEW_TOKENS = (
+    PIPELINE_LATENCY_WARMUP_DECODE_STEPS + 1
+)
+PIPELINE_LATENCY_WARMUP_TEXTS = [
+    "Reserved warmup context initializes pipeline kernels and cache paths before timing. ",
+    "Independent calibration request prepares each inference stage without reusing test input. ",
+    "Warmup-only token sequence exercises decode routing before the measured workload begins. ",
+]
 PROMPT_FRAGMENT = (
     "Distributed inference splits a language model across multiple edge devices so "
     "that each device processes part of the network while cooperating with the others. "
@@ -113,6 +124,8 @@ class PipelineDebugClient:
         self._json_sockets: dict[str, zmq.Socket] = {}
         self._data_sockets: dict[str, zmq.Socket] = {}
         self._request_seq = 0
+        self._config_seq = 0
+        self.last_config_id: str | None = None
         self.telemetry_public_addr: str | None = None
         self.telemetry_bind_addr: str | None = None
         self._telemetry_socket: zmq.Socket | None = None
@@ -152,6 +165,12 @@ class PipelineDebugClient:
         self._request_seq += 1
         return f"client-{int(time.time() * 1000)}-{self._request_seq}"
 
+    def _new_config_id(self) -> str:
+        """Create an ID that ties node-ready reports to one config broadcast."""
+
+        self._config_seq += 1
+        return f"config-{int(time.time() * 1000)}-{self._config_seq}"
+
     def _build_user_request_payload(
         self,
         prompt: str,
@@ -185,11 +204,19 @@ class PipelineDebugClient:
                 payload["trace_forward_measurement"] = True
         return client_request_id, payload
 
-    def build_config(self, index: int) -> dict:
+    def build_config(self, index: int, config_id: str | None = None) -> dict:
+        """
+        Build one node's pipeline config.
+
+        If telemetry is configured, its PULL endpoint also receives optional
+        controller-plane node-ready reports. This reuse is test-only plumbing:
+        request telemetry remains unchanged and normal configs may omit it.
+        """
+
         node = self.nodes[index]
         next_node = self.nodes[(index + 1) % self.pipeline_depth]
         first_node = self.nodes[0]
-        return {
+        config = {
             "src_addr": f"tcp://*:{node.data_port}",
             "dst_addr": next_node.node_addr,
             "node_addr": node.node_addr,
@@ -201,12 +228,26 @@ class PipelineDebugClient:
             "max_active_requests": self.max_active_requests,
             "node_id": node.node_id,
         }
+        if config_id is not None:
+            config["config_id"] = config_id
+        if self.telemetry_public_addr:
+            config["controller_addr"] = self.telemetry_public_addr
+        return config
 
-    def send_config(self) -> None:
-        """Send current config to all pipeline nodes."""
+    def send_config(self) -> str:
+        """
+        Send current config to all pipeline nodes and return its config_id.
+
+        Nodes echo this ID in their optional pipeline_node_ready reports, so a
+        caller can wait for the exact broadcast instead of relying on a fixed
+        layer-load delay.
+        """
+
+        config_id = self._new_config_id()
+        self.last_config_id = config_id
 
         for index, node in enumerate(self.nodes):
-            config = self.build_config(index)
+            config = self.build_config(index, config_id=config_id)
             self._json_socket(node.config_addr).send_json(config)
             print(
                 f"[CONFIG] sent {node.node_id} {node.ip}: "
@@ -214,6 +255,7 @@ class PipelineDebugClient:
                 f"dst={config['dst_addr']}, can_receive={node.can_receive_user_request}"
             )
         print("[CONFIG] all configs sent; keep this CLI alive while nodes receive them.")
+        return config_id
 
     def configure_telemetry(
         self,
@@ -285,6 +327,53 @@ class PipelineDebugClient:
             event = self.receive_event(timeout_s=0.01)
             if event is None:
                 return
+
+    def wait_for_nodes_ready(
+        self,
+        config_id: str,
+        timeout_s: float,
+    ) -> list[dict]:
+        """
+        Wait until every configured node confirms that it loaded config_id.
+
+        This validates layer loading after a topology reconfiguration. Reports
+        from another config_id remain in the event backlog for their own caller;
+        they cannot satisfy this wait accidentally.
+        """
+
+        expected_node_ids = {node.node_id for node in self.nodes}
+        reports_by_node: dict[str, dict] = {}
+        deadline = time.time() + timeout_s
+        while (
+            set(reports_by_node) != expected_node_ids
+            and time.time() < deadline
+        ):
+            report = self.wait_for_event(
+                lambda event: (
+                    event.get("type") == PIPELINE_NODE_READY
+                    and event.get("config_id") == config_id
+                ),
+                timeout_s=max(0.05, deadline - time.time()),
+            )
+            if report is None:
+                break
+            node_id = str(report.get("node_id"))
+            if node_id in expected_node_ids:
+                reports_by_node[node_id] = report
+
+        missing_node_ids = sorted(expected_node_ids - set(reports_by_node))
+        if missing_node_ids:
+            raise TimeoutError(
+                "[ERROR] timed out waiting for node-ready reports for "
+                f"config_id={config_id}; missing={missing_node_ids}"
+            )
+
+        reports = [reports_by_node[node.node_id] for node in self.nodes]
+        print(
+            f"[CONTROLLER] all {len(reports)} nodes confirmed ready for "
+            f"config_id={config_id}."
+        )
+        return reports
 
     def submit_request(
         self,
@@ -495,7 +584,7 @@ def build_even_split_nodes(node_count: int) -> list[PipelineNodeSpec]:
     return nodes
 
 
-def configure_even_split_topology(client: PipelineDebugClient, node_count: int) -> None:
+def configure_even_split_topology(client: PipelineDebugClient, node_count: int) -> str:
     """
     临时把测试 CLI 的拓扑切到前 node_count 台设备，并发送对应 config。
 
@@ -510,7 +599,7 @@ def configure_even_split_topology(client: PipelineDebugClient, node_count: int) 
         f"max_active_requests={client.max_active_requests}."
     )
     client.show_topology()
-    client.send_config()
+    return client.send_config()
 
 
 def ask_prompt(default: str = DEFAULT_PROMPTS[0]) -> str:
@@ -1168,6 +1257,60 @@ def build_input_ids_for_lengths(tokenizer, token_lengths: list[int]) -> dict[int
         token_length: long_input_ids[:, :token_length].clone()
         for token_length in token_lengths
     }
+
+
+def build_pipeline_latency_warmup_input_ids(
+    tokenizer,
+    actual_prompts: list[str],
+    actual_input_ids_list: list[torch.Tensor] | None,
+) -> torch.Tensor:
+    """
+    Build a fixed-length warm-up input that cannot reuse a measured request.
+
+    Menu 7 warm-up must exercise a stable 16-token prefill plus 16 decode rounds
+    without sharing the measured request's prompt/input IDs. Candidate texts are
+    tokenized and truncated exactly like the profiler-style input construction;
+    the first sequence that does not match any measured request's first 16 token
+    IDs is selected.
+    """
+
+    actual_prefixes: set[tuple[int, ...]] = set()
+    if actual_input_ids_list is not None:
+        actual_prefixes.update(
+            tuple(
+                int(token_id)
+                for token_id in input_ids[0, :PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH].tolist()
+            )
+            for input_ids in actual_input_ids_list
+        )
+    else:
+        actual_prefixes.update(
+            tuple(
+                int(token_id)
+                for token_id in tokenizer(prompt, return_tensors="pt")["input_ids"][
+                    0, :PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH
+                ].tolist()
+            )
+            for prompt in actual_prompts
+        )
+
+    for seed_text in PIPELINE_LATENCY_WARMUP_TEXTS:
+        text = seed_text
+        while (
+            len(tokenizer(text, return_tensors="pt")["input_ids"][0])
+            < PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH
+        ):
+            text += seed_text
+        warmup_input_ids = tokenizer(text, return_tensors="pt")["input_ids"][
+            :, :PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH
+        ].clone()
+        warmup_sequence = tuple(int(token_id) for token_id in warmup_input_ids[0].tolist())
+        if warmup_sequence not in actual_prefixes:
+            return warmup_input_ids
+
+    raise RuntimeError(
+        "[ERROR] failed to construct a warm-up input distinct from all measured requests."
+    )
 
 
 def build_distinct_input_ids_for_same_length(
@@ -2290,6 +2433,7 @@ def wait_for_warmup_batch(
     prompts: list[str] | None = None,
     input_ids_list: list[torch.Tensor] | None = None,
     ignore_eos_for_measurement: bool = False,
+    require_completion: bool = False,
 ) -> None:
     warmup_prompts = prompts if prompts is not None else [prompt] * request_count
     warmup_client_ids = client.submit_burst_requests(
@@ -2309,6 +2453,11 @@ def wait_for_warmup_batch(
         if warmup_done is None:
             missing_warmups.append(warmup_client_id)
     if missing_warmups:
+        if require_completion:
+            raise TimeoutError(
+                "[ERROR] warm-up requests did not report done before timeout: "
+                f"{missing_warmups}"
+            )
         print(
             f"[WARNING] warm-up requests did not report done before timeout: "
             f"{missing_warmups}; continuing with measured run."
@@ -2495,7 +2644,7 @@ def run_two_round_pipeline_latency_scenario(
     request_count: int,
     prompt: str,
     timeout_s: float,
-    config_settle_s: float,
+    config_ready_timeout_s: float,
     max_new_tokens: int = 2,
     ignore_eos_for_measurement: bool = True,
     prompts: list[str] | None = None,
@@ -2529,25 +2678,37 @@ def run_two_round_pipeline_latency_scenario(
         f"\n[TEST] {node_count} nodes, {request_count} simultaneous requests, "
         f"max_new_tokens={max_new_tokens}"
     )
-    configure_even_split_topology(client, node_count)
+    config_id = configure_even_split_topology(client, node_count)
     print(
-        f"[TEST] waiting {config_settle_s:.1f} seconds after config for nodes to load layers..."
+        f"[TEST] waiting up to {config_ready_timeout_s:.1f} seconds for all "
+        "nodes to confirm layer loading..."
     )
-    time.sleep(config_settle_s)
+    client.wait_for_nodes_ready(config_id, timeout_s=config_ready_timeout_s)
     client.drain_events()
 
-    print("[TEST] running topology-matched warm-up batch without measurement...")
+    warmup_tokenizer = load_tokenizer()
+    warmup_input_ids = build_pipeline_latency_warmup_input_ids(
+        tokenizer=warmup_tokenizer,
+        actual_prompts=request_prompts,
+        actual_input_ids_list=input_ids_list,
+    )
+    print(
+        "[TEST] running one fixed warm-up request without measurement: "
+        f"input_tokens={PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH}, "
+        f"decode_steps={PIPELINE_LATENCY_WARMUP_DECODE_STEPS}."
+    )
     wait_for_warmup_batch(
         client=client,
         owner_index=0,
-        prompt=prompt,
-        request_count=request_count,
-        max_new_tokens=max_new_tokens,
+        prompt="",
+        request_count=1,
+        max_new_tokens=PIPELINE_LATENCY_WARMUP_MAX_NEW_TOKENS,
         timeout_s=timeout_s,
         trace_label_prefix=f"{prefix}_warmup",
-        prompts=request_prompts,
-        input_ids_list=input_ids_list,
-        ignore_eos_for_measurement=ignore_eos_for_measurement,
+        prompts=[""],
+        input_ids_list=[warmup_input_ids],
+        ignore_eos_for_measurement=True,
+        require_completion=True,
     )
     print("[TEST] waiting 2 seconds after warm-up for runtime state to settle...")
     time.sleep(2.0)
@@ -2785,8 +2946,8 @@ def run_two_round_distinct_same_length_custom_scenario(
         else 2
     )
     timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
-    config_settle_s = float(
-        input("Config settle seconds after topology config [30]: ").strip() or "30"
+    config_ready_timeout_s = float(
+        input("Config-ready timeout seconds after topology config [60]: ").strip() or "60"
     )
     ask_telemetry(client)
 
@@ -2813,7 +2974,7 @@ def run_two_round_distinct_same_length_custom_scenario(
         request_count=request_count,
         prompt="",
         timeout_s=timeout_s,
-        config_settle_s=config_settle_s,
+        config_ready_timeout_s=config_ready_timeout_s,
         max_new_tokens=max_new_tokens,
         prompts=prompts,
         input_ids_list=input_ids_list,
@@ -2845,8 +3006,8 @@ def run_two_round_same_prompt_custom_scenario(
         else 2
     )
     timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
-    config_settle_s = float(
-        input("Config settle seconds after topology config [30]: ").strip() or "30"
+    config_ready_timeout_s = float(
+        input("Config-ready timeout seconds after topology config [60]: ").strip() or "60"
     )
     ask_telemetry(client)
 
@@ -2861,7 +3022,7 @@ def run_two_round_same_prompt_custom_scenario(
         request_count=request_count,
         prompt=prompt,
         timeout_s=timeout_s,
-        config_settle_s=config_settle_s,
+        config_ready_timeout_s=config_ready_timeout_s,
         max_new_tokens=max_new_tokens,
         prefix=prefix,
         experiment_name=(
@@ -2915,77 +3076,77 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
 
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
     timeout_s = float(input("Overall timeout seconds [180]: ").strip() or "180")
-    config_settle_s = float(
-        input("Config settle seconds after each topology config [30]: ").strip() or "30"
+    config_ready_timeout_s = float(
+        input("Config-ready timeout seconds after each topology config [60]: ").strip() or "60"
     )
     ask_telemetry(client)
 
     if choice == "1":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 3, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 3, 3, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "2":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 2, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 2, 3, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "3":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 4, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 4, 3, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "4":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 4, 4, prompt, timeout_s, config_settle_s
+            client, result_dir, 4, 4, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "5":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 3, 4, prompt, timeout_s, config_settle_s
+            client, result_dir, 3, 4, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "6":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 4, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 4, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "7":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 5, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 5, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "8":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 6, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 6, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "9":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 4, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 4, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 5, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 5, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 6, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 6, prompt, timeout_s, config_ready_timeout_s
         )
     elif choice == "10":
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 3, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 3, 3, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 2, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 2, 3, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 4, 3, prompt, timeout_s, config_settle_s
+            client, result_dir, 4, 3, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 4, 4, prompt, timeout_s, config_settle_s
+            client, result_dir, 4, 4, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 3, 4, prompt, timeout_s, config_settle_s
+            client, result_dir, 3, 4, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 4, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 4, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 5, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 5, prompt, timeout_s, config_ready_timeout_s
         )
         run_two_round_pipeline_latency_scenario(
-            client, result_dir, 5, 6, prompt, timeout_s, config_settle_s
+            client, result_dir, 5, 6, prompt, timeout_s, config_ready_timeout_s
         )
     else:
         print("Unknown experiment.")
@@ -3075,7 +3236,17 @@ def main() -> None:
     client = PipelineDebugClient(DEFAULT_NODES)
     client.show_topology()
     if ask_yes_no("Send initial config now?", default=True):
-        client.send_config()
+        ask_telemetry(client)
+        config_ready_timeout_s = float(
+            input("Initial config-ready timeout seconds [60]: ").strip() or "60"
+        )
+        config_id = client.send_config()
+        print(
+            f"[TEST] waiting up to {config_ready_timeout_s:.1f} seconds for all "
+            "nodes to confirm initial layer loading..."
+        )
+        client.wait_for_nodes_ready(config_id, timeout_s=config_ready_timeout_s)
+        client.drain_events()
     menu_loop(client)
 
 

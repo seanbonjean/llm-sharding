@@ -41,6 +41,7 @@ class PipelineProtocol:
     KV_CACHE_REPORT = "kv_cache_report"
     SHARD_FORWARD_REPORT = "shard_forward_report"
     PIPELINE_DONE_REPORT = "pipeline_done_report"
+    PIPELINE_NODE_READY = "pipeline_node_ready"
 
     TELEMETRY_FIELDS = (
         "client_request_id",
@@ -377,6 +378,25 @@ class PipelineCommunicator:
         if not addr:
             raise ValueError("[ERROR] send_to requires a non-empty target address.")
         self._get_send_socket(addr).send(self._serialize(data))
+
+    def try_send_to(self, addr: str, data: Any) -> bool:
+        """
+        Best-effort non-blocking point-to-point send for controller reports.
+
+        Node-ready reports are control-plane observability messages. An absent or
+        slow controller must never delay pipeline inference, so a full ZMQ send
+        queue drops the report and returns False instead of blocking the worker.
+        """
+
+        if not addr:
+            return False
+        try:
+            self._get_send_socket(addr).send(
+                self._serialize(data), flags=zmq.NOBLOCK
+            )
+        except zmq.Again:
+            return False
+        return True
 
     def transfer_data(self, data: Any) -> None:
         """把消息发送给 config 中配置的模型链下一个节点"""
@@ -1272,6 +1292,7 @@ class PipelineNodeController:
             None  # 等旧请求 drain 完毕后再真正应用的 config
         )
         print("[CONTROLLER] Pipeline node is ready.")
+        self._emit_node_ready_report(event="initial_ready")
 
     @property
     def is_first_stage(self) -> bool:
@@ -1287,6 +1308,10 @@ class PipelineNodeController:
         if "*" in config["node_addr"]:
             raise ValueError(
                 "[ERROR] node_addr must be connectable by other devices; do not use tcp://*:port."
+            )
+        if config.get("controller_addr") and "*" in config["controller_addr"]:
+            raise ValueError(
+                "[ERROR] controller_addr must be connectable by this node; do not use tcp://*:port."
             )
 
         config.setdefault(
@@ -1305,6 +1330,48 @@ class PipelineNodeController:
             raise ValueError("[ERROR] pipeline_depth must be positive.")
         if int(config["max_active_requests"]) <= 0:
             raise ValueError("[ERROR] max_active_requests must be positive.")
+
+    def _emit_node_ready_report(self, event: str) -> None:
+        """
+        Notify the optional central controller after this node has loaded its shard.
+
+        The report is emitted immediately after the local ready/reconfigured log,
+        which is after PipelineNodeWorker.load_shards() has completed. config_id
+        lets a controller distinguish the current topology from stale reports.
+        Configs without controller_addr keep the original inference behavior.
+
+        This notification is best-effort and non-blocking because it is a
+        control-plane message, not a pipeline data dependency.
+        """
+
+        controller_addr = self.received_config.get("controller_addr")
+        if not controller_addr:
+            return
+
+        report = {
+            PipelineProtocol.TYPE_KEY: PipelineProtocol.PIPELINE_NODE_READY,
+            "event": event,
+            "config_id": self.received_config.get("config_id"),
+            "node_id": self.node_worker.node_id,
+            "node_addr": self.node_worker.node_addr,
+            "shards_start": self.node_worker.start,
+            "shards_end": self.node_worker.end,
+            "can_receive_user_request": self.accepting_user_requests,
+            "pipeline_depth": self.pipeline_depth,
+            "max_active_requests": self.max_active_requests,
+            "timestamp": time.time(),
+        }
+        try:
+            sent = self.node_worker.communicator.try_send_to(controller_addr, report)
+        except (ValueError, zmq.ZMQError) as exc:
+            print(f"[CONTROLLER WARNING] failed to send node-ready report: {exc}")
+            return
+
+        if not sent:
+            print(
+                "[CONTROLLER WARNING] dropped node-ready report because "
+                "the controller send queue is full."
+            )
 
     def _create_worker(
         self, config: dict[str, Any], keep_owner_runtime: bool = False
@@ -1461,6 +1528,7 @@ class PipelineNodeController:
                 "new user requests are still rejected by the controller."
             )
         print("[CONTROLLER] Pipeline node reconfigured.")
+        self._emit_node_ready_report(event="reconfigured_ready")
 
     def _release_pending_prefill_after_reconfig(self) -> None:
         """

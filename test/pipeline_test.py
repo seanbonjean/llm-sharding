@@ -1197,6 +1197,166 @@ def plot_done_received_barh(done_rows: list[dict], output_path: Path) -> None:
     print(f"[TEST] plot saved to {output_path}")
 
 
+def _menu7_phase_step_order(row: dict) -> int:
+    """Return the menu-7 x-axis order: prefill first, then decode steps."""
+
+    explicit_order = row.get("phase_step_order")
+    if explicit_order is not None:
+        return int(explicit_order)
+    return 1 if row.get("phase") == "prefill" else int(row.get("step") or 0) + 1
+
+
+def _menu7_phase_step_label(row: dict) -> str:
+    """Build the human-readable menu-7 x-axis label for one forward round."""
+
+    if row.get("phase") == "prefill":
+        return "prefill"
+    return f"decode {int(row.get('step') or 0)}"
+
+
+def plot_menu7_forward_elapsed_lines(
+    forward_rows: list[dict],
+    output_dir: Path,
+    prefix: str,
+    expected_phase_steps: list[tuple[str, int]] | None = None,
+) -> None:
+    """
+    Plot menu-7 forward elapsed time for every stage and for their per-step sum.
+
+    Each request is one line. The x-axis is the request-local sequence of one
+    prefill followed by decode rounds, not wall-clock time. A total point is
+    plotted only when every stage reported that request/round, preventing a
+    partial report from being mistaken for the full pipeline forward time.
+    """
+
+    usable_rows = [
+        row
+        for row in forward_rows
+        if _float_or_none(row.get("forward_elapsed_ms")) is not None
+    ]
+    if not usable_rows:
+        print("[TEST] no forward elapsed rows available for menu-7 line plots.")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    stage_keys = sorted(
+        {
+            (
+                str(row.get("node_id")),
+                int(row.get("shards_start") or 0),
+                int(row.get("shards_end") or 0),
+            )
+            for row in usable_rows
+        },
+        key=lambda item: (item[1], item[2], item[0]),
+    )
+    request_orders = sorted(
+        {int(row.get("request_order") or 0) for row in usable_rows}
+    )
+    if expected_phase_steps is not None:
+        phase_orders = list(range(1, len(expected_phase_steps) + 1))
+        phase_labels = [
+            "prefill" if phase == "prefill" else f"decode {step}"
+            for phase, step in expected_phase_steps
+        ]
+    else:
+        phase_orders = sorted({_menu7_phase_step_order(row) for row in usable_rows})
+        label_by_phase_order: dict[int, str] = {}
+        for row in usable_rows:
+            label_by_phase_order.setdefault(
+                _menu7_phase_step_order(row), _menu7_phase_step_label(row)
+            )
+        phase_labels = [
+            label_by_phase_order.get(phase_order, str(phase_order))
+            for phase_order in phase_orders
+        ]
+
+    values_by_stage_request_step: dict[tuple[str, int, int, int, int], float] = {}
+    for row in usable_rows:
+        node_id = str(row.get("node_id"))
+        shards_start = int(row.get("shards_start") or 0)
+        shards_end = int(row.get("shards_end") or 0)
+        request_order = int(row.get("request_order") or 0)
+        phase_order = _menu7_phase_step_order(row)
+        values_by_stage_request_step[
+            (node_id, shards_start, shards_end, request_order, phase_order)
+        ] = _float_or_none(row.get("forward_elapsed_ms")) or 0.0
+
+    x_positions = list(range(len(phase_orders)))
+    for node_id, shards_start, shards_end in stage_keys:
+        plt.figure(figsize=(9, 5))
+        for request_order in request_orders:
+            values = [
+                values_by_stage_request_step.get(
+                    (node_id, shards_start, shards_end, request_order, phase_order),
+                    math.nan,
+                )
+                for phase_order in phase_orders
+            ]
+            plt.plot(
+                x_positions,
+                values,
+                marker="o",
+                label=f"request {request_order}",
+            )
+        plt.xticks(x_positions, phase_labels)
+        plt.xlabel("Forward round")
+        plt.ylabel("forward_elapsed_ms (ms)")
+        plt.title(f"Forward elapsed - {node_id} shards {shards_start}~{shards_end}")
+        plt.grid(alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        output_path = output_dir / (
+            f"{prefix}_forward_elapsed_{safe_filename_part(node_id)}_"
+            f"shards_{shards_start}~{shards_end}.png"
+        )
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        print(f"[TEST] plot saved to {output_path}")
+
+    plt.figure(figsize=(9, 5))
+    missing_total_points = 0
+    for request_order in request_orders:
+        total_values = []
+        for phase_order in phase_orders:
+            stage_values = [
+                values_by_stage_request_step.get(
+                    (node_id, shards_start, shards_end, request_order, phase_order)
+                )
+                for node_id, shards_start, shards_end in stage_keys
+            ]
+            if any(value is None for value in stage_values):
+                total_values.append(math.nan)
+                missing_total_points += 1
+            else:
+                total_values.append(sum(stage_values))
+        plt.plot(
+            x_positions,
+            total_values,
+            marker="o",
+            label=f"request {request_order}",
+        )
+    plt.xticks(x_positions, phase_labels)
+    plt.xlabel("Forward round")
+    plt.ylabel("sum of forward_elapsed_ms across stages (ms)")
+    plt.title("Total forward elapsed across pipeline stages")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    total_output_path = output_dir / f"{prefix}_forward_elapsed_total.png"
+    plt.savefig(total_output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {total_output_path}")
+    if missing_total_points:
+        print(
+            f"[WARNING] omitted {missing_total_points} incomplete request/round "
+            "points from the total forward-elapsed plot."
+        )
+
+
 def sample_rows_by_x_interval(
     rows: list[dict],
     x_key: str,
@@ -2895,6 +3055,12 @@ def run_two_round_pipeline_latency_scenario(
         critical_path_analysis["critical_path_rows"],
     )
     write_json(result_dir / f"{prefix}_summary.json", summary)
+    plot_menu7_forward_elapsed_lines(
+        forward_rows=forward_rows,
+        output_dir=result_dir,
+        prefix=prefix,
+        expected_phase_steps=expected_phase_steps,
+    )
     plot_latency_breakdown_pie(
         summary,
         result_dir / f"{prefix}_latency_breakdown_pie.png",

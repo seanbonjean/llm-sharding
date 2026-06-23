@@ -1206,14 +1206,6 @@ def _menu7_phase_step_order(row: dict) -> int:
     return 1 if row.get("phase") == "prefill" else int(row.get("step") or 0) + 1
 
 
-def _menu7_phase_step_label(row: dict) -> str:
-    """Build the human-readable menu-7 x-axis label for one forward round."""
-
-    if row.get("phase") == "prefill":
-        return "prefill"
-    return f"decode {int(row.get('step') or 0)}"
-
-
 def plot_menu7_forward_elapsed_lines(
     forward_rows: list[dict],
     output_dir: Path,
@@ -1258,21 +1250,8 @@ def plot_menu7_forward_elapsed_lines(
     )
     if expected_phase_steps is not None:
         phase_orders = list(range(1, len(expected_phase_steps) + 1))
-        phase_labels = [
-            "prefill" if phase == "prefill" else f"decode {step}"
-            for phase, step in expected_phase_steps
-        ]
     else:
         phase_orders = sorted({_menu7_phase_step_order(row) for row in usable_rows})
-        label_by_phase_order: dict[int, str] = {}
-        for row in usable_rows:
-            label_by_phase_order.setdefault(
-                _menu7_phase_step_order(row), _menu7_phase_step_label(row)
-            )
-        phase_labels = [
-            label_by_phase_order.get(phase_order, str(phase_order))
-            for phase_order in phase_orders
-        ]
 
     values_by_stage_request_step: dict[tuple[str, int, int, int, int], float] = {}
     for row in usable_rows:
@@ -1299,14 +1278,13 @@ def plot_menu7_forward_elapsed_lines(
             plt.plot(
                 x_positions,
                 values,
-                marker="o",
+                linewidth=0.8,
                 label=f"request {request_order}",
             )
-        plt.xticks(x_positions, phase_labels)
-        plt.xlabel("Forward round")
+        plt.xticks([])
+        plt.xlabel("Forward round (prefill followed by decode)")
         plt.ylabel("forward_elapsed_ms (ms)")
         plt.title(f"Forward elapsed - {node_id} shards {shards_start}~{shards_end}")
-        plt.grid(alpha=0.3)
         plt.legend()
         plt.tight_layout()
         output_path = output_dir / (
@@ -1336,14 +1314,13 @@ def plot_menu7_forward_elapsed_lines(
         plt.plot(
             x_positions,
             total_values,
-            marker="o",
+            linewidth=0.8,
             label=f"request {request_order}",
         )
-    plt.xticks(x_positions, phase_labels)
-    plt.xlabel("Forward round")
+    plt.xticks([])
+    plt.xlabel("Forward round (prefill followed by decode)")
     plt.ylabel("sum of forward_elapsed_ms across stages (ms)")
     plt.title("Total forward elapsed across pipeline stages")
-    plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
     total_output_path = output_dir / f"{prefix}_forward_elapsed_total.png"

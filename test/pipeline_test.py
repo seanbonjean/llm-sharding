@@ -84,9 +84,10 @@ AVAILABLE_NODES = [
     PipelineNodeSpec("node2", "172.16.0.6", 14, 21),
     PipelineNodeSpec("node3", "172.16.0.7", 21, 28),
     PipelineNodeSpec("node4", "172.16.0.2", 23, 28),
-    # node5 is a 4 GiB Orin Nano. It is used only as an intermediate stage in
-    # the six-node topology, so it must not load tokenizer/embedding or lm_head.
+    # node5 is a 4 GiB Orin Nano. In every topology that includes it, it stays
+    # an intermediate stage and must not load tokenizer/embedding or lm_head.
     PipelineNodeSpec("node5", "172.16.0.3", 23, 28, can_receive_user_request=False),
+    PipelineNodeSpec("node6", "172.16.0.8", 23, 28),
 ]
 DEFAULT_NODES = AVAILABLE_NODES[:4]
 DEFAULT_LAYER_COUNT = 28
@@ -462,7 +463,8 @@ def build_even_split_nodes(node_count: int) -> list[PipelineNodeSpec]:
     The regular topologies use the order in AVAILABLE_NODES. For six nodes,
     node5 (172.16.0.3) is deliberately placed before node4: node5 is the 4 GiB
     Orin Nano and therefore remains an intermediate shard without embedding or
-    LM-head weights, while node4 remains the final stage.
+    LM-head weights, while node4 remains the final stage. The seven-node order
+    naturally keeps node5 intermediate and uses node6 as the final stage.
     """
     if node_count < 1 or node_count > len(AVAILABLE_NODES):
         raise ValueError(f"[ERROR] node_count must be in [1, {len(AVAILABLE_NODES)}].")
@@ -2774,7 +2776,7 @@ def run_two_round_distinct_same_length_custom_scenario(
         "a long text, tokenize it, then slice exact-length input ids. Each request "
         "uses a different fragment order, so the token ids differ while length stays equal.\n"
     )
-    node_count = ask_int("Node count", 2, minimum=2, maximum=6)
+    node_count = ask_int("Node count", 2, minimum=2, maximum=7)
     request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
     input_token_length = ask_int("Input token length for every request", 64, minimum=8)
     max_new_tokens = (
@@ -2834,7 +2836,7 @@ def run_two_round_same_prompt_custom_scenario(
         "This scenario uses the same prompt for every request, matching scenarios 1-8, "
         "but lets you choose node_count and request_count interactively.\n"
     )
-    node_count = ask_int("Node count", 2, minimum=2, maximum=6)
+    node_count = ask_int("Node count", 2, minimum=2, maximum=7)
     request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
     prompt = ask_prompt(DEFAULT_PROMPTS[4])
     max_new_tokens = (

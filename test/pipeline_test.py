@@ -3076,6 +3076,7 @@ def run_two_round_distinct_same_length_custom_scenario(
     client: PipelineDebugClient,
     result_dir: Path,
     custom_max_new_tokens: bool = False,
+    allow_single_request: bool = False,
 ) -> None:
     print(
         "\n[TEST] Custom two-round latency with different requests but equal input token length\n"
@@ -3084,7 +3085,12 @@ def run_two_round_distinct_same_length_custom_scenario(
         "uses a different fragment order, so the token ids differ while length stays equal.\n"
     )
     node_count = ask_int("Node count", 2, minimum=2, maximum=7)
-    request_count = ask_int("Request count", node_count, minimum=2, maximum=7)
+    request_count = ask_int(
+        "Request count",
+        1 if allow_single_request else node_count,
+        minimum=1 if allow_single_request else 2,
+        maximum=7,
+    )
     input_token_length = ask_int("Input token length for every request", 64, minimum=8)
     max_new_tokens = (
         ask_int("max_new_tokens", 2, minimum=1)
@@ -3195,7 +3201,7 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         "  10. run all scenarios\n"
         "  11. custom nodes/requests with different requests but equal input token length\n"
         "  12. custom nodes/requests with identical request content\n"
-        "  13. custom different requests with equal input token length and custom max_new_tokens\n"
+        "  13. custom different requests with equal input token length, custom max_new_tokens; one request allowed\n"
         "  14. custom identical requests with custom max_new_tokens\n"
     )
     choice = input("Experiment: ").strip()
@@ -3209,7 +3215,10 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
         return
     if choice == "13":
         run_two_round_distinct_same_length_custom_scenario(
-            client, result_dir, custom_max_new_tokens=True
+            client,
+            result_dir,
+            custom_max_new_tokens=True,
+            allow_single_request=True,
         )
         print(f"[TEST] results directory: {result_dir}")
         return

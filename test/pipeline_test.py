@@ -1230,6 +1230,9 @@ def plot_menu7_forward_elapsed_lines(
         print("[TEST] no forward elapsed rows available for menu-7 line plots.")
         return
 
+    trend_output_dir = output_dir / "forward_delay_trend"
+    trend_output_dir.mkdir(parents=True, exist_ok=True)
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1287,7 +1290,7 @@ def plot_menu7_forward_elapsed_lines(
         plt.title(f"Forward elapsed - {node_id} shards {shards_start}~{shards_end}")
         plt.legend()
         plt.tight_layout()
-        output_path = output_dir / (
+        output_path = trend_output_dir / (
             f"{prefix}_forward_elapsed_{safe_filename_part(node_id)}_"
             f"shards_{shards_start}~{shards_end}.png"
         )
@@ -1323,7 +1326,7 @@ def plot_menu7_forward_elapsed_lines(
     plt.title("Total forward elapsed across pipeline stages")
     plt.legend()
     plt.tight_layout()
-    total_output_path = output_dir / f"{prefix}_forward_elapsed_total.png"
+    total_output_path = trend_output_dir / f"{prefix}_forward_elapsed_total.png"
     plt.savefig(total_output_path, dpi=150)
     plt.close()
     print(f"[TEST] plot saved to {total_output_path}")

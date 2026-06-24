@@ -213,9 +213,9 @@ EOS 跳过，因此先经过一次 prefill，再恰好执行 16 次 decode；war
 forward report DAG critical path 累加得到的推理关键路径时延，`communication_and_noncompute_time`
 是二者差值。测试还会输出 latency breakdown 饼图，以及各 request 的
 `done_received_elapsed_ms` 横向条形图。每个 stage 还会输出一张
-`<prefix>_forward_elapsed_<node_id>_shards_<start>~<end>.png`：每条线对应一个 request，
+`forward_delay_trend/<prefix>_forward_elapsed_<node_id>_shards_<start>~<end>.png`：每条线对应一个 request，
 横轴为 prefill 和后续 decode 轮次，纵轴为该 stage 的 `forward_elapsed_ms`。另有
-`<prefix>_forward_elapsed_total.png`，对同一 request、同一轮的所有 stage
+`forward_delay_trend/<prefix>_forward_elapsed_total.png`，对同一 request、同一轮的所有 stage
 `forward_elapsed_ms` 求和；缺失任一 stage report 的点不会纳入总和。
 
 该菜单还提供一个自定义等长不同内容测试项：节点数可输入 2~7，请求数可输入 2~7，

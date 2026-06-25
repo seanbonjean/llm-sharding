@@ -18,6 +18,8 @@ import csv
 import io
 import json
 import math
+import random
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +38,8 @@ KV_CACHE_REPORT = "kv_cache_report"
 SHARD_FORWARD_REPORT = "shard_forward_report"
 PIPELINE_DONE_REPORT = "pipeline_done_report"
 PIPELINE_NODE_READY = "pipeline_node_ready"
+PIPELINE_ADMISSION_REPORT = "pipeline_admission_report"
+PIPELINE_TOKEN_REPORT = "pipeline_token_report"
 
 TOKENIZER_PATH = "shards/Llama-3___2-3B-Instruct_float16"
 RESULT_ROOT = Path("results") / "pipeline_kv_cache"
@@ -44,6 +48,14 @@ DEFAULT_TELEMETRY_PORT = 40900
 DEFAULT_PREFILL_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
 DEFAULT_DECODE_OUTPUT_TOKEN_LENGTHS = [8, 16, 32, 64, 128, 256, 512]
 OVERLAP_TIME_SAMPLE_INTERVAL_S = 1.0
+CONCURRENCY_SWEEP_NODE_COUNT = 4
+CONCURRENCY_SWEEP_REQUEST_COUNT = 12
+CONCURRENCY_SWEEP_MAX_ACTIVE_VALUES = [1, 2, 3, 4, 5, 6, 8]
+CONCURRENCY_SWEEP_INPUT_TOKEN_LENGTH = 128
+CONCURRENCY_SWEEP_OUTPUT_TOKEN_LENGTH = 64
+CONCURRENCY_SWEEP_REPEATS = 5
+CONCURRENCY_SWEEP_WARMUP_INPUT_TOKEN_LENGTH = 64
+CONCURRENCY_SWEEP_WARMUP_OUTPUT_TOKEN_LENGTH = 16
 PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH = 16
 PIPELINE_LATENCY_WARMUP_DECODE_STEPS = 16
 PIPELINE_LATENCY_WARMUP_MAX_NEW_TOKENS = (
@@ -650,6 +662,72 @@ def write_json(path: Path, data: dict) -> None:
     print(f"[TEST] json saved to {path}")
 
 
+def percentile(values: list[float], percent: float) -> float | None:
+    usable_values = sorted(value for value in values if value is not None)
+    if not usable_values:
+        return None
+    if len(usable_values) == 1:
+        return usable_values[0]
+    rank = (len(usable_values) - 1) * percent / 100.0
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return usable_values[int(rank)]
+    lower_value = usable_values[lower]
+    upper_value = usable_values[upper]
+    return lower_value + (upper_value - lower_value) * (rank - lower)
+
+
+def mean_or_none(values: list[float]) -> float | None:
+    usable_values = [value for value in values if value is not None]
+    if not usable_values:
+        return None
+    return sum(usable_values) / len(usable_values)
+
+
+class TegrastatsLogger:
+    """
+    Optional local tegrastats capture for runs launched on a Jetson controller.
+
+    This does not SSH into worker devices. It only records the local machine's
+    tegrastats output when the CLI operator explicitly enables it.
+    """
+
+    def __init__(self, output_path: Path, interval_ms: int = 1000):
+        self.output_path = output_path
+        self.interval_ms = interval_ms
+        self._file = None
+        self._process: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.output_path.open("w", encoding="utf-8", errors="replace")
+        try:
+            self._process = subprocess.Popen(
+                ["tegrastats", "--interval", str(self.interval_ms)],
+                stdout=self._file,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print(f"[TEST] tegrastats logging to {self.output_path}")
+        except FileNotFoundError:
+            print("[WARNING] tegrastats command not found; skip tegrastats logging.")
+            self.stop()
+
+    def stop(self) -> None:
+        if self._process is not None and self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5.0)
+        self._process = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+
 def linear_fit(xs: list[float], ys: list[float]) -> dict[str, float]:
     if len(xs) != len(ys):
         raise ValueError("[ERROR] xs and ys must have the same length.")
@@ -1127,7 +1205,9 @@ def analyze_forward_critical_path(forward_rows: list[dict]) -> dict:
 def plot_latency_breakdown_pie(summary: dict, output_path: Path) -> None:
     inference_time = _float_or_none(summary.get("inference_time"))
     residual_time = _float_or_none(summary.get("communication_and_noncompute_time"))
-    total_time = _float_or_none(summary.get("total_complete_time"))
+    total_time = _float_or_none(summary.get("total_complete_time_preferred_ms"))
+    if total_time is None:
+        total_time = _float_or_none(summary.get("total_complete_time"))
     if inference_time is None or residual_time is None or total_time is None:
         print(f"[TEST] no complete latency breakdown to plot for {output_path}")
         return
@@ -1162,9 +1242,24 @@ def plot_latency_breakdown_pie(summary: dict, output_path: Path) -> None:
     print(f"[TEST] plot saved to {output_path}")
 
 
-def plot_done_received_barh(done_rows: list[dict], output_path: Path) -> None:
+def plot_request_completion_elapsed_barh(
+    done_rows: list[dict],
+    output_path: Path,
+) -> None:
+    """Plot per-request completion elapsed time with an explicit preferred source.
+
+    The preferred value is owner-local batch elapsed time because it is measured
+    on the owner node's monotonic clock. The collector-side receive elapsed time
+    is kept only as a fallback for older worker versions or incomplete reports.
+    """
+
     usable_rows = [
-        row for row in done_rows if _float_or_none(row.get("done_received_elapsed_ms")) is not None
+        row
+        for row in done_rows
+        if (
+            _float_or_none(row.get("owner_local_batch_elapsed_ms")) is not None
+            or _float_or_none(row.get("collector_done_received_elapsed_ms")) is not None
+        )
     ]
     if not usable_rows:
         print(f"[TEST] no done rows to plot for {output_path}")
@@ -1176,20 +1271,28 @@ def plot_done_received_barh(done_rows: list[dict], output_path: Path) -> None:
 
     ordered_rows = sorted(usable_rows, key=lambda row: int(row.get("request_order") or 0))
     labels = [f"request {int(row.get('request_order') or 0)}" for row in ordered_rows]
-    values = [
-        _float_or_none(row.get("done_received_elapsed_ms")) or 0.0
-        for row in ordered_rows
-    ]
+    values: list[float] = []
+    sources: list[str] = []
+    for row in ordered_rows:
+        owner_elapsed = _float_or_none(row.get("owner_local_batch_elapsed_ms"))
+        if owner_elapsed is not None:
+            values.append(owner_elapsed)
+            sources.append("owner_local_batch_elapsed_ms")
+            continue
+        values.append(
+            _float_or_none(row.get("collector_done_received_elapsed_ms")) or 0.0
+        )
+        sources.append("collector_done_received_elapsed_ms")
 
     height = max(4.0, 0.45 * len(ordered_rows) + 1.5)
     plt.figure(figsize=(9, height))
     plt.barh(labels, values)
-    plt.xlabel("done_received_elapsed_ms")
+    plt.xlabel("request_completion_elapsed_preferred_ms")
     plt.ylabel("request order")
-    plt.title("Request completion time from batch submission")
+    plt.title("Request completion elapsed time (preferred source)")
     plt.grid(axis="x", alpha=0.3)
-    for index, value in enumerate(values):
-        plt.text(value, index, f" {value:.1f} ms", va="center", fontsize=8)
+    for index, (value, source) in enumerate(zip(values, sources)):
+        plt.text(value, index, f" {value:.1f} ms\n {source}", va="center", fontsize=8)
     plt.gca().invert_yaxis()
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
@@ -1211,6 +1314,7 @@ def plot_menu7_forward_elapsed_lines(
     output_dir: Path,
     prefix: str,
     expected_phase_steps: list[tuple[str, int]] | None = None,
+    dense_output_axis: bool = False,
 ) -> None:
     """
     Plot menu-7 forward elapsed time for every stage and for their per-step sum.
@@ -1281,7 +1385,7 @@ def plot_menu7_forward_elapsed_lines(
             plt.plot(
                 x_positions,
                 values,
-                linewidth=0.8,
+                linewidth=0.5 if dense_output_axis else 0.8,
                 label=f"request {request_order}",
             )
         plt.xticks([])
@@ -1317,7 +1421,7 @@ def plot_menu7_forward_elapsed_lines(
         plt.plot(
             x_positions,
             total_values,
-            linewidth=0.8,
+            linewidth=0.5 if dense_output_axis else 0.8,
             label=f"request {request_order}",
         )
     plt.xticks([])
@@ -1335,6 +1439,199 @@ def plot_menu7_forward_elapsed_lines(
             f"[WARNING] omitted {missing_total_points} incomplete request/round "
             "points from the total forward-elapsed plot."
         )
+
+
+def plot_sweep_metric_lines(
+    rows: list[dict],
+    metric_specs: list[tuple[str, str]],
+    output_path: Path,
+    title: str,
+    y_label: str,
+    value_transform: Callable[[float], float] | None = None,
+) -> None:
+    if not rows:
+        print(f"[TEST] no rows to plot for {output_path}")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    max_active_values = sorted(
+        {int(row["max_active_requests"]) for row in rows if row.get("max_active_requests") is not None}
+    )
+    if not max_active_values:
+        print(f"[TEST] no max_active_requests values for {output_path}")
+        return
+
+    plt.figure(figsize=(9, 5))
+    for metric_key, label in metric_specs:
+        xs = []
+        ys = []
+        for max_active in max_active_values:
+            raw_values = [
+                _float_or_none(row.get(metric_key))
+                for row in rows
+                if int(row.get("max_active_requests") or 0) == max_active
+            ]
+            mean_value = mean_or_none([
+                value for value in raw_values if value is not None
+            ])
+            if mean_value is None:
+                continue
+            xs.append(max_active)
+            ys.append(value_transform(mean_value) if value_transform else mean_value)
+        if xs:
+            plt.plot(xs, ys, marker="o", linewidth=1.4, label=label)
+
+    plt.xlabel("max_active_requests")
+    plt.ylabel(y_label)
+    plt.title(title)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {output_path}")
+
+
+def plot_stage_time_utilization(
+    rows: list[dict],
+    output_path: Path,
+) -> None:
+    if not rows:
+        print(f"[TEST] no stage utilization rows to plot for {output_path}")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    stage_keys = sorted(
+        {
+            (
+                str(row.get("node_id")),
+                int(row.get("shards_start") or 0),
+                int(row.get("shards_end") or 0),
+            )
+            for row in rows
+        },
+        key=lambda item: (item[1], item[2], item[0]),
+    )
+    max_active_values = sorted(
+        {int(row.get("max_active_requests") or 0) for row in rows}
+    )
+
+    plt.figure(figsize=(9, 5))
+    for node_id, shards_start, shards_end in stage_keys:
+        xs = []
+        ys = []
+        for max_active in max_active_values:
+            values = [
+                _float_or_none(row.get("stage_time_utilization"))
+                for row in rows
+                if str(row.get("node_id")) == node_id
+                and int(row.get("shards_start") or 0) == shards_start
+                and int(row.get("shards_end") or 0) == shards_end
+                and int(row.get("max_active_requests") or 0) == max_active
+            ]
+            mean_value = mean_or_none([
+                value for value in values if value is not None
+            ])
+            if mean_value is None:
+                continue
+            xs.append(max_active)
+            ys.append(mean_value * 100.0)
+        if xs:
+            plt.plot(
+                xs,
+                ys,
+                marker="o",
+                linewidth=1.4,
+                label=f"{node_id} {shards_start}~{shards_end}",
+            )
+
+    plt.xlabel("max_active_requests")
+    plt.ylabel("stage time utilization (%)")
+    plt.title(
+        "Stage time utilization (forward time / total completion time; lower means more idle)"
+    )
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {output_path}")
+
+
+def plot_memory_peak_by_node(
+    rows: list[dict],
+    metric_key: str,
+    output_path: Path,
+    title: str,
+    y_label: str,
+) -> None:
+    if not rows:
+        print(f"[TEST] no memory peak rows to plot for {output_path}")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    node_keys = sorted(
+        {
+            (
+                str(row.get("node_id")),
+                int(row.get("shards_start") or 0),
+                int(row.get("shards_end") or 0),
+            )
+            for row in rows
+        },
+        key=lambda item: (item[1], item[2], item[0]),
+    )
+    max_active_values = sorted(
+        {int(row.get("max_active_requests") or 0) for row in rows}
+    )
+
+    plt.figure(figsize=(9, 5))
+    for node_id, shards_start, shards_end in node_keys:
+        xs = []
+        ys = []
+        for max_active in max_active_values:
+            values = [
+                _float_or_none(row.get(metric_key))
+                for row in rows
+                if str(row.get("node_id")) == node_id
+                and int(row.get("shards_start") or 0) == shards_start
+                and int(row.get("shards_end") or 0) == shards_end
+                and int(row.get("max_active_requests") or 0) == max_active
+            ]
+            mean_value = mean_or_none([
+                value for value in values if value is not None
+            ])
+            if mean_value is None:
+                continue
+            xs.append(max_active)
+            ys.append(bytes_to_mib(mean_value))
+        if xs:
+            plt.plot(
+                xs,
+                ys,
+                marker="o",
+                linewidth=1.4,
+                label=f"{node_id} {shards_start}~{shards_end}",
+            )
+
+    plt.xlabel("max_active_requests")
+    plt.ylabel(y_label)
+    plt.title(title)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {output_path}")
 
 
 def sample_rows_by_x_interval(
@@ -1476,7 +1773,7 @@ def build_distinct_input_ids_for_same_length(
 
     input_ids_list: list[torch.Tensor] = []
     for request_index in range(request_count):
-        text = ""
+        text = f"Profiler-style distinct request seed {request_index + 1}. "
         fragment_index = request_index
         while len(tokenizer(text, return_tensors="pt")["input_ids"][0]) < token_length:
             text += DISTINCT_PROMPT_FRAGMENTS[
@@ -1514,6 +1811,21 @@ def aggregate_reports(reports_by_node: dict[str, dict]) -> dict:
     total_cuda_memory_allocated = sum_optional_int("cuda_memory_allocated_bytes")
     total_cuda_memory_baseline = sum_optional_int("cuda_memory_baseline_bytes")
     total_cuda_memory_delta = sum_optional_int("cuda_memory_delta_bytes")
+    total_mem_info_free = sum_optional_int("cuda_mem_get_info_free_bytes")
+    total_mem_info_used = sum_optional_int("cuda_mem_get_info_used_bytes")
+    total_mem_info_total = sum_optional_int("cuda_mem_get_info_total_bytes")
+    total_mem_info_free_baseline = sum_optional_int(
+        "cuda_mem_get_info_free_baseline_bytes"
+    )
+    total_mem_info_used_baseline = sum_optional_int(
+        "cuda_mem_get_info_used_baseline_bytes"
+    )
+    total_mem_info_used_delta = sum_optional_int(
+        "cuda_mem_get_info_used_delta_bytes"
+    )
+    total_mem_info_free_delta = sum_optional_int(
+        "cuda_mem_get_info_free_delta_bytes"
+    )
     timestamps = [float(report.get("timestamp") or 0.0) for report in reports]
     first = reports[0]
     return {
@@ -1545,6 +1857,48 @@ def aggregate_reports(reports_by_node: dict[str, dict]) -> dict:
         "cuda_memory_delta_mib": (
             bytes_to_mib(total_cuda_memory_delta)
             if total_cuda_memory_delta is not None
+            else None
+        ),
+        "cuda_mem_get_info_free_bytes": total_mem_info_free,
+        "cuda_mem_get_info_free_mib": (
+            bytes_to_mib(total_mem_info_free)
+            if total_mem_info_free is not None
+            else None
+        ),
+        "cuda_mem_get_info_used_bytes": total_mem_info_used,
+        "cuda_mem_get_info_used_mib": (
+            bytes_to_mib(total_mem_info_used)
+            if total_mem_info_used is not None
+            else None
+        ),
+        "cuda_mem_get_info_total_bytes": total_mem_info_total,
+        "cuda_mem_get_info_total_mib": (
+            bytes_to_mib(total_mem_info_total)
+            if total_mem_info_total is not None
+            else None
+        ),
+        "cuda_mem_get_info_free_baseline_bytes": total_mem_info_free_baseline,
+        "cuda_mem_get_info_free_baseline_mib": (
+            bytes_to_mib(total_mem_info_free_baseline)
+            if total_mem_info_free_baseline is not None
+            else None
+        ),
+        "cuda_mem_get_info_used_baseline_bytes": total_mem_info_used_baseline,
+        "cuda_mem_get_info_used_baseline_mib": (
+            bytes_to_mib(total_mem_info_used_baseline)
+            if total_mem_info_used_baseline is not None
+            else None
+        ),
+        "cuda_mem_get_info_used_delta_bytes": total_mem_info_used_delta,
+        "cuda_mem_get_info_used_delta_mib": (
+            bytes_to_mib(total_mem_info_used_delta)
+            if total_mem_info_used_delta is not None
+            else None
+        ),
+        "cuda_mem_get_info_free_delta_bytes": total_mem_info_free_delta,
+        "cuda_mem_get_info_free_delta_mib": (
+            bytes_to_mib(total_mem_info_free_delta)
+            if total_mem_info_free_delta is not None
             else None
         ),
         "first_timestamp": min(timestamps),
@@ -2532,7 +2886,7 @@ def collect_forward_reports_and_done(
                     reports_by_key[key] = event
                 continue
             if event_type == PIPELINE_DONE_REPORT and client_request_id in expected_done_ids:
-                event["done_received_elapsed_ms"] = (
+                event["collector_done_received_elapsed_ms"] = (
                     time.perf_counter() - process_started_perf
                 ) * 1000.0
                 done_by_client_id[client_request_id] = event
@@ -2604,6 +2958,785 @@ def wait_for_warmup_batch(
         )
     else:
         print(f"[TEST] warm-up requests completed: {warmup_client_ids}.")
+
+
+def collect_concurrency_sweep_events(
+    client: PipelineDebugClient,
+    client_request_ids: list[str],
+    expected_phase_steps: list[tuple[str, int]],
+    process_started_perf: float,
+    timeout_s: float,
+) -> dict:
+    expected_node_ids = {node.node_id for node in client.nodes}
+    expected_report_keys = {
+        (client_request_id, node_id, phase, step)
+        for client_request_id in client_request_ids
+        for node_id in expected_node_ids
+        for phase, step in expected_phase_steps
+    }
+    expected_client_ids = set(client_request_ids)
+    reports_by_key: dict[tuple[str, str, str, int], dict] = {}
+    done_by_client_id: dict[str, dict] = {}
+    ack_by_client_id: dict[str, dict] = {}
+    admission_by_client_id: dict[str, dict] = {}
+    first_token_by_client_id: dict[str, dict] = {}
+    held_events: list[dict] = []
+    deadline = time.time() + timeout_s
+
+    try:
+        while time.time() < deadline:
+            if (
+                set(ack_by_client_id) == expected_client_ids
+                and set(admission_by_client_id) == expected_client_ids
+                and set(first_token_by_client_id) == expected_client_ids
+                and set(reports_by_key) == expected_report_keys
+                and set(done_by_client_id) == expected_client_ids
+            ):
+                break
+            event = client.receive_event(
+                timeout_s=max(0.05, min(0.5, deadline - time.time()))
+            )
+            if event is None:
+                continue
+            received_elapsed_ms = (time.perf_counter() - process_started_perf) * 1000.0
+            event_type = event.get("type")
+            client_request_id = str(event.get("client_request_id"))
+
+            if event_type == USER_REQUEST_ACK and client_request_id in expected_client_ids:
+                event["collector_ack_received_elapsed_ms"] = received_elapsed_ms
+                ack_by_client_id[client_request_id] = event
+                continue
+
+            if (
+                event_type == PIPELINE_ADMISSION_REPORT
+                and client_request_id in expected_client_ids
+            ):
+                event["collector_admission_received_elapsed_ms"] = received_elapsed_ms
+                admission_by_client_id[client_request_id] = event
+                continue
+
+            if (
+                event_type == PIPELINE_TOKEN_REPORT
+                and client_request_id in expected_client_ids
+            ):
+                event["collector_token_received_elapsed_ms"] = received_elapsed_ms
+                if (
+                    bool(event.get("is_first_token"))
+                    and client_request_id not in first_token_by_client_id
+                ):
+                    event["collector_first_token_received_elapsed_ms"] = (
+                        received_elapsed_ms
+                    )
+                    if event.get("owner_local_ttft_ms") is not None:
+                        event["first_token_elapsed_preferred_ms"] = event.get(
+                            "owner_local_ttft_ms"
+                        )
+                        event["first_token_elapsed_source"] = "owner_local_ttft_ms"
+                    else:
+                        event["first_token_elapsed_preferred_ms"] = received_elapsed_ms
+                        event["first_token_elapsed_source"] = (
+                            "collector_first_token_received_elapsed_ms"
+                        )
+                    first_token_by_client_id[client_request_id] = event
+                continue
+
+            if (
+                event_type == SHARD_FORWARD_REPORT
+                and client_request_id in expected_client_ids
+                and event.get("event") == "shard_forward_measurement"
+            ):
+                phase = str(event.get("phase"))
+                step = int(event.get("step") or 0)
+                key = (
+                    client_request_id,
+                    str(event.get("node_id")),
+                    phase,
+                    step,
+                )
+                if key in expected_report_keys:
+                    event["collector_received_elapsed_ms"] = received_elapsed_ms
+                    reports_by_key[key] = event
+                continue
+
+            if event_type == PIPELINE_DONE_REPORT and client_request_id in expected_client_ids:
+                event["collector_done_received_elapsed_ms"] = received_elapsed_ms
+                done_by_client_id[client_request_id] = event
+                continue
+
+            held_events.append(event)
+    finally:
+        client._event_backlog[:0] = held_events
+
+    phase_step_order = {
+        phase_step: index for index, phase_step in enumerate(expected_phase_steps)
+    }
+    reports = list(reports_by_key.values())
+    reports.sort(
+        key=lambda row: (
+            client_request_ids.index(str(row.get("client_request_id"))),
+            phase_step_order.get((str(row.get("phase")), int(row.get("step") or 0)), 999),
+            int(row.get("shards_start") or 0),
+        )
+    )
+    done_reports = list(done_by_client_id.values())
+    done_reports.sort(
+        key=lambda row: client_request_ids.index(str(row.get("client_request_id")))
+    )
+    return {
+        "reports": reports,
+        "done_reports": done_reports,
+        "ack_by_client_id": ack_by_client_id,
+        "admission_by_client_id": admission_by_client_id,
+        "first_token_by_client_id": first_token_by_client_id,
+        "missing_ack": sorted(expected_client_ids - set(ack_by_client_id)),
+        "missing_admission": sorted(expected_client_ids - set(admission_by_client_id)),
+        "missing_first_token": sorted(expected_client_ids - set(first_token_by_client_id)),
+        "missing_reports": sorted(expected_report_keys - set(reports_by_key)),
+        "missing_done": sorted(expected_client_ids - set(done_by_client_id)),
+    }
+
+
+def add_run_memory_baselines(forward_rows: list[dict]) -> None:
+    allocated_baseline_by_node: dict[str, int] = {}
+    mem_info_used_baseline_by_node: dict[str, int] = {}
+    for row in forward_rows:
+        node_id = str(row.get("node_id"))
+        allocated_before = row.get("cuda_memory_before_bytes")
+        if allocated_before is not None:
+            allocated_baseline_by_node[node_id] = min(
+                allocated_baseline_by_node.get(node_id, int(allocated_before)),
+                int(allocated_before),
+            )
+        mem_info_used_before = row.get("cuda_mem_get_info_used_before_bytes")
+        if mem_info_used_before is not None:
+            mem_info_used_baseline_by_node[node_id] = min(
+                mem_info_used_baseline_by_node.get(node_id, int(mem_info_used_before)),
+                int(mem_info_used_before),
+            )
+
+    for row in forward_rows:
+        node_id = str(row.get("node_id"))
+        allocated_after = row.get("cuda_memory_after_bytes")
+        allocated_baseline = allocated_baseline_by_node.get(node_id)
+        allocated_delta = (
+            int(allocated_after) - allocated_baseline
+            if allocated_after is not None and allocated_baseline is not None
+            else None
+        )
+        row["cuda_memory_allocated_run_baseline_bytes"] = allocated_baseline
+        row["cuda_memory_allocated_run_delta_bytes"] = allocated_delta
+        row["cuda_memory_allocated_run_delta_mib"] = bytes_to_mib(allocated_delta)
+
+        mem_info_used_after = row.get("cuda_mem_get_info_used_after_bytes")
+        mem_info_used_baseline = mem_info_used_baseline_by_node.get(node_id)
+        mem_info_used_delta = (
+            int(mem_info_used_after) - mem_info_used_baseline
+            if mem_info_used_after is not None and mem_info_used_baseline is not None
+            else None
+        )
+        row["cuda_mem_get_info_used_run_baseline_bytes"] = mem_info_used_baseline
+        row["cuda_mem_get_info_used_run_delta_bytes"] = mem_info_used_delta
+        row["cuda_mem_get_info_used_run_delta_mib"] = bytes_to_mib(mem_info_used_delta)
+
+
+def summarize_memory_peaks(
+    forward_rows: list[dict],
+    done_rows: list[dict],
+    client_nodes: list[PipelineNodeSpec],
+) -> tuple[list[dict], dict]:
+    latest_kv_by_node_request: dict[tuple[str, str], int] = {}
+    peak_dynamic_by_node: dict[str, int] = {node.node_id: 0 for node in client_nodes}
+    peak_alloc_delta_by_node: dict[str, int | None] = {
+        node.node_id: None for node in client_nodes
+    }
+    peak_mem_info_delta_by_node: dict[str, int | None] = {
+        node.node_id: None for node in client_nodes
+    }
+    peak_dynamic_total = 0
+
+    timeline_events: list[tuple[float, str, dict]] = []
+    # These events are ordered by the collector's telemetry receive time. This
+    # is useful for a conservative active-KV estimate, but it is not a synced
+    # cross-device execution timeline and should not be mixed with owner-local
+    # latency fields.
+    for row in forward_rows:
+        elapsed = _float_or_none(row.get("collector_received_elapsed_ms"))
+        if elapsed is not None:
+            timeline_events.append((elapsed, "forward", row))
+    for row in done_rows:
+        elapsed = _float_or_none(row.get("collector_done_received_elapsed_ms"))
+        if elapsed is not None:
+            timeline_events.append((elapsed, "done", row))
+    timeline_events.sort(key=lambda item: item[0])
+
+    for _, event_type, row in timeline_events:
+        if event_type == "done":
+            client_request_id = str(row.get("client_request_id"))
+            for node in client_nodes:
+                latest_kv_by_node_request[(node.node_id, client_request_id)] = 0
+            continue
+
+        node_id = str(row.get("node_id"))
+        client_request_id = str(row.get("client_request_id"))
+        latest_kv_by_node_request[(node_id, client_request_id)] = int(
+            row.get("kv_cache_after_bytes") or 0
+        )
+        node_dynamic_total = sum(
+            value
+            for (current_node_id, _), value in latest_kv_by_node_request.items()
+            if current_node_id == node_id
+        )
+        peak_dynamic_by_node[node_id] = max(
+            peak_dynamic_by_node.get(node_id, 0),
+            node_dynamic_total,
+        )
+        peak_dynamic_total = max(
+            peak_dynamic_total,
+            sum(latest_kv_by_node_request.values()),
+        )
+
+        allocated_delta = row.get("cuda_memory_allocated_run_delta_bytes")
+        if allocated_delta is not None:
+            previous = peak_alloc_delta_by_node.get(node_id)
+            peak_alloc_delta_by_node[node_id] = max(
+                int(allocated_delta),
+                int(previous) if previous is not None else int(allocated_delta),
+            )
+        mem_info_delta = row.get("cuda_mem_get_info_used_run_delta_bytes")
+        if mem_info_delta is not None:
+            previous = peak_mem_info_delta_by_node.get(node_id)
+            peak_mem_info_delta_by_node[node_id] = max(
+                int(mem_info_delta),
+                int(previous) if previous is not None else int(mem_info_delta),
+            )
+
+    node_spec_by_id = {node.node_id: node for node in client_nodes}
+    memory_rows = []
+    for node_id in sorted(peak_dynamic_by_node, key=lambda item: node_spec_by_id[item].shards_start):
+        node = node_spec_by_id[node_id]
+        allocated_delta = peak_alloc_delta_by_node.get(node_id)
+        mem_info_delta = peak_mem_info_delta_by_node.get(node_id)
+        dynamic_peak = peak_dynamic_by_node[node_id]
+        memory_rows.append(
+            {
+                "node_id": node_id,
+                "node_addr": node.node_addr,
+                "shards_start": node.shards_start,
+                "shards_end": node.shards_end,
+                "peak_ordering_basis": "collector_telemetry_receive_order",
+                "peak_dynamiccache_total_bytes": dynamic_peak,
+                "peak_dynamiccache_total_mib": bytes_to_mib(dynamic_peak),
+                "peak_cuda_memory_allocated_run_delta_bytes": allocated_delta,
+                "peak_cuda_memory_allocated_run_delta_mib": bytes_to_mib(allocated_delta),
+                "peak_cuda_mem_get_info_used_run_delta_bytes": mem_info_delta,
+                "peak_cuda_mem_get_info_used_run_delta_mib": bytes_to_mib(mem_info_delta),
+            }
+        )
+
+    allocated_values = [
+        value for value in peak_alloc_delta_by_node.values() if value is not None
+    ]
+    mem_info_values = [
+        value for value in peak_mem_info_delta_by_node.values() if value is not None
+    ]
+    memory_summary = {
+        "memory_peak_ordering_basis": "collector_telemetry_receive_order",
+        "peak_dynamiccache_total_bytes": peak_dynamic_total,
+        "peak_dynamiccache_total_mib": bytes_to_mib(peak_dynamic_total),
+        "sum_peak_dynamiccache_by_node_bytes": sum(peak_dynamic_by_node.values()),
+        "sum_peak_dynamiccache_by_node_mib": bytes_to_mib(
+            sum(peak_dynamic_by_node.values())
+        ),
+        "max_peak_dynamiccache_by_node_bytes": max(peak_dynamic_by_node.values())
+        if peak_dynamic_by_node
+        else None,
+        "max_peak_dynamiccache_by_node_mib": bytes_to_mib(
+            max(peak_dynamic_by_node.values()) if peak_dynamic_by_node else None
+        ),
+        "sum_peak_cuda_memory_allocated_run_delta_bytes": sum(allocated_values)
+        if allocated_values
+        else None,
+        "sum_peak_cuda_memory_allocated_run_delta_mib": bytes_to_mib(
+            sum(allocated_values) if allocated_values else None
+        ),
+        "max_peak_cuda_memory_allocated_run_delta_bytes": max(allocated_values)
+        if allocated_values
+        else None,
+        "max_peak_cuda_memory_allocated_run_delta_mib": bytes_to_mib(
+            max(allocated_values) if allocated_values else None
+        ),
+        "sum_peak_cuda_mem_get_info_used_run_delta_bytes": sum(mem_info_values)
+        if mem_info_values
+        else None,
+        "sum_peak_cuda_mem_get_info_used_run_delta_mib": bytes_to_mib(
+            sum(mem_info_values) if mem_info_values else None
+        ),
+        "max_peak_cuda_mem_get_info_used_run_delta_bytes": max(mem_info_values)
+        if mem_info_values
+        else None,
+        "max_peak_cuda_mem_get_info_used_run_delta_mib": bytes_to_mib(
+            max(mem_info_values) if mem_info_values else None
+        ),
+    }
+    return memory_rows, memory_summary
+
+
+def build_concurrency_sweep_result_rows(
+    *,
+    experiment_name: str,
+    run_index: int,
+    repeat_index: int,
+    max_active_requests: int,
+    input_token_length: int,
+    output_token_length: int,
+    client: PipelineDebugClient,
+    client_request_ids: list[str],
+    collected: dict,
+    process_started_perf: float,
+) -> tuple[
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    dict,
+]:
+    expected_phase_steps = [("prefill", 0)] + [
+        ("decode", step) for step in range(1, output_token_length)
+    ]
+    phase_step_order = {
+        phase_step: index + 1 for index, phase_step in enumerate(expected_phase_steps)
+    }
+    request_order_by_client_id = {
+        client_request_id: index
+        for index, client_request_id in enumerate(client_request_ids, start=1)
+    }
+    ack_by_client_id = collected["ack_by_client_id"]
+    admission_by_client_id = collected["admission_by_client_id"]
+    first_token_by_client_id = collected["first_token_by_client_id"]
+
+    request_id_by_client_id = {
+        client_request_id: ack.get("request_id")
+        for client_request_id, ack in ack_by_client_id.items()
+    }
+
+    forward_rows: list[dict] = []
+    for report in collected["reports"]:
+        client_request_id = str(report.get("client_request_id"))
+        phase = str(report.get("phase"))
+        step = int(report.get("step") or 0)
+        request_order = request_order_by_client_id[client_request_id]
+        row = {
+            "experiment": experiment_name,
+            "run_index": run_index,
+            "repeat_index": repeat_index,
+            "topology_node_count": client.pipeline_depth,
+            "request_count": len(client_request_ids),
+            "max_active_requests": max_active_requests,
+            "input_token_length": input_token_length,
+            "max_new_tokens": output_token_length,
+            "request_order": request_order,
+            "client_request_id": client_request_id,
+            "request_id": request_id_by_client_id.get(client_request_id),
+            "node_id": report.get("node_id"),
+            "node_addr": report.get("node_addr"),
+            "shards_start": report.get("shards_start"),
+            "shards_end": report.get("shards_end"),
+            "phase": phase,
+            "step": step,
+            "phase_step_order": phase_step_order.get((phase, step)),
+            "started_timestamp": report.get("started_timestamp"),
+            "finished_timestamp": report.get("finished_timestamp"),
+            "collector_received_elapsed_ms": report.get("collector_received_elapsed_ms"),
+            "forward_elapsed_ms": report.get("forward_elapsed_ms"),
+            "shard_forward_elapsed_ms": report.get("shard_forward_elapsed_ms"),
+            "owner_embedding_elapsed_ms": report.get("owner_embedding_elapsed_ms"),
+            "kv_cache_before_bytes": report.get("kv_cache_before_bytes"),
+            "kv_cache_after_bytes": report.get("kv_cache_after_bytes"),
+            "kv_cache_delta_bytes": report.get("kv_cache_delta_bytes"),
+            "kv_cache_delta_mib": bytes_to_mib(report.get("kv_cache_delta_bytes")),
+            "cuda_memory_before_bytes": report.get("cuda_memory_before_bytes"),
+            "cuda_memory_after_bytes": report.get("cuda_memory_after_bytes"),
+            "cuda_memory_forward_delta_bytes": report.get(
+                "cuda_memory_forward_delta_bytes"
+            ),
+            "cuda_memory_forward_delta_mib": bytes_to_mib(
+                report.get("cuda_memory_forward_delta_bytes")
+            ),
+            "cuda_mem_get_info_free_before_bytes": report.get(
+                "cuda_mem_get_info_free_before_bytes"
+            ),
+            "cuda_mem_get_info_total_before_bytes": report.get(
+                "cuda_mem_get_info_total_before_bytes"
+            ),
+            "cuda_mem_get_info_used_before_bytes": report.get(
+                "cuda_mem_get_info_used_before_bytes"
+            ),
+            "cuda_mem_get_info_free_after_bytes": report.get(
+                "cuda_mem_get_info_free_after_bytes"
+            ),
+            "cuda_mem_get_info_total_after_bytes": report.get(
+                "cuda_mem_get_info_total_after_bytes"
+            ),
+            "cuda_mem_get_info_used_after_bytes": report.get(
+                "cuda_mem_get_info_used_after_bytes"
+            ),
+            "cuda_mem_get_info_used_forward_delta_bytes": report.get(
+                "cuda_mem_get_info_used_forward_delta_bytes"
+            ),
+            "cuda_mem_get_info_used_forward_delta_mib": bytes_to_mib(
+                report.get("cuda_mem_get_info_used_forward_delta_bytes")
+            ),
+            "cuda_mem_get_info_free_forward_delta_bytes": report.get(
+                "cuda_mem_get_info_free_forward_delta_bytes"
+            ),
+        }
+        forward_rows.append(row)
+    add_run_memory_baselines(forward_rows)
+
+    done_rows: list[dict] = []
+    for done_report in collected["done_reports"]:
+        client_request_id = str(done_report.get("client_request_id"))
+        request_order = request_order_by_client_id[client_request_id]
+        done_rows.append(
+            {
+                "experiment": experiment_name,
+                "run_index": run_index,
+                "repeat_index": repeat_index,
+                "topology_node_count": client.pipeline_depth,
+                "request_count": len(client_request_ids),
+                "max_active_requests": max_active_requests,
+                "input_token_length": input_token_length,
+                "max_new_tokens": output_token_length,
+                "request_order": request_order,
+                "client_request_id": client_request_id,
+                "request_id": request_id_by_client_id.get(client_request_id),
+                "reason": done_report.get("reason"),
+                "output_token_count": done_report.get("output_token_count"),
+                "ignore_eos_for_measurement": done_report.get(
+                    "ignore_eos_for_measurement"
+                ),
+                "eos_seen": done_report.get("eos_seen"),
+                "first_eos_step": done_report.get("first_eos_step"),
+                "semantic_output_valid": done_report.get("semantic_output_valid"),
+                "collector_done_received_elapsed_ms": done_report.get(
+                    "collector_done_received_elapsed_ms"
+                ),
+                "owner_local_request_elapsed_ms": done_report.get(
+                    "owner_local_request_elapsed_ms"
+                ),
+                "owner_local_batch_elapsed_ms": done_report.get(
+                    "owner_local_batch_elapsed_ms"
+                ),
+                "owner_request_start_timestamp": done_report.get(
+                    "owner_request_start_timestamp"
+                ),
+                "owner_batch_start_timestamp": done_report.get(
+                    "owner_batch_start_timestamp"
+                ),
+                "owner_batch_id": done_report.get("owner_batch_id"),
+            }
+        )
+
+    request_latency_rows: list[dict] = []
+    admission_rows: list[dict] = []
+    first_token_rows: list[dict] = []
+    for client_request_id in client_request_ids:
+        request_order = request_order_by_client_id[client_request_id]
+        admission = admission_by_client_id.get(client_request_id, {})
+        first_token = first_token_by_client_id.get(client_request_id, {})
+        done = next(
+            (
+                row for row in done_rows
+                if row.get("client_request_id") == client_request_id
+            ),
+            {},
+        )
+        admission_row = {
+            "experiment": experiment_name,
+            "run_index": run_index,
+            "repeat_index": repeat_index,
+            "request_order": request_order,
+            "client_request_id": client_request_id,
+            "request_id": request_id_by_client_id.get(client_request_id),
+            "max_active_requests": max_active_requests,
+            "source": admission.get("source"),
+            "pending_wait_ms": admission.get("pending_wait_ms"),
+            "collector_admission_received_elapsed_ms": admission.get(
+                "collector_admission_received_elapsed_ms"
+            ),
+            "active_request_count": admission.get("active_request_count"),
+            "pending_prefill_count": admission.get("pending_prefill_count"),
+        }
+        first_token_row = {
+            "experiment": experiment_name,
+            "run_index": run_index,
+            "repeat_index": repeat_index,
+            "request_order": request_order,
+            "client_request_id": client_request_id,
+            "request_id": request_id_by_client_id.get(client_request_id),
+            "max_active_requests": max_active_requests,
+            "first_token_elapsed_preferred_ms": first_token.get(
+                "first_token_elapsed_preferred_ms"
+            ),
+            "first_token_elapsed_source": first_token.get(
+                "first_token_elapsed_source"
+            ),
+            "owner_local_ttft_ms": first_token.get("owner_local_ttft_ms"),
+            "owner_local_batch_ttft_ms": first_token.get("owner_local_batch_ttft_ms"),
+            "collector_first_token_received_elapsed_ms": first_token.get(
+                "collector_first_token_received_elapsed_ms"
+            ),
+            "collector_token_received_elapsed_ms": first_token.get(
+                "collector_token_received_elapsed_ms"
+            ),
+            "output_token_index": first_token.get("output_token_index"),
+            "owner_batch_id": first_token.get("owner_batch_id"),
+        }
+        request_completion_elapsed_preferred_ms = (
+            done.get("owner_local_request_elapsed_ms")
+            if done.get("owner_local_request_elapsed_ms") is not None
+            else done.get("collector_done_received_elapsed_ms")
+        )
+        request_complete_elapsed_source = (
+            "owner_local_request_elapsed_ms"
+            if done.get("owner_local_request_elapsed_ms") is not None
+            else (
+                "collector_done_received_elapsed_ms"
+                if done.get("collector_done_received_elapsed_ms") is not None
+                else None
+            )
+        )
+        latency_row = {
+            "experiment": experiment_name,
+            "run_index": run_index,
+            "repeat_index": repeat_index,
+            "topology_node_count": client.pipeline_depth,
+            "request_count": len(client_request_ids),
+            "max_active_requests": max_active_requests,
+            "input_token_length": input_token_length,
+            "max_new_tokens": output_token_length,
+            "request_order": request_order,
+            "client_request_id": client_request_id,
+            "request_id": request_id_by_client_id.get(client_request_id),
+            "pending_wait_ms": admission.get("pending_wait_ms"),
+            "first_token_elapsed_preferred_ms": first_token.get(
+                "first_token_elapsed_preferred_ms"
+            ),
+            "first_token_elapsed_source": first_token.get(
+                "first_token_elapsed_source"
+            ),
+            "owner_local_ttft_ms": first_token.get("owner_local_ttft_ms"),
+            "collector_first_token_received_elapsed_ms": first_token.get(
+                "collector_first_token_received_elapsed_ms"
+            ),
+            "request_completion_elapsed_preferred_ms": (
+                request_completion_elapsed_preferred_ms
+            ),
+            "request_completion_elapsed_source": request_complete_elapsed_source,
+            "owner_local_request_elapsed_ms": done.get(
+                "owner_local_request_elapsed_ms"
+            ),
+            "owner_local_batch_elapsed_ms": done.get("owner_local_batch_elapsed_ms"),
+            "collector_done_received_elapsed_ms": done.get(
+                "collector_done_received_elapsed_ms"
+            ),
+            "output_token_count": done.get("output_token_count"),
+        }
+        admission_rows.append(admission_row)
+        first_token_rows.append(first_token_row)
+        request_latency_rows.append(latency_row)
+
+    owner_batch_elapsed_values = [
+        float(row["owner_local_batch_elapsed_ms"])
+        for row in done_rows
+        if row.get("owner_local_batch_elapsed_ms") is not None
+    ]
+    done_received_elapsed_values = [
+        float(row["collector_done_received_elapsed_ms"])
+        for row in done_rows
+        if row.get("collector_done_received_elapsed_ms") is not None
+    ]
+    if done_rows and not collected["missing_done"] and owner_batch_elapsed_values:
+        total_elapsed_ms = max(owner_batch_elapsed_values)
+        total_elapsed_source = "owner_local_batch_elapsed_ms"
+    elif done_rows and not collected["missing_done"] and done_received_elapsed_values:
+        total_elapsed_ms = max(done_received_elapsed_values)
+        total_elapsed_source = "collector_done_received_elapsed_ms"
+    else:
+        total_elapsed_ms = None
+        total_elapsed_source = None
+    critical_path_analysis = analyze_forward_critical_path(forward_rows)
+    inference_time = critical_path_analysis["inference_time"]
+    communication_and_noncompute_time = (
+        total_elapsed_ms - inference_time
+        if total_elapsed_ms is not None and inference_time is not None
+        else None
+    )
+
+    stage_rows: list[dict] = []
+    for node in client.nodes:
+        node_forward_values = [
+            _float_or_none(row.get("forward_elapsed_ms")) or 0.0
+            for row in forward_rows
+            if str(row.get("node_id")) == node.node_id
+        ]
+        busy_ms = sum(node_forward_values)
+        utilization = (
+            busy_ms / total_elapsed_ms
+            if total_elapsed_ms is not None and total_elapsed_ms > 0
+            else None
+        )
+        stage_rows.append(
+            {
+                "experiment": experiment_name,
+                "run_index": run_index,
+                "repeat_index": repeat_index,
+                "topology_node_count": client.pipeline_depth,
+                "request_count": len(client_request_ids),
+                "max_active_requests": max_active_requests,
+                "input_token_length": input_token_length,
+                "max_new_tokens": output_token_length,
+                "node_id": node.node_id,
+                "node_addr": node.node_addr,
+                "shards_start": node.shards_start,
+                "shards_end": node.shards_end,
+                "stage_forward_busy_ms": busy_ms,
+                "total_complete_time_preferred_ms": total_elapsed_ms,
+                "total_complete_time_ms": total_elapsed_ms,
+                "total_complete_time_source": total_elapsed_source,
+                "stage_time_utilization": utilization,
+                "stage_time_utilization_percent": (
+                    utilization * 100.0 if utilization is not None else None
+                ),
+            }
+        )
+
+    memory_rows, memory_summary = summarize_memory_peaks(
+        forward_rows,
+        done_rows,
+        client.nodes,
+    )
+    for row in memory_rows:
+        row.update(
+            {
+                "experiment": experiment_name,
+                "run_index": run_index,
+                "repeat_index": repeat_index,
+                "topology_node_count": client.pipeline_depth,
+                "request_count": len(client_request_ids),
+                "max_active_requests": max_active_requests,
+                "input_token_length": input_token_length,
+                "max_new_tokens": output_token_length,
+            }
+        )
+
+    request_completion_values = [
+        value for value in (
+            _float_or_none(row.get("request_completion_elapsed_preferred_ms"))
+            for row in request_latency_rows
+        )
+        if value is not None
+    ]
+    first_token_values = [
+        value for value in (
+            _float_or_none(row.get("first_token_elapsed_preferred_ms"))
+            for row in request_latency_rows
+        )
+        if value is not None
+    ]
+    pending_values = [
+        value for value in (
+            _float_or_none(row.get("pending_wait_ms")) for row in request_latency_rows
+        )
+        if value is not None
+    ]
+    stage_util_values = [
+        value for value in (
+            _float_or_none(row.get("stage_time_utilization")) for row in stage_rows
+        )
+        if value is not None
+    ]
+
+    summary = {
+        "experiment": experiment_name,
+        "run_index": run_index,
+        "repeat_index": repeat_index,
+        "topology_node_count": client.pipeline_depth,
+        "request_count": len(client_request_ids),
+        "max_active_requests": max_active_requests,
+        "input_token_length": input_token_length,
+        "max_new_tokens": output_token_length,
+        "time_unit": "ms",
+        "total_complete_time_preferred_ms": total_elapsed_ms,
+        "total_complete_time_ms": total_elapsed_ms,
+        "total_complete_time_source": total_elapsed_source,
+        "throughput_requests_per_s": (
+            len(client_request_ids) / (total_elapsed_ms / 1000.0)
+            if total_elapsed_ms is not None and total_elapsed_ms > 0
+            else None
+        ),
+        "request_completion_latency_preferred_mean_ms": mean_or_none(
+            request_completion_values
+        ),
+        "request_completion_latency_preferred_p50_ms": percentile(
+            request_completion_values, 50
+        ),
+        "request_completion_latency_preferred_p95_ms": percentile(
+            request_completion_values, 95
+        ),
+        "request_completion_latency_preferred_max_ms": (
+            max(request_completion_values) if request_completion_values else None
+        ),
+        "first_token_latency_preferred_mean_ms": mean_or_none(first_token_values),
+        "first_token_latency_preferred_p50_ms": percentile(first_token_values, 50),
+        "first_token_latency_preferred_p95_ms": percentile(first_token_values, 95),
+        "first_token_latency_preferred_max_ms": (
+            max(first_token_values) if first_token_values else None
+        ),
+        "pending_wait_mean_ms": mean_or_none(pending_values),
+        "pending_wait_p50_ms": percentile(pending_values, 50),
+        "pending_wait_p95_ms": percentile(pending_values, 95),
+        "pending_wait_max_ms": max(pending_values) if pending_values else None,
+        "stage_time_utilization_mean": mean_or_none(stage_util_values),
+        "stage_time_utilization_min": min(stage_util_values) if stage_util_values else None,
+        "stage_time_utilization_max": max(stage_util_values) if stage_util_values else None,
+        "inference_time_ms": inference_time,
+        "communication_and_noncompute_time_ms": communication_and_noncompute_time,
+        "critical_path_cycle_detected": critical_path_analysis[
+            "critical_path_cycle_detected"
+        ],
+        "critical_path_node_count": critical_path_analysis[
+            "critical_path_node_count"
+        ],
+        "expected_forward_report_count": (
+            len(client_request_ids) * client.pipeline_depth * len(expected_phase_steps)
+        ),
+        "collected_forward_report_count": len(forward_rows),
+        "missing_ack_count": len(collected["missing_ack"]),
+        "missing_admission_count": len(collected["missing_admission"]),
+        "missing_first_token_count": len(collected["missing_first_token"]),
+        "missing_forward_report_count": len(collected["missing_reports"]),
+        "missing_done_count": len(collected["missing_done"]),
+        "collector_process_elapsed_ms": (
+            time.perf_counter() - process_started_perf
+        ) * 1000.0,
+        **memory_summary,
+    }
+    return (
+        forward_rows,
+        done_rows,
+        request_latency_rows,
+        admission_rows,
+        first_token_rows,
+        stage_rows,
+        memory_rows,
+        critical_path_analysis["critical_path_rows"],
+        summary,
+    )
 
 
 def run_simultaneous_pair_forward_experiment(client: PipelineDebugClient) -> None:
@@ -2968,17 +4101,44 @@ def run_two_round_pipeline_latency_scenario(
                 "eos_seen": done_report.get("eos_seen"),
                 "first_eos_step": done_report.get("first_eos_step"),
                 "semantic_output_valid": done_report.get("semantic_output_valid"),
-                "done_received_elapsed_ms": done_report.get(
-                    "done_received_elapsed_ms"
+                "collector_done_received_elapsed_ms": done_report.get(
+                    "collector_done_received_elapsed_ms"
                 ),
+                "owner_local_request_elapsed_ms": done_report.get(
+                    "owner_local_request_elapsed_ms"
+                ),
+                "owner_local_batch_elapsed_ms": done_report.get(
+                    "owner_local_batch_elapsed_ms"
+                ),
+                "owner_request_start_timestamp": done_report.get(
+                    "owner_request_start_timestamp"
+                ),
+                "owner_batch_start_timestamp": done_report.get(
+                    "owner_batch_start_timestamp"
+                ),
+                "owner_batch_id": done_report.get("owner_batch_id"),
             }
         )
 
-    total_elapsed_ms = (
-        max(float(row["done_received_elapsed_ms"]) for row in done_rows)
-        if done_rows and not missing_done
-        else None
-    )
+    owner_batch_elapsed_values = [
+        float(row["owner_local_batch_elapsed_ms"])
+        for row in done_rows
+        if row.get("owner_local_batch_elapsed_ms") is not None
+    ]
+    done_received_elapsed_values = [
+        float(row["collector_done_received_elapsed_ms"])
+        for row in done_rows
+        if row.get("collector_done_received_elapsed_ms") is not None
+    ]
+    if done_rows and not missing_done and owner_batch_elapsed_values:
+        total_elapsed_ms = max(owner_batch_elapsed_values)
+        total_elapsed_source = "owner_local_batch_elapsed_ms"
+    elif done_rows and not missing_done and done_received_elapsed_values:
+        total_elapsed_ms = max(done_received_elapsed_values)
+        total_elapsed_source = "collector_done_received_elapsed_ms"
+    else:
+        total_elapsed_ms = None
+        total_elapsed_source = None
     critical_path_analysis = analyze_forward_critical_path(forward_rows)
     inference_time = critical_path_analysis["inference_time"]
     communication_and_noncompute_time = (
@@ -2998,7 +4158,9 @@ def run_two_round_pipeline_latency_scenario(
         "max_active_requests": client.max_active_requests,
         "max_new_tokens": max_new_tokens,
         "time_unit": "ms",
+        "total_complete_time_preferred_ms": total_elapsed_ms,
         "total_complete_time": total_elapsed_ms,
+        "total_complete_time_source": total_elapsed_source,
         "inference_time": inference_time,
         "communication_and_noncompute_time": communication_and_noncompute_time,
         "total_process_elapsed_ms": total_elapsed_ms,
@@ -3040,14 +4202,15 @@ def run_two_round_pipeline_latency_scenario(
         output_dir=result_dir,
         prefix=prefix,
         expected_phase_steps=expected_phase_steps,
+        dense_output_axis=max_new_tokens > 64,
     )
     plot_latency_breakdown_pie(
         summary,
         result_dir / f"{prefix}_latency_breakdown_pie.png",
     )
-    plot_done_received_barh(
+    plot_request_completion_elapsed_barh(
         done_rows,
-        result_dir / f"{prefix}_done_received_elapsed_ms_barh.png",
+        result_dir / f"{prefix}_request_completion_elapsed_preferred_barh.png",
     )
 
     if missing_ack:
@@ -3308,6 +4471,381 @@ def run_two_round_pipeline_latency_experiment(client: PipelineDebugClient) -> No
     print(f"[TEST] results directory: {result_dir}")
 
 
+def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> None:
+    result_dir = make_result_dir()
+    experiment_name = "concurrency_sweep_motivation"
+    print(
+        "\nConcurrency sweep motivation experiment:\n"
+        "This experiment fixes a 4-stage Llama 3.2 3B pipeline and submits "
+        "12 distinct requests with identical input token length to the first "
+        "node. It sweeps max_active_requests to show utilization, latency, "
+        "TTFT/pending wait, and memory-pressure tradeoffs.\n"
+    )
+    use_tegrastats = ask_yes_no(
+        "Is this CLI running on a Jetson device and should it record local tegrastats?",
+        default=False,
+    )
+    input_token_length = ask_int(
+        "Input token length for every request",
+        CONCURRENCY_SWEEP_INPUT_TOKEN_LENGTH,
+        minimum=8,
+    )
+    output_token_length = ask_int(
+        "Output token count / max_new_tokens",
+        CONCURRENCY_SWEEP_OUTPUT_TOKEN_LENGTH,
+        minimum=1,
+    )
+    repeats = ask_int(
+        "Repeat count per max_active_requests",
+        CONCURRENCY_SWEEP_REPEATS,
+        minimum=1,
+    )
+    max_active_values = ask_int_list(
+        "max_active_requests values",
+        CONCURRENCY_SWEEP_MAX_ACTIVE_VALUES,
+    )
+    max_active_values = sorted({value for value in max_active_values if value >= 1})
+    if not max_active_values:
+        print("[ERROR] max_active_requests values must contain at least one value >= 1.")
+        return
+    timeout_default = max(
+        300,
+        int(output_token_length * CONCURRENCY_SWEEP_REQUEST_COUNT * 2.0),
+    )
+    timeout_s = float(
+        input(f"Overall timeout seconds per run [{timeout_default}]: ").strip()
+        or str(timeout_default)
+    )
+    config_ready_timeout_s = float(
+        input("Config-ready timeout seconds [60]: ").strip() or "60"
+    )
+    ask_telemetry(client)
+
+    if output_token_length > 64:
+        print(
+            "[TEST] output_token_length > 64: token-step line plots will use dense "
+            "style when generated. This experiment's summary plots use "
+            "max_active_requests on the x-axis, so no summary plot uses output "
+            "token count as a plotted dimension."
+        )
+
+    tokenizer = load_tokenizer()
+    input_ids_list = build_distinct_input_ids_for_same_length(
+        tokenizer=tokenizer,
+        token_length=input_token_length,
+        request_count=CONCURRENCY_SWEEP_REQUEST_COUNT,
+    )
+    prompts = [""] * CONCURRENCY_SWEEP_REQUEST_COUNT
+
+    client.nodes = build_even_split_nodes(CONCURRENCY_SWEEP_NODE_COUNT)
+    client.pipeline_depth = CONCURRENCY_SWEEP_NODE_COUNT
+    client.max_active_requests = CONCURRENCY_SWEEP_NODE_COUNT
+    print(
+        f"[TEST] applying {CONCURRENCY_SWEEP_NODE_COUNT}-node topology for "
+        "concurrency sweep."
+    )
+    client.show_topology()
+    config_id = client.send_config()
+    client.wait_for_nodes_ready(config_id, timeout_s=config_ready_timeout_s)
+    client.drain_events()
+
+    warmup_input_ids = build_input_ids_for_lengths(
+        tokenizer,
+        [CONCURRENCY_SWEEP_WARMUP_INPUT_TOKEN_LENGTH],
+    )[CONCURRENCY_SWEEP_WARMUP_INPUT_TOKEN_LENGTH]
+    print(
+        "[TEST] running one warm-up request without measurement: "
+        f"input_tokens={CONCURRENCY_SWEEP_WARMUP_INPUT_TOKEN_LENGTH}, "
+        f"output_tokens={CONCURRENCY_SWEEP_WARMUP_OUTPUT_TOKEN_LENGTH}."
+    )
+    wait_for_warmup_batch(
+        client=client,
+        owner_index=0,
+        prompt="",
+        request_count=1,
+        max_new_tokens=CONCURRENCY_SWEEP_WARMUP_OUTPUT_TOKEN_LENGTH,
+        timeout_s=timeout_s,
+        trace_label_prefix="concurrency_sweep_warmup",
+        prompts=[""],
+        input_ids_list=[warmup_input_ids],
+        ignore_eos_for_measurement=True,
+        require_completion=True,
+    )
+    print("[TEST] waiting 2 seconds after warm-up for runtime state to settle...")
+    time.sleep(2.0)
+    client.drain_events()
+
+    tegrastats_logger = (
+        TegrastatsLogger(result_dir / "tegrastats_raw.log")
+        if use_tegrastats
+        else None
+    )
+
+    summary_rows: list[dict] = []
+    all_forward_rows: list[dict] = []
+    all_done_rows: list[dict] = []
+    all_request_latency_rows: list[dict] = []
+    all_admission_rows: list[dict] = []
+    all_first_token_rows: list[dict] = []
+    all_stage_rows: list[dict] = []
+    all_memory_rows: list[dict] = []
+    all_critical_path_rows: list[dict] = []
+
+    run_plan = [
+        (max_active, repeat_index)
+        for max_active in max_active_values
+        for repeat_index in range(1, repeats + 1)
+    ]
+    random.shuffle(run_plan)
+    write_json(
+        result_dir / "concurrency_sweep_plan.json",
+        {
+            "experiment": experiment_name,
+            "node_count": CONCURRENCY_SWEEP_NODE_COUNT,
+            "request_count": CONCURRENCY_SWEEP_REQUEST_COUNT,
+            "input_token_length": input_token_length,
+            "output_token_length": output_token_length,
+            "max_active_values": max_active_values,
+            "repeat_count_per_max_active": repeats,
+            "randomized_run_plan": [
+                {"max_active_requests": max_active, "repeat_index": repeat_index}
+                for max_active, repeat_index in run_plan
+            ],
+        },
+    )
+
+    try:
+        if tegrastats_logger is not None:
+            tegrastats_logger.start()
+
+        expected_phase_steps = [("prefill", 0)] + [
+            ("decode", step) for step in range(1, output_token_length)
+        ]
+        for run_index, (max_active, repeat_index) in enumerate(run_plan, start=1):
+            print(
+                f"\n[TEST] concurrency sweep run {run_index}/{len(run_plan)}: "
+                f"max_active_requests={max_active}, repeat={repeat_index}/{repeats}"
+            )
+            client.max_active_requests = max_active
+            config_id = client.send_config()
+            client.wait_for_nodes_ready(config_id, timeout_s=config_ready_timeout_s)
+            client.drain_events()
+
+            prefix = f"sweep_run{run_index:03d}_M{max_active}_rep{repeat_index}"
+            process_started_perf = time.perf_counter()
+            client_request_ids = client.submit_burst_requests(
+                owner_index=0,
+                prompts=prompts,
+                max_new_tokens=output_token_length,
+                input_ids_list=input_ids_list,
+                trace_forward_measurement=True,
+                trace_label_prefix=prefix,
+                ignore_eos_for_measurement=True,
+            )
+            collected = collect_concurrency_sweep_events(
+                client=client,
+                client_request_ids=client_request_ids,
+                expected_phase_steps=expected_phase_steps,
+                process_started_perf=process_started_perf,
+                timeout_s=timeout_s,
+            )
+            (
+                forward_rows,
+                done_rows,
+                request_latency_rows,
+                admission_rows,
+                first_token_rows,
+                stage_rows,
+                memory_rows,
+                critical_path_rows,
+                summary,
+            ) = build_concurrency_sweep_result_rows(
+                experiment_name=experiment_name,
+                run_index=run_index,
+                repeat_index=repeat_index,
+                max_active_requests=max_active,
+                input_token_length=input_token_length,
+                output_token_length=output_token_length,
+                client=client,
+                client_request_ids=client_request_ids,
+                collected=collected,
+                process_started_perf=process_started_perf,
+            )
+            summary_rows.append(summary)
+            all_forward_rows.extend(forward_rows)
+            all_done_rows.extend(done_rows)
+            all_request_latency_rows.extend(request_latency_rows)
+            all_admission_rows.extend(admission_rows)
+            all_first_token_rows.extend(first_token_rows)
+            all_stage_rows.extend(stage_rows)
+            all_memory_rows.extend(memory_rows)
+            for path_row in critical_path_rows:
+                path_row.update(
+                    {
+                        "experiment": experiment_name,
+                        "run_index": run_index,
+                        "repeat_index": repeat_index,
+                        "max_active_requests": max_active,
+                    }
+                )
+            all_critical_path_rows.extend(critical_path_rows)
+
+            print(
+                "[TEST] run summary: "
+                f"makespan={summary.get('total_complete_time_preferred_ms')} ms, "
+                f"throughput={summary.get('throughput_requests_per_s')} req/s, "
+                f"stage_util_mean={summary.get('stage_time_utilization_mean')}"
+            )
+            if (
+                summary["missing_ack_count"]
+                or summary["missing_admission_count"]
+                or summary["missing_first_token_count"]
+                or summary["missing_forward_report_count"]
+                or summary["missing_done_count"]
+            ):
+                print(
+                    "[WARNING] run has missing telemetry: "
+                    f"ack={summary['missing_ack_count']}, "
+                    f"admission={summary['missing_admission_count']}, "
+                    f"first_token={summary['missing_first_token_count']}, "
+                    f"forward={summary['missing_forward_report_count']}, "
+                    f"done={summary['missing_done_count']}"
+                )
+    finally:
+        if tegrastats_logger is not None:
+            tegrastats_logger.stop()
+
+    write_csv(result_dir / "concurrency_sweep_run_summary.csv", summary_rows)
+    write_csv(result_dir / "concurrency_sweep_request_latency.csv", all_request_latency_rows)
+    write_csv(result_dir / "concurrency_sweep_admission_reports.csv", all_admission_rows)
+    write_csv(result_dir / "concurrency_sweep_first_token_reports.csv", all_first_token_rows)
+    write_csv(result_dir / "concurrency_sweep_done_reports.csv", all_done_rows)
+    write_csv(result_dir / "concurrency_sweep_forward_reports.csv", all_forward_rows)
+    write_csv(result_dir / "concurrency_sweep_stage_time_utilization.csv", all_stage_rows)
+    write_csv(result_dir / "concurrency_sweep_memory_peaks_per_node.csv", all_memory_rows)
+    write_csv(result_dir / "concurrency_sweep_critical_path_forward_rows.csv", all_critical_path_rows)
+
+    plot_sweep_metric_lines(
+        summary_rows,
+        [("throughput_requests_per_s", "throughput")],
+        result_dir / "concurrency_sweep_throughput.png",
+        "Throughput vs max_active_requests",
+        "Throughput (requests/s)",
+    )
+    plot_sweep_metric_lines(
+        summary_rows,
+        [
+            ("total_complete_time_preferred_ms", "makespan"),
+            (
+                "request_completion_latency_preferred_mean_ms",
+                "request completion mean",
+            ),
+            (
+                "request_completion_latency_preferred_p95_ms",
+                "request completion P95",
+            ),
+        ],
+        result_dir / "concurrency_sweep_completion_latency.png",
+        "Completion latency vs max_active_requests",
+        "Latency (ms)",
+    )
+    plot_sweep_metric_lines(
+        summary_rows,
+        [
+            ("pending_wait_mean_ms", "pending wait mean"),
+            ("pending_wait_p95_ms", "pending wait P95"),
+            ("first_token_latency_preferred_mean_ms", "first token mean"),
+            ("first_token_latency_preferred_p95_ms", "first token P95"),
+        ],
+        result_dir / "concurrency_sweep_first_token_pending_wait.png",
+        "First-token latency and pending wait vs max_active_requests",
+        "Latency (ms)",
+    )
+    plot_sweep_metric_lines(
+        summary_rows,
+        [
+            ("total_complete_time_preferred_ms", "makespan"),
+            ("inference_time_ms", "critical-path inference"),
+            ("communication_and_noncompute_time_ms", "communication + non-forward"),
+        ],
+        result_dir / "concurrency_sweep_latency_breakdown_lines.png",
+        "Latency breakdown vs max_active_requests",
+        "Latency (ms)",
+    )
+    plot_stage_time_utilization(
+        all_stage_rows,
+        result_dir / "concurrency_sweep_stage_time_utilization.png",
+    )
+    plot_sweep_metric_lines(
+        summary_rows,
+        [
+            ("peak_dynamiccache_total_bytes", "collector-ordered total peak"),
+            ("max_peak_dynamiccache_by_node_bytes", "max node peak"),
+        ],
+        result_dir / "concurrency_sweep_dynamiccache_peak_summary.png",
+        "DynamicCache peak vs max_active_requests",
+        "DynamicCache peak (MiB)",
+        value_transform=bytes_to_mib,
+    )
+    plot_memory_peak_by_node(
+        all_memory_rows,
+        "peak_dynamiccache_total_bytes",
+        result_dir / "concurrency_sweep_dynamiccache_peak_by_node.png",
+        "DynamicCache peak by node",
+        "DynamicCache peak (MiB)",
+    )
+    plot_sweep_metric_lines(
+        summary_rows,
+        [
+            (
+                "max_peak_cuda_memory_allocated_run_delta_bytes",
+                "max node baseline delta",
+            ),
+            (
+                "sum_peak_cuda_memory_allocated_run_delta_bytes",
+                "sum of node peak deltas",
+            ),
+        ],
+        result_dir / "concurrency_sweep_cuda_memory_allocated_peak_summary.png",
+        "torch.cuda.memory_allocated() baseline delta peak",
+        "Memory delta (MiB)",
+        value_transform=bytes_to_mib,
+    )
+    plot_memory_peak_by_node(
+        all_memory_rows,
+        "peak_cuda_memory_allocated_run_delta_bytes",
+        result_dir / "concurrency_sweep_cuda_memory_allocated_peak_by_node.png",
+        "torch.cuda.memory_allocated() baseline delta by node",
+        "Memory delta (MiB)",
+    )
+    plot_sweep_metric_lines(
+        summary_rows,
+        [
+            (
+                "max_peak_cuda_mem_get_info_used_run_delta_bytes",
+                "max node used baseline delta",
+            ),
+            (
+                "sum_peak_cuda_mem_get_info_used_run_delta_bytes",
+                "sum of node used peak deltas",
+            ),
+        ],
+        result_dir / "concurrency_sweep_cuda_mem_get_info_peak_summary.png",
+        "torch.cuda.mem_get_info() used baseline delta peak",
+        "Memory delta (MiB)",
+        value_transform=bytes_to_mib,
+    )
+    plot_memory_peak_by_node(
+        all_memory_rows,
+        "peak_cuda_mem_get_info_used_run_delta_bytes",
+        result_dir / "concurrency_sweep_cuda_mem_get_info_peak_by_node.png",
+        "torch.cuda.mem_get_info() used baseline delta by node",
+        "Memory delta (MiB)",
+    )
+
+    print(f"[TEST] results directory: {result_dir}")
+
+
 def run_scenario(client: PipelineDebugClient) -> None:
     print(
         "\nScenarios:\n"
@@ -3358,8 +4896,9 @@ def menu_loop(client: PipelineDebugClient) -> None:
             "  5. run KV cache growth experiments\n"
             "  6. run simultaneous pair forward measurement\n"
             "  7. run two-round pipeline latency experiments\n"
-            "  8. run predefined Jetson test scenario\n"
-            "  9. show topology/config\n"
+            "  8. run concurrency sweep motivation experiment\n"
+            "  9. run predefined Jetson test scenario\n"
+            "  10. show topology/config\n"
             "  q. quit\n"
         )
         choice = input("Select: ").strip().lower()
@@ -3378,8 +4917,10 @@ def menu_loop(client: PipelineDebugClient) -> None:
         elif choice == "7":
             run_two_round_pipeline_latency_experiment(client)
         elif choice == "8":
-            run_scenario(client)
+            run_concurrency_sweep_motivation_experiment(client)
         elif choice == "9":
+            run_scenario(client)
+        elif choice == "10":
             client.show_topology()
         elif choice in {"q", "quit", "exit"}:
             return

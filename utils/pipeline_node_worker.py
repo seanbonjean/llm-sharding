@@ -42,6 +42,8 @@ class PipelineProtocol:
     SHARD_FORWARD_REPORT = "shard_forward_report"
     PIPELINE_DONE_REPORT = "pipeline_done_report"
     PIPELINE_NODE_READY = "pipeline_node_ready"
+    PIPELINE_ADMISSION_REPORT = "pipeline_admission_report"
+    PIPELINE_TOKEN_REPORT = "pipeline_token_report"
 
     TELEMETRY_FIELDS = (
         "client_request_id",
@@ -441,7 +443,15 @@ class PipelineSession:
     ignore_eos_for_measurement: bool = False
     eos_seen: bool = False
     first_eos_step: int | None = None
+    owner_request_start_perf: float | None = None
+    owner_request_start_timestamp: float | None = None
+    owner_batch_start_perf: float | None = None
+    owner_batch_start_timestamp: float | None = None
+    owner_batch_id: str | None = None
     cuda_memory_baseline_bytes: int | None = None
+    cuda_mem_get_info_free_baseline_bytes: int | None = None
+    cuda_mem_get_info_used_baseline_bytes: int | None = None
+    cuda_mem_get_info_total_bytes: int | None = None
 
 
 class PipelineNodeWorker:
@@ -699,6 +709,31 @@ class PipelineNodeWorker:
         torch.cuda.synchronize(self.device)
         return int(torch.cuda.memory_allocated(self.device))
 
+    def _cuda_mem_get_info_bytes(self) -> dict[str, int | None]:
+        """
+        Return CUDA-driver memory information for telemetry-only experiments.
+
+        `memory_allocated()` only reports live PyTorch tensor allocations, while
+        `mem_get_info()` reports device-level free/total memory. This helper is
+        only called by telemetry reports, so ordinary pipeline inference does
+        not pay for the extra CUDA synchronization.
+        """
+
+        if self.device.type != "cuda" or not hasattr(torch.cuda, "mem_get_info"):
+            return {
+                "free_bytes": None,
+                "total_bytes": None,
+                "used_bytes": None,
+            }
+        torch.cuda.synchronize(self.device)
+        with torch.cuda.device(self.device):
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+            "used_bytes": int(total_bytes - free_bytes),
+        }
+
     def _maybe_capture_cuda_memory_baseline(
         self,
         session: PipelineSession,
@@ -720,6 +755,10 @@ class PipelineNodeWorker:
         ):
             return
         session.cuda_memory_baseline_bytes = self._cuda_memory_allocated_bytes()
+        mem_info = self._cuda_mem_get_info_bytes()
+        session.cuda_mem_get_info_free_baseline_bytes = mem_info["free_bytes"]
+        session.cuda_mem_get_info_used_baseline_bytes = mem_info["used_bytes"]
+        session.cuda_mem_get_info_total_bytes = mem_info["total_bytes"]
 
     def build_kv_cache_report(
         self,
@@ -742,14 +781,41 @@ class PipelineNodeWorker:
         cuda_allocated_bytes = (
             self._cuda_memory_allocated_bytes() if include_cuda_memory else None
         )
+        mem_info = (
+            self._cuda_mem_get_info_bytes()
+            if include_cuda_memory
+            else {"free_bytes": None, "total_bytes": None, "used_bytes": None}
+        )
         cuda_baseline_bytes = (
             session.cuda_memory_baseline_bytes
+            if include_cuda_memory and session is not None
+            else None
+        )
+        mem_info_free_baseline_bytes = (
+            session.cuda_mem_get_info_free_baseline_bytes
+            if include_cuda_memory and session is not None
+            else None
+        )
+        mem_info_used_baseline_bytes = (
+            session.cuda_mem_get_info_used_baseline_bytes
             if include_cuda_memory and session is not None
             else None
         )
         cuda_delta_bytes = (
             cuda_allocated_bytes - cuda_baseline_bytes
             if cuda_allocated_bytes is not None and cuda_baseline_bytes is not None
+            else None
+        )
+        mem_info_used_delta_bytes = (
+            mem_info["used_bytes"] - mem_info_used_baseline_bytes
+            if mem_info["used_bytes"] is not None
+            and mem_info_used_baseline_bytes is not None
+            else None
+        )
+        mem_info_free_delta_bytes = (
+            mem_info_free_baseline_bytes - mem_info["free_bytes"]
+            if mem_info_free_baseline_bytes is not None
+            and mem_info["free_bytes"] is not None
             else None
         )
         report: dict[str, Any] = {
@@ -766,6 +832,13 @@ class PipelineNodeWorker:
             "cuda_memory_allocated_bytes": cuda_allocated_bytes,
             "cuda_memory_baseline_bytes": cuda_baseline_bytes,
             "cuda_memory_delta_bytes": cuda_delta_bytes,
+            "cuda_mem_get_info_free_bytes": mem_info["free_bytes"],
+            "cuda_mem_get_info_total_bytes": mem_info["total_bytes"],
+            "cuda_mem_get_info_used_bytes": mem_info["used_bytes"],
+            "cuda_mem_get_info_free_baseline_bytes": mem_info_free_baseline_bytes,
+            "cuda_mem_get_info_used_baseline_bytes": mem_info_used_baseline_bytes,
+            "cuda_mem_get_info_used_delta_bytes": mem_info_used_delta_bytes,
+            "cuda_mem_get_info_free_delta_bytes": mem_info_free_delta_bytes,
         }
         report.update(cache_stats)
         if source_message is not None:
@@ -828,7 +901,7 @@ class PipelineNodeWorker:
 
     def _capture_forward_measurement_start(
         self, session: PipelineSession
-    ) -> tuple[dict[str, int], int | None, float, float]:
+    ) -> tuple[dict[str, int], int | None, dict[str, int | None], float, float]:
         """
         在 shard forward 前采集 KV/CUDA 起点，并返回计时起点。
 
@@ -841,7 +914,14 @@ class PipelineNodeWorker:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             cuda_before = int(torch.cuda.memory_allocated(self.device))
-        return cache_before, cuda_before, time.perf_counter(), time.time()
+        mem_info_before = self._cuda_mem_get_info_bytes()
+        return (
+            cache_before,
+            cuda_before,
+            mem_info_before,
+            time.perf_counter(),
+            time.time(),
+        )
 
     def _emit_forward_measurement_report(
         self,
@@ -849,6 +929,7 @@ class PipelineNodeWorker:
         session: PipelineSession,
         cache_before: dict[str, int],
         cuda_before: int | None,
+        mem_info_before: dict[str, int | None],
         started_perf: float,
         started_wall: float,
     ) -> None:
@@ -869,6 +950,7 @@ class PipelineNodeWorker:
             cuda_after = int(torch.cuda.memory_allocated(self.device))
         else:
             cuda_after = None
+        mem_info_after = self._cuda_mem_get_info_bytes()
         finished_perf = time.perf_counter()
         finished_wall = time.time()
 
@@ -878,6 +960,18 @@ class PipelineNodeWorker:
         cuda_delta = (
             cuda_after - cuda_before
             if cuda_after is not None and cuda_before is not None
+            else None
+        )
+        mem_info_used_delta = (
+            mem_info_after["used_bytes"] - mem_info_before["used_bytes"]
+            if mem_info_after["used_bytes"] is not None
+            and mem_info_before["used_bytes"] is not None
+            else None
+        )
+        mem_info_free_delta = (
+            mem_info_before["free_bytes"] - mem_info_after["free_bytes"]
+            if mem_info_before["free_bytes"] is not None
+            and mem_info_after["free_bytes"] is not None
             else None
         )
         shard_elapsed_ms = (finished_perf - started_perf) * 1000.0
@@ -920,6 +1014,14 @@ class PipelineNodeWorker:
             "cuda_memory_before_bytes": cuda_before,
             "cuda_memory_after_bytes": cuda_after,
             "cuda_memory_forward_delta_bytes": cuda_delta,
+            "cuda_mem_get_info_free_before_bytes": mem_info_before["free_bytes"],
+            "cuda_mem_get_info_total_before_bytes": mem_info_before["total_bytes"],
+            "cuda_mem_get_info_used_before_bytes": mem_info_before["used_bytes"],
+            "cuda_mem_get_info_free_after_bytes": mem_info_after["free_bytes"],
+            "cuda_mem_get_info_total_after_bytes": mem_info_after["total_bytes"],
+            "cuda_mem_get_info_used_after_bytes": mem_info_after["used_bytes"],
+            "cuda_mem_get_info_used_forward_delta_bytes": mem_info_used_delta,
+            "cuda_mem_get_info_free_forward_delta_bytes": mem_info_free_delta,
         }
         self.communicator.send_to(telemetry_addr, report)
 
@@ -960,6 +1062,34 @@ class PipelineNodeWorker:
             )
 
         request_id = self._new_request_id()
+        owner_request_start_perf = (
+            request_metadata.get("owner_request_start_perf")
+            if request_metadata
+            else None
+        )
+        owner_request_start_timestamp = (
+            request_metadata.get("owner_request_start_timestamp")
+            if request_metadata
+            else None
+        )
+        if owner_request_start_perf is None:
+            owner_request_start_perf = time.perf_counter()
+        if owner_request_start_timestamp is None:
+            owner_request_start_timestamp = time.time()
+        owner_batch_start_perf = (
+            request_metadata.get("owner_batch_start_perf")
+            if request_metadata
+            else None
+        )
+        owner_batch_start_timestamp = (
+            request_metadata.get("owner_batch_start_timestamp")
+            if request_metadata
+            else None
+        )
+        if owner_batch_start_perf is None:
+            owner_batch_start_perf = owner_request_start_perf
+        if owner_batch_start_timestamp is None:
+            owner_batch_start_timestamp = owner_request_start_timestamp
         ignore_eos_for_measurement = bool(
             request_metadata
             and request_metadata.get("ignore_eos_for_measurement", False)
@@ -970,6 +1100,15 @@ class PipelineNodeWorker:
             input_token_length=input_ids.shape[1],
             max_new_tokens=max_new_tokens,
             ignore_eos_for_measurement=ignore_eos_for_measurement,
+            owner_request_start_perf=float(owner_request_start_perf),
+            owner_request_start_timestamp=float(owner_request_start_timestamp),
+            owner_batch_start_perf=float(owner_batch_start_perf),
+            owner_batch_start_timestamp=float(owner_batch_start_timestamp),
+            owner_batch_id=(
+                str(request_metadata.get("owner_batch_id"))
+                if request_metadata and request_metadata.get("owner_batch_id")
+                else None
+            ),
         )
         self.sessions[request_id] = session
 
@@ -1018,6 +1157,7 @@ class PipelineNodeWorker:
         trace_forward_measurement = self._should_trace_forward_measurement(message)
         cache_before = None
         cuda_before = None
+        mem_info_before = None
         forward_started_perf = None
         forward_started_wall = None
 
@@ -1034,6 +1174,7 @@ class PipelineNodeWorker:
                 (
                     cache_before,
                     cuda_before,
+                    mem_info_before,
                     forward_started_perf,
                     forward_started_wall,
                 ) = self._capture_forward_measurement_start(session)
@@ -1061,6 +1202,7 @@ class PipelineNodeWorker:
                 (
                     cache_before,
                     cuda_before,
+                    mem_info_before,
                     forward_started_perf,
                     forward_started_wall,
                 ) = self._capture_forward_measurement_start(session)
@@ -1100,6 +1242,7 @@ class PipelineNodeWorker:
                 session=session,
                 cache_before=cache_before,
                 cuda_before=cuda_before,
+                mem_info_before=mem_info_before,
                 started_perf=forward_started_perf,
                 started_wall=forward_started_wall,
             )
@@ -1149,6 +1292,17 @@ class PipelineNodeWorker:
         if should_stop_on_eos or reached_max_new_tokens:
             session.finished = True
             reason = "eos" if should_stop_on_eos else "max_new_tokens"
+            finished_perf = time.perf_counter()
+            owner_local_request_elapsed_ms = (
+                (finished_perf - session.owner_request_start_perf) * 1000.0
+                if session.owner_request_start_perf is not None
+                else None
+            )
+            owner_local_batch_elapsed_ms = (
+                (finished_perf - session.owner_batch_start_perf) * 1000.0
+                if session.owner_batch_start_perf is not None
+                else None
+            )
             print()
             final_ids = torch.cat(session.generated_ids, dim=-1)
             print(
@@ -1166,6 +1320,11 @@ class PipelineNodeWorker:
                     "semantic_output_valid": not (
                         session.ignore_eos_for_measurement and session.eos_seen
                     ),
+                    "owner_local_request_elapsed_ms": owner_local_request_elapsed_ms,
+                    "owner_local_batch_elapsed_ms": owner_local_batch_elapsed_ms,
+                    "owner_request_start_timestamp": session.owner_request_start_timestamp,
+                    "owner_batch_start_timestamp": session.owner_batch_start_timestamp,
+                    "owner_batch_id": session.owner_batch_id,
                 }
             )
             return done_message
@@ -1500,8 +1659,57 @@ class PipelineNodeController:
         self._apply_config(config)
         self._release_pending_prefill_after_reconfig()
 
+    def _can_apply_config_without_reloading(
+        self, new_config: dict[str, Any]
+    ) -> bool:
+        """
+        Return True when a config only changes scheduler/controller metadata.
+
+        This keeps layer weights, tokenizer, CUDA kernels, and allocator state
+        warm during experiments that sweep max_active_requests. Any topology,
+        shard, address, or owner-runtime change still falls back to full reload.
+        """
+
+        stable_keys = (
+            "src_addr",
+            "dst_addr",
+            "node_addr",
+            "first_node_addr",
+            "can_receive_user_request",
+            "shards_start",
+            "shards_end",
+            "pipeline_depth",
+            "node_id",
+        )
+        return all(
+            self.received_config.get(key) == new_config.get(key)
+            for key in stable_keys
+        )
+
+    def _apply_config_without_reloading(self, new_config: dict[str, Any]) -> None:
+        """
+        Apply a scheduler-only config change without recreating PipelineNodeWorker.
+
+        The current use case is max_active_requests sweep. The node still emits
+        a ready report with the new config_id so the controller can wait for the
+        same acknowledgement path as a full reconfiguration.
+        """
+
+        self.received_config = new_config
+        self.pipeline_depth = int(new_config["pipeline_depth"])
+        self.max_active_requests = int(new_config["max_active_requests"])
+        self.accepting_user_requests = bool(new_config["can_receive_user_request"])
+        print(
+            "[CONTROLLER] Pipeline scheduler config updated without reloading shards."
+        )
+        self._emit_node_ready_report(event="scheduler_reconfigured_ready")
+
     def _apply_config(self, new_config: dict[str, Any]) -> None:
         """真正切换到新 config；调用前必须保证旧请求已经 drain 完毕"""
+
+        if self._can_apply_config_without_reloading(new_config):
+            self._apply_config_without_reloading(new_config)
+            return
 
         owner_only_sessions = self._preserve_owner_only_sessions_for_reconfig()
         keep_owner_runtime = bool(owner_only_sessions)
@@ -1652,10 +1860,16 @@ class PipelineNodeController:
         requests = message.get("requests")
         if not isinstance(requests, list):
             raise RuntimeError("[ERROR] user_request_batch requires a requests list.")
+        batch_start_perf = time.perf_counter()
+        batch_start_timestamp = time.time()
+        batch_id = message.get("batch_id") or f"owner-batch-{int(batch_start_timestamp * 1000)}"
         for request in requests:
             if not isinstance(request, dict):
                 raise RuntimeError("[ERROR] each batched user request must be a dict.")
             request.setdefault(PipelineProtocol.TYPE_KEY, PipelineProtocol.USER_REQUEST)
+            request.setdefault("owner_batch_start_perf", batch_start_perf)
+            request.setdefault("owner_batch_start_timestamp", batch_start_timestamp)
+            request.setdefault("owner_batch_id", batch_id)
             self._handle_user_request(request)
 
     def _handle_user_request(self, message: dict[str, Any]) -> None:
@@ -1673,11 +1887,26 @@ class PipelineNodeController:
 
         telemetry_addr = message.get("telemetry_addr")
         client_request_id = message.get("client_request_id")
+        owner_request_start_perf = time.perf_counter()
+        owner_request_start_timestamp = time.time()
         request_metadata = {
             field: message[field]
             for field in PipelineProtocol.TELEMETRY_FIELDS
             if field in message
         }
+        request_metadata.update(
+            {
+                "owner_request_start_perf": owner_request_start_perf,
+                "owner_request_start_timestamp": owner_request_start_timestamp,
+                "owner_batch_start_perf": message.get(
+                    "owner_batch_start_perf", owner_request_start_perf
+                ),
+                "owner_batch_start_timestamp": message.get(
+                    "owner_batch_start_timestamp", owner_request_start_timestamp
+                ),
+                "owner_batch_id": message.get("owner_batch_id"),
+            }
+        )
 
         raw_input_ids = message.get("input_ids")
         input_ids = None
@@ -1733,6 +1962,19 @@ class PipelineNodeController:
                         if session is not None
                         else False
                     ),
+                    "owner_request_start_timestamp": (
+                        session.owner_request_start_timestamp
+                        if session is not None
+                        else None
+                    ),
+                    "owner_batch_start_timestamp": (
+                        session.owner_batch_start_timestamp
+                        if session is not None
+                        else None
+                    ),
+                    "owner_batch_id": (
+                        session.owner_batch_id if session is not None else None
+                    ),
                     "timestamp": time.time(),
                 },
             )
@@ -1784,6 +2026,7 @@ class PipelineNodeController:
         # 重配置时，新 prefill 只能在 pending_prefill_queue 等待；已经 active
         # 的请求返回 decode 时，直接进入 first_stage_input_queue
         if phase == PipelineProtocol.PHASE_PREFILL:
+            message.setdefault("first_stage_enqueue_timestamp", time.time())
             if request_id in self.active_request_ids:
                 raise RuntimeError(
                     f"[ERROR] received duplicate prefill for active request_id={request_id}; "
@@ -1800,6 +2043,7 @@ class PipelineNodeController:
             elif len(self.active_request_ids) < self.max_active_requests:
                 self.active_request_ids.add(request_id)
                 self.first_stage_input_queue.append(message)
+                self._emit_pipeline_admission_report(message, source="direct")
                 print(
                     f"[SCHEDULER] admitted request_id={request_id}; "
                     f"active queue={len(self.active_request_ids)}/{self.max_active_requests}"
@@ -1825,6 +2069,48 @@ class PipelineNodeController:
         raise RuntimeError(
             f"[ERROR] unsupported first-stage input phase={phase!r} "
             f"for request_id={request_id}."
+        )
+
+    def _emit_pipeline_admission_report(
+        self, message: dict[str, Any], source: str
+    ) -> None:
+        """
+        Emit a telemetry-only report when a prefill request enters active slots.
+
+        pending_wait_ms is measured entirely on the first stage: it starts when
+        the prefill first reaches the scheduler and ends when the request is
+        admitted into active_request_ids. This avoids cross-device clock sync.
+        """
+
+        telemetry_addr = message.get("telemetry_addr")
+        if not telemetry_addr:
+            return
+        admitted_timestamp = time.time()
+        enqueue_timestamp = float(
+            message.get("first_stage_enqueue_timestamp", admitted_timestamp)
+        )
+        self.node_worker.communicator.send_to(
+            telemetry_addr,
+            {
+                PipelineProtocol.TYPE_KEY: PipelineProtocol.PIPELINE_ADMISSION_REPORT,
+                "event": "prefill_admitted",
+                "request_id": message["request_id"],
+                "client_request_id": message.get("client_request_id"),
+                "trace_label": message.get("trace_label"),
+                "node_id": self.node_worker.node_id,
+                "node_addr": self.node_worker.node_addr,
+                "shards_start": self.node_worker.start,
+                "shards_end": self.node_worker.end,
+                "source": source,
+                "phase": message.get("phase"),
+                "step": message.get("step"),
+                "active_request_count": len(self.active_request_ids),
+                "pending_prefill_count": len(self.pending_prefill_queue),
+                "max_active_requests": self.max_active_requests,
+                "first_stage_enqueue_timestamp": enqueue_timestamp,
+                "admitted_timestamp": admitted_timestamp,
+                "pending_wait_ms": (admitted_timestamp - enqueue_timestamp) * 1000.0,
+            },
         )
 
     def _process_first_stage_input_once(self) -> None:
@@ -1854,6 +2140,7 @@ class PipelineNodeController:
             self.node_worker.communicator.send_to(message["owner_addr"], message)
             return
 
+        self._emit_pipeline_token_report(message)
         next_message = self.node_worker.receive_next_token(message)
         if PipelineProtocol.is_type(next_message, PipelineProtocol.PIPELINE_DONE):
             if self.is_first_stage:
@@ -1864,6 +2151,66 @@ class PipelineNodeController:
                 )
         else:
             self._submit_input_to_first_stage(next_message)
+
+    def _emit_pipeline_token_report(self, message: dict[str, Any]) -> None:
+        """
+        Emit a telemetry-only report when the owner receives a generated token.
+
+        The controller uses output_token_index=1 as TTFT. The timestamp is local
+        to the owner, while pipeline_test.py also records receive-side elapsed
+        time so no cross-device clock sync is required for user-visible latency.
+        """
+
+        telemetry_addr = message.get("telemetry_addr")
+        if not telemetry_addr:
+            return
+        phase = str(message.get("phase"))
+        step = int(message.get("step") or 0)
+        output_token_index = 1 if phase == PipelineProtocol.PHASE_PREFILL else step + 1
+        if output_token_index != 1:
+            return
+        session = self.node_worker.sessions.get(message["request_id"])
+        received_perf = time.perf_counter()
+        owner_local_ttft_ms = (
+            (received_perf - session.owner_request_start_perf) * 1000.0
+            if session is not None and session.owner_request_start_perf is not None
+            else None
+        )
+        owner_local_batch_ttft_ms = (
+            (received_perf - session.owner_batch_start_perf) * 1000.0
+            if session is not None and session.owner_batch_start_perf is not None
+            else None
+        )
+        self.node_worker.communicator.send_to(
+            telemetry_addr,
+            {
+                PipelineProtocol.TYPE_KEY: PipelineProtocol.PIPELINE_TOKEN_REPORT,
+                "event": "owner_received_token",
+                "request_id": message["request_id"],
+                "client_request_id": message.get("client_request_id"),
+                "trace_label": message.get("trace_label"),
+                "phase": phase,
+                "step": step,
+                "output_token_index": output_token_index,
+                "is_first_token": output_token_index == 1,
+                "owner_local_ttft_ms": owner_local_ttft_ms,
+                "owner_local_batch_ttft_ms": owner_local_batch_ttft_ms,
+                "owner_request_start_timestamp": (
+                    session.owner_request_start_timestamp
+                    if session is not None
+                    else None
+                ),
+                "owner_batch_start_timestamp": (
+                    session.owner_batch_start_timestamp
+                    if session is not None
+                    else None
+                ),
+                "owner_batch_id": session.owner_batch_id if session is not None else None,
+                "node_id": self.node_worker.node_id,
+                "node_addr": self.node_worker.node_addr,
+                "timestamp": time.time(),
+            },
+        )
 
     def _handle_pipeline_done(self, message: dict[str, Any]) -> None:
         # 如果 token 的 first_node_addr 不是本节点，说明是发错了，重新转发到相应节点
@@ -1906,6 +2253,19 @@ class PipelineNodeController:
                 "eos_seen": message.get("eos_seen", False),
                 "first_eos_step": message.get("first_eos_step"),
                 "semantic_output_valid": message.get("semantic_output_valid", True),
+                "owner_local_request_elapsed_ms": message.get(
+                    "owner_local_request_elapsed_ms"
+                ),
+                "owner_local_batch_elapsed_ms": message.get(
+                    "owner_local_batch_elapsed_ms"
+                ),
+                "owner_request_start_timestamp": message.get(
+                    "owner_request_start_timestamp"
+                ),
+                "owner_batch_start_timestamp": message.get(
+                    "owner_batch_start_timestamp"
+                ),
+                "owner_batch_id": message.get("owner_batch_id"),
                 "node_id": self.node_worker.node_id,
                 "node_addr": self.node_worker.node_addr,
                 "timestamp": time.time(),
@@ -1955,6 +2315,7 @@ class PipelineNodeController:
             self.active_request_ids.add(request_id)
             message["first_node_addr"] = self.node_worker.first_node_addr
             self.first_stage_input_queue.append(message)
+            self._emit_pipeline_admission_report(message, source="pending")
             print(
                 f"[SCHEDULER] admitted pending request_id={request_id}; "
                 f"active={len(self.active_request_ids)}/{self.max_active_requests}; "

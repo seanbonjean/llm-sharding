@@ -19,7 +19,6 @@ import io
 import json
 import math
 import random
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +39,9 @@ PIPELINE_DONE_REPORT = "pipeline_done_report"
 PIPELINE_NODE_READY = "pipeline_node_ready"
 PIPELINE_ADMISSION_REPORT = "pipeline_admission_report"
 PIPELINE_TOKEN_REPORT = "pipeline_token_report"
+PIPELINE_TEGRASTATS_START = "pipeline_tegrastats_start"
+PIPELINE_TEGRASTATS_STOP = "pipeline_tegrastats_stop"
+PIPELINE_TEGRASTATS_REPORT = "pipeline_tegrastats_report"
 
 TOKENIZER_PATH = "shards/Llama-3___2-3B-Instruct_float16"
 RESULT_ROOT = Path("results") / "pipeline_kv_cache"
@@ -56,6 +58,7 @@ CONCURRENCY_SWEEP_OUTPUT_TOKEN_LENGTH = 64
 CONCURRENCY_SWEEP_REPEATS = 5
 CONCURRENCY_SWEEP_WARMUP_INPUT_TOKEN_LENGTH = 64
 CONCURRENCY_SWEEP_WARMUP_OUTPUT_TOKEN_LENGTH = 16
+DEFAULT_TEGRASTATS_INTERVAL_MS = 1000
 PIPELINE_LATENCY_WARMUP_INPUT_TOKEN_LENGTH = 16
 PIPELINE_LATENCY_WARMUP_DECODE_STEPS = 16
 PIPELINE_LATENCY_WARMUP_MAX_NEW_TOKENS = (
@@ -504,6 +507,99 @@ class PipelineDebugClient:
             self._data_socket(node.node_addr).send(self._serialize(payload))
         return query_id
 
+    def _collect_worker_tegrastats_reports(
+        self,
+        run_id: str,
+        expected_events: set[str],
+        timeout_s: float,
+    ) -> list[dict]:
+        expected_node_ids = {node.node_id for node in self.nodes}
+        reports_by_node: dict[str, dict] = {}
+        deadline = time.time() + timeout_s
+        while set(reports_by_node) != expected_node_ids and time.time() < deadline:
+            report = self.wait_for_event(
+                lambda event: (
+                    event.get("type") == PIPELINE_TEGRASTATS_REPORT
+                    and event.get("event") in expected_events
+                    and (
+                        event.get("run_id") == run_id
+                        or event.get("requested_run_id") == run_id
+                    )
+                ),
+                timeout_s=max(0.05, deadline - time.time()),
+            )
+            if report is None:
+                break
+            node_id = str(report.get("node_id"))
+            if node_id in expected_node_ids:
+                reports_by_node[node_id] = report
+
+        missing = sorted(expected_node_ids - set(reports_by_node))
+        if missing:
+            print(
+                f"[WARNING] missing worker tegrastats reports for run_id={run_id}: "
+                f"{missing}"
+            )
+        return [reports_by_node[node.node_id] for node in self.nodes if node.node_id in reports_by_node]
+
+    def start_worker_tegrastats(
+        self,
+        run_id: str,
+        trace_label: str,
+        interval_ms: int = DEFAULT_TEGRASTATS_INTERVAL_MS,
+        timeout_s: float = 10.0,
+    ) -> list[dict]:
+        """Ask every pipeline worker node to start local Jetson tegrastats."""
+
+        if not self.telemetry_public_addr:
+            raise RuntimeError("[ERROR] telemetry must be configured before tegrastats.")
+        for node in self.nodes:
+            payload = {
+                "type": PIPELINE_TEGRASTATS_START,
+                "run_id": run_id,
+                "trace_label": trace_label,
+                "interval_ms": interval_ms,
+                "telemetry_addr": self.telemetry_public_addr,
+            }
+            self._data_socket(node.node_addr).send(self._serialize(payload))
+        reports = self._collect_worker_tegrastats_reports(
+            run_id=run_id,
+            expected_events={"tegrastats_started", "start_failed"},
+            timeout_s=timeout_s,
+        )
+        failed = [
+            f"{report.get('node_id')}: {report.get('error')}"
+            for report in reports
+            if not report.get("ok", False)
+        ]
+        if failed:
+            print(f"[WARNING] worker tegrastats failed to start: {failed}")
+        return reports
+
+    def stop_worker_tegrastats(
+        self,
+        run_id: str,
+        trace_label: str,
+        timeout_s: float = 15.0,
+    ) -> list[dict]:
+        """Ask every pipeline worker node to stop tegrastats and return samples."""
+
+        if not self.telemetry_public_addr:
+            raise RuntimeError("[ERROR] telemetry must be configured before tegrastats.")
+        for node in self.nodes:
+            payload = {
+                "type": PIPELINE_TEGRASTATS_STOP,
+                "run_id": run_id,
+                "trace_label": trace_label,
+                "telemetry_addr": self.telemetry_public_addr,
+            }
+            self._data_socket(node.node_addr).send(self._serialize(payload))
+        return self._collect_worker_tegrastats_reports(
+            run_id=run_id,
+            expected_events={"tegrastats_stopped", "not_running"},
+            timeout_s=timeout_s,
+        )
+
     def show_topology(self) -> None:
         print("\nCurrent pipeline topology:")
         for index, node in enumerate(self.nodes):
@@ -683,49 +779,6 @@ def mean_or_none(values: list[float]) -> float | None:
     if not usable_values:
         return None
     return sum(usable_values) / len(usable_values)
-
-
-class TegrastatsLogger:
-    """
-    Optional local tegrastats capture for runs launched on a Jetson controller.
-
-    This does not SSH into worker devices. It only records the local machine's
-    tegrastats output when the CLI operator explicitly enables it.
-    """
-
-    def __init__(self, output_path: Path, interval_ms: int = 1000):
-        self.output_path = output_path
-        self.interval_ms = interval_ms
-        self._file = None
-        self._process: subprocess.Popen | None = None
-
-    def start(self) -> None:
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.output_path.open("w", encoding="utf-8", errors="replace")
-        try:
-            self._process = subprocess.Popen(
-                ["tegrastats", "--interval", str(self.interval_ms)],
-                stdout=self._file,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            print(f"[TEST] tegrastats logging to {self.output_path}")
-        except FileNotFoundError:
-            print("[WARNING] tegrastats command not found; skip tegrastats logging.")
-            self.stop()
-
-    def stop(self) -> None:
-        if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=5.0)
-        self._process = None
-        if self._file is not None:
-            self._file.close()
-            self._file = None
 
 
 def linear_fit(xs: list[float], ys: list[float]) -> dict[str, float]:
@@ -1628,6 +1681,92 @@ def plot_memory_peak_by_node(
     plt.title(title)
     plt.grid(alpha=0.3)
     plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    print(f"[TEST] plot saved to {output_path}")
+
+
+def plot_memory_peak_methods_by_node(
+    rows: list[dict],
+    output_path: Path,
+) -> None:
+    if not rows:
+        print(f"[TEST] no memory peak rows to plot for {output_path}")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    metric_specs = [
+        (
+            "peak_cuda_memory_allocated_run_delta_bytes",
+            "cuda.memory_allocated delta",
+            "-",
+        ),
+        (
+            "peak_cuda_mem_get_info_used_run_delta_bytes",
+            "cuda.mem_get_info used delta",
+            "--",
+        ),
+        (
+            "peak_tegrastats_ram_used_run_delta_bytes",
+            "tegrastats RAM used delta",
+            ":",
+        ),
+    ]
+    node_keys = sorted(
+        {
+            (
+                str(row.get("node_id")),
+                int(row.get("shards_start") or 0),
+                int(row.get("shards_end") or 0),
+            )
+            for row in rows
+        },
+        key=lambda item: (item[1], item[2], item[0]),
+    )
+    max_active_values = sorted(
+        {int(row.get("max_active_requests") or 0) for row in rows}
+    )
+
+    plt.figure(figsize=(11, 6))
+    for node_id, shards_start, shards_end in node_keys:
+        for metric_key, metric_label, linestyle in metric_specs:
+            xs = []
+            ys = []
+            for max_active in max_active_values:
+                values = [
+                    _float_or_none(row.get(metric_key))
+                    for row in rows
+                    if str(row.get("node_id")) == node_id
+                    and int(row.get("shards_start") or 0) == shards_start
+                    and int(row.get("shards_end") or 0) == shards_end
+                    and int(row.get("max_active_requests") or 0) == max_active
+                ]
+                mean_value = mean_or_none(
+                    [value for value in values if value is not None]
+                )
+                if mean_value is None:
+                    continue
+                xs.append(max_active)
+                ys.append(bytes_to_mib(mean_value))
+            if xs:
+                plt.plot(
+                    xs,
+                    ys,
+                    marker="o",
+                    linewidth=1.2,
+                    linestyle=linestyle,
+                    label=f"{node_id} {shards_start}~{shards_end} {metric_label}",
+                )
+
+    plt.xlabel("max_active_requests")
+    plt.ylabel("Memory delta (MiB)")
+    plt.title("Memory pressure by node and measurement method")
+    plt.grid(alpha=0.3)
+    plt.legend(fontsize=7, ncol=2)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -3143,6 +3282,7 @@ def summarize_memory_peaks(
     forward_rows: list[dict],
     done_rows: list[dict],
     client_nodes: list[PipelineNodeSpec],
+    tegrastats_reports: list[dict] | None = None,
 ) -> tuple[list[dict], dict]:
     latest_kv_by_node_request: dict[tuple[str, str], int] = {}
     peak_dynamic_by_node: dict[str, int] = {node.node_id: 0 for node in client_nodes}
@@ -3239,6 +3379,11 @@ def summarize_memory_peaks(
     mem_info_values = [
         value for value in peak_mem_info_delta_by_node.values() if value is not None
     ]
+    tegrastats_by_node = {
+        str(report.get("node_id")): report
+        for report in (tegrastats_reports or [])
+        if report.get("node_id") is not None
+    }
     memory_summary = {
         "memory_peak_ordering_basis": "collector_telemetry_receive_order",
         "peak_dynamiccache_total_bytes": peak_dynamic_total,
@@ -3278,7 +3423,187 @@ def summarize_memory_peaks(
             max(mem_info_values) if mem_info_values else None
         ),
     }
+
+    tegrastats_delta_values: list[int] = []
+    for row in memory_rows:
+        report = tegrastats_by_node.get(str(row["node_id"]), {})
+        tegrastats_delta = report.get("peak_tegrastats_ram_used_run_delta_bytes")
+        if tegrastats_delta is not None:
+            tegrastats_delta_values.append(int(tegrastats_delta))
+        row.update(
+            {
+                "tegrastats_event": report.get("event"),
+                "tegrastats_ok": report.get("ok"),
+                "tegrastats_sample_count": report.get("tegrastats_sample_count"),
+                "tegrastats_log_path": report.get("log_path"),
+                "tegrastats_ram_total_bytes": report.get(
+                    "tegrastats_ram_total_bytes"
+                ),
+                "tegrastats_ram_total_mib": bytes_to_mib(
+                    report.get("tegrastats_ram_total_bytes")
+                ),
+                "tegrastats_ram_used_baseline_bytes": report.get(
+                    "tegrastats_ram_used_baseline_bytes"
+                ),
+                "tegrastats_ram_used_baseline_mib": bytes_to_mib(
+                    report.get("tegrastats_ram_used_baseline_bytes")
+                ),
+                "peak_tegrastats_ram_used_bytes": report.get(
+                    "peak_tegrastats_ram_used_bytes"
+                ),
+                "peak_tegrastats_ram_used_mib": bytes_to_mib(
+                    report.get("peak_tegrastats_ram_used_bytes")
+                ),
+                "peak_tegrastats_ram_used_run_delta_bytes": tegrastats_delta,
+                "peak_tegrastats_ram_used_run_delta_mib": bytes_to_mib(
+                    tegrastats_delta
+                ),
+                "peak_tegrastats_gr3d_freq_percent": report.get(
+                    "peak_tegrastats_gr3d_freq_percent"
+                ),
+                "peak_tegrastats_emc_freq_percent": report.get(
+                    "peak_tegrastats_emc_freq_percent"
+                ),
+                "peak_tegrastats_vdd_in_current_mw": report.get(
+                    "peak_tegrastats_vdd_in_current_mw"
+                ),
+                "mean_tegrastats_vdd_in_current_mw": report.get(
+                    "mean_tegrastats_vdd_in_current_mw"
+                ),
+            }
+        )
+
+    memory_summary.update(
+        {
+            "tegrastats_available_node_count": len(tegrastats_delta_values),
+            "sum_peak_tegrastats_ram_used_run_delta_bytes": (
+                sum(tegrastats_delta_values) if tegrastats_delta_values else None
+            ),
+            "sum_peak_tegrastats_ram_used_run_delta_mib": bytes_to_mib(
+                sum(tegrastats_delta_values) if tegrastats_delta_values else None
+            ),
+            "max_peak_tegrastats_ram_used_run_delta_bytes": (
+                max(tegrastats_delta_values) if tegrastats_delta_values else None
+            ),
+            "max_peak_tegrastats_ram_used_run_delta_mib": bytes_to_mib(
+                max(tegrastats_delta_values) if tegrastats_delta_values else None
+            ),
+        }
+    )
     return memory_rows, memory_summary
+
+
+def build_tegrastats_rows(
+    reports: list[dict],
+    *,
+    experiment_name: str,
+    run_index: int,
+    repeat_index: int,
+    max_active_requests: int,
+    input_token_length: int,
+    output_token_length: int,
+) -> tuple[list[dict], list[dict]]:
+    report_rows: list[dict] = []
+    sample_rows: list[dict] = []
+    context = {
+        "experiment": experiment_name,
+        "run_index": run_index,
+        "repeat_index": repeat_index,
+        "max_active_requests": max_active_requests,
+        "input_token_length": input_token_length,
+        "max_new_tokens": output_token_length,
+    }
+
+    for report in reports:
+        report_row = dict(context)
+        report_row.update(
+            {
+                "node_id": report.get("node_id"),
+                "node_addr": report.get("node_addr"),
+                "shards_start": report.get("shards_start"),
+                "shards_end": report.get("shards_end"),
+                "event": report.get("event"),
+                "ok": report.get("ok"),
+                "error": report.get("error"),
+                "run_id": report.get("run_id"),
+                "requested_run_id": report.get("requested_run_id"),
+                "trace_label": report.get("trace_label"),
+                "log_path": report.get("log_path"),
+                "started_timestamp": report.get("started_timestamp"),
+                "stopped_timestamp": report.get("stopped_timestamp"),
+                "elapsed_ms": report.get("elapsed_ms"),
+                "return_code": report.get("return_code"),
+                "tegrastats_sample_count": report.get("tegrastats_sample_count"),
+                "tegrastats_ram_total_bytes": report.get(
+                    "tegrastats_ram_total_bytes"
+                ),
+                "tegrastats_ram_total_mib": bytes_to_mib(
+                    report.get("tegrastats_ram_total_bytes")
+                ),
+                "tegrastats_ram_used_baseline_bytes": report.get(
+                    "tegrastats_ram_used_baseline_bytes"
+                ),
+                "tegrastats_ram_used_baseline_mib": bytes_to_mib(
+                    report.get("tegrastats_ram_used_baseline_bytes")
+                ),
+                "peak_tegrastats_ram_used_bytes": report.get(
+                    "peak_tegrastats_ram_used_bytes"
+                ),
+                "peak_tegrastats_ram_used_mib": bytes_to_mib(
+                    report.get("peak_tegrastats_ram_used_bytes")
+                ),
+                "peak_tegrastats_ram_used_run_delta_bytes": report.get(
+                    "peak_tegrastats_ram_used_run_delta_bytes"
+                ),
+                "peak_tegrastats_ram_used_run_delta_mib": bytes_to_mib(
+                    report.get("peak_tegrastats_ram_used_run_delta_bytes")
+                ),
+                "peak_tegrastats_gr3d_freq_percent": report.get(
+                    "peak_tegrastats_gr3d_freq_percent"
+                ),
+                "peak_tegrastats_emc_freq_percent": report.get(
+                    "peak_tegrastats_emc_freq_percent"
+                ),
+                "peak_tegrastats_vdd_in_current_mw": report.get(
+                    "peak_tegrastats_vdd_in_current_mw"
+                ),
+                "mean_tegrastats_vdd_in_current_mw": report.get(
+                    "mean_tegrastats_vdd_in_current_mw"
+                ),
+            }
+        )
+        report_rows.append(report_row)
+
+        for sample in report.get("samples") or []:
+            sample_row = dict(context)
+            sample_row.update(
+                {
+                    "node_id": report.get("node_id"),
+                    "node_addr": report.get("node_addr"),
+                    "shards_start": report.get("shards_start"),
+                    "shards_end": report.get("shards_end"),
+                    "run_id": report.get("run_id"),
+                    "sample_index": sample.get("sample_index"),
+                    "ram_used_mb": sample.get("ram_used_mb"),
+                    "ram_total_mb": sample.get("ram_total_mb"),
+                    "ram_used_bytes": sample.get("ram_used_bytes"),
+                    "ram_used_mib": bytes_to_mib(sample.get("ram_used_bytes")),
+                    "ram_total_bytes": sample.get("ram_total_bytes"),
+                    "ram_total_mib": bytes_to_mib(sample.get("ram_total_bytes")),
+                    "swap_used_mb": sample.get("swap_used_mb"),
+                    "swap_total_mb": sample.get("swap_total_mb"),
+                    "swap_used_bytes": sample.get("swap_used_bytes"),
+                    "swap_total_bytes": sample.get("swap_total_bytes"),
+                    "gr3d_freq_percent": sample.get("gr3d_freq_percent"),
+                    "emc_freq_percent": sample.get("emc_freq_percent"),
+                    "vdd_in_current_mw": sample.get("vdd_in_current_mw"),
+                    "vdd_in_average_mw": sample.get("vdd_in_average_mw"),
+                    "raw_line": sample.get("raw_line"),
+                }
+            )
+            sample_rows.append(sample_row)
+
+    return report_rows, sample_rows
 
 
 def build_concurrency_sweep_result_rows(
@@ -3293,6 +3618,7 @@ def build_concurrency_sweep_result_rows(
     client_request_ids: list[str],
     collected: dict,
     process_started_perf: float,
+    tegrastats_reports: list[dict] | None = None,
 ) -> tuple[
     list[dict],
     list[dict],
@@ -3619,6 +3945,7 @@ def build_concurrency_sweep_result_rows(
         forward_rows,
         done_rows,
         client.nodes,
+        tegrastats_reports=tegrastats_reports,
     )
     for row in memory_rows:
         row.update(
@@ -4479,12 +4806,21 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
         "This experiment fixes a 4-stage Llama 3.2 3B pipeline and submits "
         "12 distinct requests with identical input token length to the first "
         "node. It sweeps max_active_requests to show utilization, latency, "
-        "TTFT/pending wait, and memory-pressure tradeoffs.\n"
+        "first-token/pending wait, and memory-pressure tradeoffs. Optional "
+        "tegrastats sampling runs on the pipeline worker nodes, not on this "
+        "controller CLI machine.\n"
     )
-    use_tegrastats = ask_yes_no(
-        "Is this CLI running on a Jetson device and should it record local tegrastats?",
+    use_worker_tegrastats = ask_yes_no(
+        "Record worker-side tegrastats on pipeline Jetson nodes?",
         default=False,
     )
+    tegrastats_interval_ms = DEFAULT_TEGRASTATS_INTERVAL_MS
+    if use_worker_tegrastats:
+        tegrastats_interval_ms = ask_int(
+            "Worker tegrastats interval ms",
+            DEFAULT_TEGRASTATS_INTERVAL_MS,
+            minimum=100,
+        )
     input_token_length = ask_int(
         "Input token length for every request",
         CONCURRENCY_SWEEP_INPUT_TOKEN_LENGTH,
@@ -4575,12 +4911,6 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
     time.sleep(2.0)
     client.drain_events()
 
-    tegrastats_logger = (
-        TegrastatsLogger(result_dir / "tegrastats_raw.log")
-        if use_tegrastats
-        else None
-    )
-
     summary_rows: list[dict] = []
     all_forward_rows: list[dict] = []
     all_done_rows: list[dict] = []
@@ -4590,6 +4920,8 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
     all_stage_rows: list[dict] = []
     all_memory_rows: list[dict] = []
     all_critical_path_rows: list[dict] = []
+    all_tegrastats_report_rows: list[dict] = []
+    all_tegrastats_sample_rows: list[dict] = []
 
     run_plan = [
         (max_active, repeat_index)
@@ -4607,6 +4939,10 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
             "output_token_length": output_token_length,
             "max_active_values": max_active_values,
             "repeat_count_per_max_active": repeats,
+            "worker_tegrastats_enabled": use_worker_tegrastats,
+            "worker_tegrastats_interval_ms": (
+                tegrastats_interval_ms if use_worker_tegrastats else None
+            ),
             "randomized_run_plan": [
                 {"max_active_requests": max_active, "repeat_index": repeat_index}
                 for max_active, repeat_index in run_plan
@@ -4614,24 +4950,30 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
         },
     )
 
-    try:
-        if tegrastats_logger is not None:
-            tegrastats_logger.start()
+    expected_phase_steps = [("prefill", 0)] + [
+        ("decode", step) for step in range(1, output_token_length)
+    ]
+    for run_index, (max_active, repeat_index) in enumerate(run_plan, start=1):
+        print(
+            f"\n[TEST] concurrency sweep run {run_index}/{len(run_plan)}: "
+            f"max_active_requests={max_active}, repeat={repeat_index}/{repeats}"
+        )
+        client.max_active_requests = max_active
+        config_id = client.send_config()
+        client.wait_for_nodes_ready(config_id, timeout_s=config_ready_timeout_s)
+        client.drain_events()
 
-        expected_phase_steps = [("prefill", 0)] + [
-            ("decode", step) for step in range(1, output_token_length)
-        ]
-        for run_index, (max_active, repeat_index) in enumerate(run_plan, start=1):
-            print(
-                f"\n[TEST] concurrency sweep run {run_index}/{len(run_plan)}: "
-                f"max_active_requests={max_active}, repeat={repeat_index}/{repeats}"
+        prefix = f"sweep_run{run_index:03d}_M{max_active}_rep{repeat_index}"
+        worker_tegrastats_start_reports: list[dict] = []
+        worker_tegrastats_stop_reports: list[dict] = []
+        if use_worker_tegrastats:
+            worker_tegrastats_start_reports = client.start_worker_tegrastats(
+                run_id=prefix,
+                trace_label=prefix,
+                interval_ms=tegrastats_interval_ms,
+                timeout_s=10.0,
             )
-            client.max_active_requests = max_active
-            config_id = client.send_config()
-            client.wait_for_nodes_ready(config_id, timeout_s=config_ready_timeout_s)
-            client.drain_events()
-
-            prefix = f"sweep_run{run_index:03d}_M{max_active}_rep{repeat_index}"
+        try:
             process_started_perf = time.perf_counter()
             client_request_ids = client.submit_burst_requests(
                 owner_index=0,
@@ -4649,71 +4991,97 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
                 process_started_perf=process_started_perf,
                 timeout_s=timeout_s,
             )
-            (
-                forward_rows,
-                done_rows,
-                request_latency_rows,
-                admission_rows,
-                first_token_rows,
-                stage_rows,
-                memory_rows,
-                critical_path_rows,
-                summary,
-            ) = build_concurrency_sweep_result_rows(
-                experiment_name=experiment_name,
-                run_index=run_index,
-                repeat_index=repeat_index,
-                max_active_requests=max_active,
-                input_token_length=input_token_length,
-                output_token_length=output_token_length,
-                client=client,
-                client_request_ids=client_request_ids,
-                collected=collected,
-                process_started_perf=process_started_perf,
-            )
-            summary_rows.append(summary)
-            all_forward_rows.extend(forward_rows)
-            all_done_rows.extend(done_rows)
-            all_request_latency_rows.extend(request_latency_rows)
-            all_admission_rows.extend(admission_rows)
-            all_first_token_rows.extend(first_token_rows)
-            all_stage_rows.extend(stage_rows)
-            all_memory_rows.extend(memory_rows)
-            for path_row in critical_path_rows:
-                path_row.update(
-                    {
-                        "experiment": experiment_name,
-                        "run_index": run_index,
-                        "repeat_index": repeat_index,
-                        "max_active_requests": max_active,
-                    }
+        finally:
+            if use_worker_tegrastats:
+                worker_tegrastats_stop_reports = client.stop_worker_tegrastats(
+                    run_id=prefix,
+                    trace_label=prefix,
+                    timeout_s=15.0,
                 )
-            all_critical_path_rows.extend(critical_path_rows)
+        (
+            forward_rows,
+            done_rows,
+            request_latency_rows,
+            admission_rows,
+            first_token_rows,
+            stage_rows,
+            memory_rows,
+            critical_path_rows,
+            summary,
+        ) = build_concurrency_sweep_result_rows(
+            experiment_name=experiment_name,
+            run_index=run_index,
+            repeat_index=repeat_index,
+            max_active_requests=max_active,
+            input_token_length=input_token_length,
+            output_token_length=output_token_length,
+            client=client,
+            client_request_ids=client_request_ids,
+            collected=collected,
+            process_started_perf=process_started_perf,
+            tegrastats_reports=worker_tegrastats_stop_reports,
+        )
+        tegrastats_start_rows, _ = build_tegrastats_rows(
+            worker_tegrastats_start_reports,
+            experiment_name=experiment_name,
+            run_index=run_index,
+            repeat_index=repeat_index,
+            max_active_requests=max_active,
+            input_token_length=input_token_length,
+            output_token_length=output_token_length,
+        )
+        tegrastats_stop_rows, tegrastats_sample_rows = build_tegrastats_rows(
+            worker_tegrastats_stop_reports,
+            experiment_name=experiment_name,
+            run_index=run_index,
+            repeat_index=repeat_index,
+            max_active_requests=max_active,
+            input_token_length=input_token_length,
+            output_token_length=output_token_length,
+        )
+        summary_rows.append(summary)
+        all_forward_rows.extend(forward_rows)
+        all_done_rows.extend(done_rows)
+        all_request_latency_rows.extend(request_latency_rows)
+        all_admission_rows.extend(admission_rows)
+        all_first_token_rows.extend(first_token_rows)
+        all_stage_rows.extend(stage_rows)
+        all_memory_rows.extend(memory_rows)
+        all_tegrastats_report_rows.extend(tegrastats_start_rows)
+        all_tegrastats_report_rows.extend(tegrastats_stop_rows)
+        all_tegrastats_sample_rows.extend(tegrastats_sample_rows)
+        for path_row in critical_path_rows:
+            path_row.update(
+                {
+                    "experiment": experiment_name,
+                    "run_index": run_index,
+                    "repeat_index": repeat_index,
+                    "max_active_requests": max_active,
+                }
+            )
+        all_critical_path_rows.extend(critical_path_rows)
 
+        print(
+            "[TEST] run summary: "
+            f"makespan={summary.get('total_complete_time_preferred_ms')} ms, "
+            f"throughput={summary.get('throughput_requests_per_s')} req/s, "
+            f"stage_util_mean={summary.get('stage_time_utilization_mean')}"
+        )
+        if (
+            summary["missing_ack_count"]
+            or summary["missing_admission_count"]
+            or summary["missing_first_token_count"]
+            or summary["missing_forward_report_count"]
+            or summary["missing_done_count"]
+        ):
             print(
-                "[TEST] run summary: "
-                f"makespan={summary.get('total_complete_time_preferred_ms')} ms, "
-                f"throughput={summary.get('throughput_requests_per_s')} req/s, "
-                f"stage_util_mean={summary.get('stage_time_utilization_mean')}"
+                "[WARNING] run has missing telemetry: "
+                f"ack={summary['missing_ack_count']}, "
+                f"admission={summary['missing_admission_count']}, "
+                f"first_token={summary['missing_first_token_count']}, "
+                f"forward={summary['missing_forward_report_count']}, "
+                f"done={summary['missing_done_count']}"
             )
-            if (
-                summary["missing_ack_count"]
-                or summary["missing_admission_count"]
-                or summary["missing_first_token_count"]
-                or summary["missing_forward_report_count"]
-                or summary["missing_done_count"]
-            ):
-                print(
-                    "[WARNING] run has missing telemetry: "
-                    f"ack={summary['missing_ack_count']}, "
-                    f"admission={summary['missing_admission_count']}, "
-                    f"first_token={summary['missing_first_token_count']}, "
-                    f"forward={summary['missing_forward_report_count']}, "
-                    f"done={summary['missing_done_count']}"
-                )
-    finally:
-        if tegrastats_logger is not None:
-            tegrastats_logger.stop()
 
     write_csv(result_dir / "concurrency_sweep_run_summary.csv", summary_rows)
     write_csv(result_dir / "concurrency_sweep_request_latency.csv", all_request_latency_rows)
@@ -4723,6 +5091,8 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
     write_csv(result_dir / "concurrency_sweep_forward_reports.csv", all_forward_rows)
     write_csv(result_dir / "concurrency_sweep_stage_time_utilization.csv", all_stage_rows)
     write_csv(result_dir / "concurrency_sweep_memory_peaks_per_node.csv", all_memory_rows)
+    write_csv(result_dir / "concurrency_sweep_tegrastats_reports.csv", all_tegrastats_report_rows)
+    write_csv(result_dir / "concurrency_sweep_tegrastats_samples.csv", all_tegrastats_sample_rows)
     write_csv(result_dir / "concurrency_sweep_critical_path_forward_rows.csv", all_critical_path_rows)
 
     plot_sweep_metric_lines(
@@ -4841,6 +5211,31 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
         result_dir / "concurrency_sweep_cuda_mem_get_info_peak_by_node.png",
         "torch.cuda.mem_get_info() used baseline delta by node",
         "Memory delta (MiB)",
+    )
+    plot_sweep_metric_lines(
+        summary_rows,
+        [
+            (
+                "max_peak_cuda_memory_allocated_run_delta_bytes",
+                "max node cuda.memory_allocated delta",
+            ),
+            (
+                "max_peak_cuda_mem_get_info_used_run_delta_bytes",
+                "max node cuda.mem_get_info used delta",
+            ),
+            (
+                "max_peak_tegrastats_ram_used_run_delta_bytes",
+                "max node tegrastats RAM used delta",
+            ),
+        ],
+        result_dir / "concurrency_sweep_memory_method_peak_summary.png",
+        "Memory pressure by measurement method",
+        "Memory delta (MiB)",
+        value_transform=bytes_to_mib,
+    )
+    plot_memory_peak_methods_by_node(
+        all_memory_rows,
+        result_dir / "concurrency_sweep_memory_method_peak_by_node.png",
     )
 
     print(f"[TEST] results directory: {result_dir}")

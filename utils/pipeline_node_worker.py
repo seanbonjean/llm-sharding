@@ -3,6 +3,9 @@ from __future__ import annotations
 import gc
 import io
 import os
+import re
+import subprocess
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -44,6 +47,9 @@ class PipelineProtocol:
     PIPELINE_NODE_READY = "pipeline_node_ready"
     PIPELINE_ADMISSION_REPORT = "pipeline_admission_report"
     PIPELINE_TOKEN_REPORT = "pipeline_token_report"
+    PIPELINE_TEGRASTATS_START = "pipeline_tegrastats_start"
+    PIPELINE_TEGRASTATS_STOP = "pipeline_tegrastats_stop"
+    PIPELINE_TEGRASTATS_REPORT = "pipeline_tegrastats_report"
 
     TELEMETRY_FIELDS = (
         "client_request_id",
@@ -298,6 +304,8 @@ class PipelineProtocol:
             cls.USER_REQUEST,
             cls.USER_REQUEST_BATCH,
             cls.KV_CACHE_QUERY,
+            cls.PIPELINE_TEGRASTATS_START,
+            cls.PIPELINE_TEGRASTATS_STOP,
         }
 
 
@@ -416,6 +424,257 @@ class PipelineCommunicator:
         flags = zmq.NOBLOCK if no_block else 0
         payload = self.recv_socket.recv(flags=flags)
         return self._deserialize(payload)
+
+
+class PipelineTegrastatsMonitor:
+    """Telemetry-only tegrastats runner for one Jetson worker node.
+
+    The monitor is controlled by explicit start/stop messages from
+    pipeline_test.py. It writes tegrastats output to a local temporary file while
+    inference runs and parses the file only after stop, so it does not add
+    network traffic to the hot pipeline path.
+    """
+
+    RAM_RE = re.compile(r"\bRAM\s+(\d+)/(\d+)MB\b")
+    SWAP_RE = re.compile(r"\bSWAP\s+(\d+)/(\d+)MB\b")
+    GR3D_RE = re.compile(r"\bGR3D_FREQ\s+(\d+)%")
+    EMC_RE = re.compile(r"\bEMC_FREQ\s+(\d+)%")
+    VDD_IN_RE = re.compile(r"\bVDD_IN\s+(\d+)mW(?:/(\d+)mW)?")
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen | None = None
+        self.file_handle: Any | None = None
+        self.log_path: str | None = None
+        self.run_id: str | None = None
+        self.trace_label: str | None = None
+        self.started_timestamp: float | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    @staticmethod
+    def _mb_to_bytes(value: int | None) -> int | None:
+        return int(value) * 1024 * 1024 if value is not None else None
+
+    @staticmethod
+    def _parse_percent(pattern: re.Pattern, line: str) -> int | None:
+        match = pattern.search(line)
+        return int(match.group(1)) if match else None
+
+    @classmethod
+    def parse_line(cls, line: str, sample_index: int) -> dict[str, Any] | None:
+        ram_match = cls.RAM_RE.search(line)
+        if not ram_match:
+            return None
+
+        ram_used_mb = int(ram_match.group(1))
+        ram_total_mb = int(ram_match.group(2))
+        swap_match = cls.SWAP_RE.search(line)
+        vdd_match = cls.VDD_IN_RE.search(line)
+        sample: dict[str, Any] = {
+            "sample_index": sample_index,
+            "raw_line": line.rstrip(),
+            "ram_used_mb": ram_used_mb,
+            "ram_total_mb": ram_total_mb,
+            "ram_used_bytes": cls._mb_to_bytes(ram_used_mb),
+            "ram_total_bytes": cls._mb_to_bytes(ram_total_mb),
+            "gr3d_freq_percent": cls._parse_percent(cls.GR3D_RE, line),
+            "emc_freq_percent": cls._parse_percent(cls.EMC_RE, line),
+        }
+        if swap_match:
+            swap_used_mb = int(swap_match.group(1))
+            swap_total_mb = int(swap_match.group(2))
+            sample.update(
+                {
+                    "swap_used_mb": swap_used_mb,
+                    "swap_total_mb": swap_total_mb,
+                    "swap_used_bytes": cls._mb_to_bytes(swap_used_mb),
+                    "swap_total_bytes": cls._mb_to_bytes(swap_total_mb),
+                }
+            )
+        if vdd_match:
+            sample["vdd_in_current_mw"] = int(vdd_match.group(1))
+            sample["vdd_in_average_mw"] = (
+                int(vdd_match.group(2)) if vdd_match.group(2) else None
+            )
+        return sample
+
+    @classmethod
+    def parse_samples(cls, log_path: str | None) -> list[dict[str, Any]]:
+        if not log_path or not os.path.exists(log_path):
+            return []
+        samples: list[dict[str, Any]] = []
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                sample = cls.parse_line(line, len(samples))
+                if sample is not None:
+                    samples.append(sample)
+        return samples
+
+    @staticmethod
+    def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
+        if not samples:
+            return {
+                "tegrastats_sample_count": 0,
+                "tegrastats_ram_used_baseline_bytes": None,
+                "peak_tegrastats_ram_used_bytes": None,
+                "peak_tegrastats_ram_used_run_delta_bytes": None,
+                "tegrastats_ram_total_bytes": None,
+                "peak_tegrastats_gr3d_freq_percent": None,
+                "peak_tegrastats_emc_freq_percent": None,
+                "peak_tegrastats_vdd_in_current_mw": None,
+                "mean_tegrastats_vdd_in_current_mw": None,
+            }
+
+        ram_values = [
+            int(sample["ram_used_bytes"])
+            for sample in samples
+            if sample.get("ram_used_bytes") is not None
+        ]
+        ram_baseline = ram_values[0] if ram_values else None
+        ram_peak = max(ram_values) if ram_values else None
+        gr3d_values = [
+            int(sample["gr3d_freq_percent"])
+            for sample in samples
+            if sample.get("gr3d_freq_percent") is not None
+        ]
+        emc_values = [
+            int(sample["emc_freq_percent"])
+            for sample in samples
+            if sample.get("emc_freq_percent") is not None
+        ]
+        power_values = [
+            int(sample["vdd_in_current_mw"])
+            for sample in samples
+            if sample.get("vdd_in_current_mw") is not None
+        ]
+        total_values = [
+            int(sample["ram_total_bytes"])
+            for sample in samples
+            if sample.get("ram_total_bytes") is not None
+        ]
+        return {
+            "tegrastats_sample_count": len(samples),
+            "tegrastats_ram_used_baseline_bytes": ram_baseline,
+            "peak_tegrastats_ram_used_bytes": ram_peak,
+            "peak_tegrastats_ram_used_run_delta_bytes": (
+                ram_peak - ram_baseline
+                if ram_peak is not None and ram_baseline is not None
+                else None
+            ),
+            "tegrastats_ram_total_bytes": total_values[-1] if total_values else None,
+            "peak_tegrastats_gr3d_freq_percent": (
+                max(gr3d_values) if gr3d_values else None
+            ),
+            "peak_tegrastats_emc_freq_percent": (
+                max(emc_values) if emc_values else None
+            ),
+            "peak_tegrastats_vdd_in_current_mw": (
+                max(power_values) if power_values else None
+            ),
+            "mean_tegrastats_vdd_in_current_mw": (
+                sum(power_values) / len(power_values) if power_values else None
+            ),
+        }
+
+    def start(self, run_id: str, trace_label: str, interval_ms: int) -> dict[str, Any]:
+        if self.is_running:
+            self.stop()
+
+        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id or "run")
+        fd, log_path = tempfile.mkstemp(
+            prefix=f"pipeline_tegrastats_{safe_run_id}_",
+            suffix=".log",
+        )
+        os.close(fd)
+        self.file_handle = open(log_path, "w", encoding="utf-8", errors="replace")
+        self.log_path = log_path
+        self.run_id = run_id
+        self.trace_label = trace_label
+        self.started_timestamp = time.time()
+
+        try:
+            self.process = subprocess.Popen(
+                ["tegrastats", "--interval", str(interval_ms)],
+                stdout=self.file_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            self._close_file()
+            self.process = None
+            self.log_path = None
+            self.run_id = None
+            self.trace_label = None
+            self.started_timestamp = None
+            return {
+                "ok": False,
+                "error": str(exc),
+                "log_path": log_path,
+                "started_timestamp": time.time(),
+            }
+        except Exception as exc:
+            self._close_file()
+            self.process = None
+            self.log_path = None
+            self.run_id = None
+            self.trace_label = None
+            self.started_timestamp = None
+            return {
+                "ok": False,
+                "error": str(exc),
+                "log_path": log_path,
+                "started_timestamp": time.time(),
+            }
+
+        return {
+            "ok": True,
+            "log_path": log_path,
+            "started_timestamp": self.started_timestamp,
+        }
+
+    def _close_file(self) -> None:
+        if self.file_handle is not None:
+            self.file_handle.close()
+            self.file_handle = None
+
+    def stop(self) -> dict[str, Any]:
+        stopped_timestamp = time.time()
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5.0)
+        return_code = self.process.returncode if self.process is not None else None
+        self.process = None
+        self._close_file()
+
+        samples = self.parse_samples(self.log_path)
+        summary = self.summarize_samples(samples)
+        result = {
+            "ok": True,
+            "run_id": self.run_id,
+            "trace_label": self.trace_label,
+            "log_path": self.log_path,
+            "started_timestamp": self.started_timestamp,
+            "stopped_timestamp": stopped_timestamp,
+            "elapsed_ms": (
+                (stopped_timestamp - self.started_timestamp) * 1000.0
+                if self.started_timestamp is not None
+                else None
+            ),
+            "return_code": return_code,
+            "samples": samples,
+        }
+        result.update(summary)
+        self.run_id = None
+        self.trace_label = None
+        self.log_path = None
+        self.started_timestamp = None
+        return result
 
 
 @dataclass
@@ -1450,6 +1709,7 @@ class PipelineNodeController:
         self.deferred_config: dict[str, Any] | None = (
             None  # 等旧请求 drain 完毕后再真正应用的 config
         )
+        self.tegrastats_monitor = PipelineTegrastatsMonitor()
         print("[CONTROLLER] Pipeline node is ready.")
         self._emit_node_ready_report(event="initial_ready")
 
@@ -1846,6 +2106,81 @@ class PipelineNodeController:
             self._handle_user_request_batch(data)
         elif PipelineProtocol.is_type(data, PipelineProtocol.KV_CACHE_QUERY):
             self._handle_kv_cache_query(data)
+        elif PipelineProtocol.is_type(data, PipelineProtocol.PIPELINE_TEGRASTATS_START):
+            self._handle_tegrastats_start(data)
+        elif PipelineProtocol.is_type(data, PipelineProtocol.PIPELINE_TEGRASTATS_STOP):
+            self._handle_tegrastats_stop(data)
+
+    def _send_tegrastats_report(
+        self,
+        telemetry_addr: str | None,
+        report: dict[str, Any],
+    ) -> None:
+        if not telemetry_addr:
+            print("[REQUEST ERROR] tegrastats control message missing telemetry_addr.")
+            return
+        report.update(
+            {
+                PipelineProtocol.TYPE_KEY: PipelineProtocol.PIPELINE_TEGRASTATS_REPORT,
+                "node_id": self.node_worker.node_id,
+                "node_addr": self.node_worker.node_addr,
+                "shards_start": self.node_worker.start,
+                "shards_end": self.node_worker.end,
+                "timestamp": time.time(),
+            }
+        )
+        self.node_worker.communicator.send_to(telemetry_addr, report)
+
+    def _handle_tegrastats_start(self, message: dict[str, Any]) -> None:
+        """Start local Jetson tegrastats for an explicit telemetry experiment."""
+
+        telemetry_addr = message.get("telemetry_addr")
+        interval_ms = max(100, int(message.get("interval_ms", 1000)))
+        result = self.tegrastats_monitor.start(
+            run_id=str(message.get("run_id") or ""),
+            trace_label=str(message.get("trace_label") or ""),
+            interval_ms=interval_ms,
+        )
+        result.update(
+            {
+                "event": "tegrastats_started" if result.get("ok") else "start_failed",
+                "run_id": message.get("run_id"),
+                "trace_label": message.get("trace_label"),
+                "interval_ms": interval_ms,
+            }
+        )
+        self._send_tegrastats_report(telemetry_addr, result)
+
+    def _handle_tegrastats_stop(self, message: dict[str, Any]) -> None:
+        """Stop local Jetson tegrastats and return parsed samples and summary."""
+
+        telemetry_addr = message.get("telemetry_addr")
+        if (
+            self.tegrastats_monitor.process is None
+            and self.tegrastats_monitor.log_path is None
+        ):
+            self._send_tegrastats_report(
+                telemetry_addr,
+                {
+                    "ok": False,
+                    "event": "not_running",
+                    "run_id": message.get("run_id"),
+                    "trace_label": message.get("trace_label"),
+                    "samples": [],
+                    "tegrastats_sample_count": 0,
+                },
+            )
+            return
+
+        result = self.tegrastats_monitor.stop()
+        result.update(
+            {
+                "event": "tegrastats_stopped",
+                "requested_run_id": message.get("run_id"),
+                "requested_trace_label": message.get("trace_label"),
+            }
+        )
+        self._send_tegrastats_report(telemetry_addr, result)
 
     def _handle_user_request_batch(self, message: dict[str, Any]) -> None:
         """

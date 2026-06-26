@@ -4831,6 +4831,11 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
         CONCURRENCY_SWEEP_OUTPUT_TOKEN_LENGTH,
         minimum=1,
     )
+    request_count = ask_int(
+        "Request count",
+        CONCURRENCY_SWEEP_REQUEST_COUNT,
+        minimum=1,
+    )
     repeats = ask_int(
         "Repeat count per max_active_requests",
         CONCURRENCY_SWEEP_REPEATS,
@@ -4846,7 +4851,7 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
         return
     timeout_default = max(
         300,
-        int(output_token_length * CONCURRENCY_SWEEP_REQUEST_COUNT * 2.0),
+        int(output_token_length * request_count * 2.0),
     )
     timeout_s = float(
         input(f"Overall timeout seconds per run [{timeout_default}]: ").strip()
@@ -4869,9 +4874,9 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
     input_ids_list = build_distinct_input_ids_for_same_length(
         tokenizer=tokenizer,
         token_length=input_token_length,
-        request_count=CONCURRENCY_SWEEP_REQUEST_COUNT,
+        request_count=request_count,
     )
-    prompts = [""] * CONCURRENCY_SWEEP_REQUEST_COUNT
+    prompts = [""] * request_count
 
     client.nodes = build_even_split_nodes(CONCURRENCY_SWEEP_NODE_COUNT)
     client.pipeline_depth = CONCURRENCY_SWEEP_NODE_COUNT
@@ -4934,7 +4939,7 @@ def run_concurrency_sweep_motivation_experiment(client: PipelineDebugClient) -> 
         {
             "experiment": experiment_name,
             "node_count": CONCURRENCY_SWEEP_NODE_COUNT,
-            "request_count": CONCURRENCY_SWEEP_REQUEST_COUNT,
+            "request_count": request_count,
             "input_token_length": input_token_length,
             "output_token_length": output_token_length,
             "max_active_values": max_active_values,

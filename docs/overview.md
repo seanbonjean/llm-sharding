@@ -9,7 +9,7 @@
 | 顺序单请求模型链 | `start_node.py`；`run_this.sh` 可启动多个 controller | `send_config.py` / `ConfigSender` | `NodeController.receive_request()`；`run_worker_loop` 的演示请求开关默认关闭 |
 | 多请求 pipeline | `pipeline_start_node.py` | `test/pipeline_test.py` 或 `test/pipeline_send_config.py` | `test/pipeline_test.py` 向 owner 投递 `user_request` / 请求批次 |
 | 单设备长上下文 prefill | 本地 Python 中创建 `NodeProfiler` | 本地函数形参 | `profile_long_context_prefill()`；独立调用 `plot_long_context_prefill()` |
-| 既有节点性能实验 | `profiling.py` | 脚本中的参数 | 默认执行 `profile_kv_cache_size()`；可选择计算能力或冷启动实验 |
+| 节点性能实验 | `profiling.py` | 脚本中的参数 | 默认执行 `profile_long_context_prefill()`；可选择 KV Cache、计算能力或冷启动实验 |
 | 辅助节点性能实验 | 目标侧 `profiling.py`，辅助侧 `assist_profiling.py` | 地址及层数参数 | `assisted=True` 与 `assist_profile_compute_capability()` 配合 |
 | 完整模型基线 | `inference.py` | 脚本中的模型路径等参数 | Hugging Face 完整模型 `generate()` |
 
@@ -48,4 +48,5 @@
 - 分层推理目前沿用 `attention_mask=None`，回答质量与掩码行为需要优先核查，见 [TODO.md](TODO.md)。长上下文结果须结合其记录的 backend/掩码状态解释。
 - 测量表格存 CSV，运行属性和进度存 JSON。CUDA 内存字段为字节，是当前进程的 PyTorch allocator 统计；Jetson 的统一内存与系统进程占用需要另行观察。
 - 模型路径、IP、端口和层边界需要按部署环境配置。脚本中的示例配置不保证适配所有模型；特别是顺序版 `send_config.py` 含 32 层边界，应按实际模型配置调整。
-- 当前依赖清单是 Windows 环境参考；Jetson 应使用匹配 JetPack/CUDA 的 PyTorch。无 ML 环境的机器可用 `python -B unittest.py` 验证控制逻辑和语法，真实前向与性能需在目标服务器验证。
+- 当前依赖清单是 Windows 环境参考；Jetson 应使用匹配 JetPack/CUDA 的 PyTorch。无 ML 环境的机器可用 `python -B test/unittest_node_profiler.py` 验证控制逻辑和语法，真实前向与性能需在目标服务器验证。
+- NodeProfiler 回归测试与其他测试统一放在 `test/` 目录，文件名为 `unittest_node_profiler.py`。应用入口的搜索路径应保持标准库模块可正常解析；测试使用新进程分别检查项目根目录和 `test/` 目录中的 `unittest.mock` 导入。

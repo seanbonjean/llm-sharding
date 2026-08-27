@@ -1,7 +1,8 @@
 """Standard-library regression tests for long-context profiling, with mocked ML APIs.
 
-Run with ``python -B unittest.py``; model weights, torch and CUDA are not required.
-使用 ``python -B unittest.py`` 运行；使用模拟 ML 接口，不需要权重、torch 或 CUDA。
+Run with ``python -B test/unittest_node_profiler.py`` from the repository root.
+Model weights, torch and CUDA are not required.
+从项目根目录运行 ``python -B test/unittest_node_profiler.py``；不需要权重、torch 或 CUDA。
 """
 
 from __future__ import annotations
@@ -19,14 +20,18 @@ import tempfile
 import types
 from typing import Any
 
-# Resolve the standard-library package rather than this file's identical name.
-# 加载标准库 unittest 包，避免当前同名脚本遮蔽它。
-PROJECT_ROOT = Path(__file__).resolve().parent
+# Keep the test-only directory out of the standard-library import search.
+# Direct execution adds this directory to sys.path; application entry points live elsewhere.
+# 导入标准库时排除测试专用目录；直接运行会把该目录放入 sys.path，主程序入口位于其他目录。
+TEST_DIRECTORY = Path(__file__).resolve().parent
+PROJECT_ROOT = TEST_DIRECTORY.parent
 _original_import_paths = sys.path[:]
-sys.path = [entry for entry in sys.path if Path(entry or os.getcwd()).resolve() != PROJECT_ROOT]
-import unittest
-from unittest import mock
-sys.path[:] = _original_import_paths
+try:
+    sys.path = [entry for entry in sys.path if Path(entry or os.getcwd()).resolve() != TEST_DIRECTORY]
+    import unittest
+    from unittest import mock
+finally:
+    sys.path[:] = _original_import_paths
 
 
 class FakeOutOfMemoryError(RuntimeError):
@@ -504,11 +509,37 @@ class LongContextTests(unittest.TestCase):
 
     def test_python_sources_compile_without_importing_dependencies(self) -> None:
         """Parse and compile project Python files without loading ML dependencies. 静态检查项目代码。"""
-        files = [*PROJECT_ROOT.glob("*.py"), *PROJECT_ROOT.glob("utils/*.py"), *PROJECT_ROOT.glob("test/*.py")]
+        files = [*PROJECT_ROOT.glob("*.py"), *PROJECT_ROOT.glob("utils/*.py"), *PROJECT_ROOT.glob("test/**/*.py")]
         for path in files:
             with self.subTest(path=path.name):
                 source = path.read_text(encoding="utf-8-sig")
                 compile(ast.parse(source, filename=str(path)), str(path), "exec")
+
+    def test_standard_library_imports_from_application_directories(self) -> None:
+        """Check fresh imports from profiling and pipeline entry-point directories.
+
+        Args:
+            self: Test instance used for subprocess assertions.
+                用于验证新进程结果的测试实例。
+
+        A fresh process avoids an already cached unittest hiding a path collision.
+        新进程避免已缓存的标准库 unittest 掩盖路径上的同名模块冲突。
+        """
+        probe = (
+            "import json, unittest; from unittest import mock; "
+            "assert mock.Mock(return_value=7)() == 7; "
+            "assert hasattr(unittest, 'TestCase'); "
+            "assert not hasattr(unittest, 'LongContextTests'); "
+            "print(json.dumps(unittest.__file__))"
+        )
+        for directory in (PROJECT_ROOT, PROJECT_ROOT / "test"):
+            with self.subTest(directory=directory):
+                process = subprocess.run(
+                    [sys.executable, "-B", "-c", probe], cwd=directory,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertEqual(Path(json.loads(process.stdout)).resolve(), Path(unittest.__file__).resolve())
 
 
 if __name__ == "__main__":

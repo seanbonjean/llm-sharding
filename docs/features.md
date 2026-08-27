@@ -1124,7 +1124,7 @@ pipeline 节点入口。创建 PipelineNodeController 并运行循环，等待�
 
 ## profiling.py
 
-创建 NodeProfiler 的实验入口。当前启用 profile_kv_cache_size；其他性能方法以可选择的调用示例保留。长上下文测试调用示例见 README。
+创建 NodeProfiler 的实验入口。当前启用 profile_long_context_prefill，按脚本参数测量 LongBench-Pro 样本并打印 CSV 路径；其他性能方法以可选择的调用示例保留。
 
 ## assist_profiling.py
 
@@ -1142,9 +1142,9 @@ pipeline 节点入口。创建 PipelineNodeController 并运行循环，等待�
 
 Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内容。
 
-## unittest.py
+## test/unittest_node_profiler.py
 
-标准库回归测试入口。通过模拟 ML/通信依赖执行真实 profiler 调度和计时代码；语法检查不导入 ML 库，实际 CUDA/模型数值正确性由目标设备验证。
+NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/` 目录，并使用不与标准库冲突的文件名。通过模拟 ML/通信依赖执行真实 profiler 调度和计时代码；语法检查不导入 ML 库，实际 CUDA/模型数值正确性由目标设备验证。直接运行时临时排除测试目录以加载标准库 unittest，随后恢复搜索路径。
 
 ### load_profile_module
 
@@ -1306,3 +1306,6 @@ Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内�
 
 对项目 Python 源码做 AST/compile 静态检查。
 
+#### test_standard_library_imports_from_application_directories
+
+在新进程中分别从项目根目录和 pipeline 入口目录导入 unittest/mock，验证解析到标准库包，覆盖应用启动时尚无 unittest 缓存的情况。

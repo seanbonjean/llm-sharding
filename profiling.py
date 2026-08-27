@@ -6,7 +6,7 @@ profiler = NodeProfiler(
     "shards/Llama-3___2-3B-Instruct_float16",
     # "C:/Users/sean-/Desktop/shards/Llama-2-7b-chat-hf_float16",  # 权重shard暂存SSD，避免硬盘瓶颈
     device="cuda:0",
-    dtype=torch.float16
+    dtype=torch.float16,
 )
 # profiler.go_through_every_shards(out_token_num=256)
 # profiler.profile_compute_capability(max_layer_num=None)
@@ -21,6 +21,10 @@ profiler = NodeProfiler(
 
 # profiler.profile_kv_cache_size()
 
+
+#################################
+### 不同设备长文本 prefill 时延实验
+
 csv_path = profiler.profile_long_context_prefill(
     layer_num=6,
     model_type="llama3.2ins",
@@ -31,3 +35,9 @@ csv_path = profiler.profile_long_context_prefill(
     repeat_num=3,
 )
 print(csv_path)
+
+# png_path = NodeProfiler.plot_long_context_prefill(
+#     "results/profiling/long_context_prefill/20260827-231615-zmq7xa6z/long_context_prefill_latency-NVIDIA_Jetson_Orin_Nano_Engineering_Reference_Developer_Kit_Super-6layers.csv",
+# )
+# print(png_path)
+#################################

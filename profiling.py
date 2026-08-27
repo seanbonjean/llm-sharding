@@ -35,9 +35,4 @@ csv_path = profiler.profile_long_context_prefill(
     repeat_num=3,
 )
 print(csv_path)
-
-# png_path = NodeProfiler.plot_long_context_prefill(
-#     "results/profiling/long_context_prefill/20260827-231615-zmq7xa6z/long_context_prefill_latency-NVIDIA_Jetson_Orin_Nano_Engineering_Reference_Developer_Kit_Super-6layers.csv",
-# )
-# print(png_path)
 #################################

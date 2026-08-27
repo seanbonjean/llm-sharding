@@ -91,15 +91,12 @@ CSV 在每次完成后 `flush` + `fsync`。每轮高内存操作前，先原子�
 
 若进程已经退出而 JSON 仍为 `running`，应将 `pending_attempt` 与 CSV 的 `attempt_id` 对照：某条 CSV 已落盘而 JSON 还没更新的短窗口中，同一 attempt 可能已经完成。没有完成记录的 pending 尝试只能标为“未完成、原因待确认”；需结合系统日志确认是否 OOM。被强制结束的轮次可能来不及记录实际 token 数。返回的 CSV/目录可用于重新分析，不提供自动续跑。
 
-在另一个进程或稍后独立绘图：
+从项目根目录运行独立绘图脚本：
 
-```python
-from utils.node_profiler import NodeProfiler
-
-png_path = NodeProfiler.plot_long_context_prefill(
-    "results/profiling/long_context_prefill/<运行目录>/<结果文件>.csv",
-)
-print(png_path)
+```bash
+python test/long_context_prefill_result_fig.py "results/profiling/long_context_prefill/<运行目录>/<结果文件>.csv"
 ```
 
-该静态方法直接读 CSV，不创建 profiler 实例或加载权重，仍需要导入项目模块所需的 Python 依赖以及 matplotlib。横轴是实际模型输入 token 数，纵轴是层均摊时延；按 hidden-state/LM-head 两种终点分别画正式重复的中位数及 min/max 区间，跳过预热和无效行，标记完整 context 与可用的停止位置。至少需要一条成功的正式测量；没有时给出明确错误。
+省略 CSV 参数时使用脚本中的 `DEFAULT_CSV_PATH`；可以在脚本顶部配置默认数据文件。可用 `--output "results/figures/prefill.png"` 指定输出位置，默认图片与 CSV 同名且后缀为 `.png`。相对 CSV 和输出路径都以项目根目录为基准，绝对路径直接使用。因此在 `test/` 目录也可执行 `python long_context_prefill_result_fig.py`，使用相同的默认输入。
+
+绘图函数 `plot_long_context_prefill(csv_path, output_path=None)` 定义在这个脚本中，外部 Python 调用者也可导入该函数。脚本只使用标准库和 matplotlib，直接读取 CSV 与可选的同名 JSON。横轴是实际模型输入 token 数，纵轴是层均摊时延；按 hidden-state/LM-head 两种终点分别画正式重复的中位数及 min/max 区间，跳过预热和无效行，标记完整 context 与可用的停止位置。至少需要一条成功的正式测量；没有时给出明确错误。

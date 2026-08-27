@@ -18,10 +18,6 @@
 
 精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON。
 
-#### plot_long_context_prefill
-
-静态方法：独立读取 CSV，绘制实际 token 数与层均摊时延的中位数及 min/max，区分输出模式、完整原文、确认的停止原因与未完成尝试；无需创建模型实例。
-
 #### _long_context_read_sample
 
 逐块解析 JSON 数组，读取指定零基样本，保留当前记录缓冲区而非整个数据集。
@@ -1142,6 +1138,18 @@ pipeline 节点入口。创建 PipelineNodeController 并运行循环，等待�
 
 Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内容。
 
+## test/long_context_prefill_result_fig.py
+
+单设备长上下文结果的独立绘图入口，使用标准库和 matplotlib。`DEFAULT_CSV_PATH` 保存默认结果文件；输入及输出的相对路径均以项目根目录解析，支持从根目录或 `test/` 目录启动。
+
+### plot_long_context_prefill
+
+读取 CSV 和可选同名 JSON，按实际输入 token 数、hidden-state/LM-head 终点分组，绘制正式重复的中位数及 min/max。标记完整原文、确认的停止原因与未完成尝试，支持部分运行结果，返回图片路径。
+
+### main
+
+解析可选 CSV 位置参数和 `--output`，省略 CSV 时使用脚本默认路径，调用绘图函数并打印图片保存位置。模块导入与 `--help` 只加载标准库，matplotlib 在实际绘图时加载。
+
 ## test/unittest_node_profiler.py
 
 NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/` 目录，并使用不与标准库冲突的文件名。通过模拟 ML/通信依赖执行真实 profiler 调度和计时代码；语法检查不导入 ML 库，实际 CUDA/模型数值正确性由目标设备验证。直接运行时临时排除测试目录以加载标准库 unittest，随后恢复搜索路径。
@@ -1149,6 +1157,10 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 ### load_profile_module
 
 使用模拟依赖加载真实 node_profiler.py。
+
+### load_plot_module
+
+通过脚本自身的标准库依赖加载独立绘图模块。
 
 ### make_profiler
 
@@ -1164,7 +1176,7 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 
 ### plot_with_mocked_backend
 
-使用记录调用的 matplotlib 替身测试真实 CSV 处理和绘图分组。
+使用记录调用的 matplotlib 替身测试独立绘图模块的 CSV 处理、分组与输出路径。
 
 ### crash_probe
 
@@ -1286,9 +1298,9 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 
 验证实际 trial 在 tokenize 后、搬运/前向前拦截超长输入。
 
-#### test_plot_reads_csv_without_model_instance
+#### test_plot_reads_csv_with_standalone_module
 
-验证静态绘图按终点分组和读取正式重复。
+在禁用 ML 库导入时验证独立绘图按终点分组并读取正式重复。
 
 #### test_plot_incomplete_tail_and_pending_attempt
 
@@ -1301,6 +1313,18 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 #### test_plot_with_no_measurements
 
 验证缺少正式测量时给出明确错误。
+
+#### test_plot_relative_paths_use_project_root
+
+验证相对 CSV 和图片输出路径均基于项目根目录解析。
+
+#### test_plot_cli_default_and_explicit_paths
+
+验证默认 CSV、显式输入和输出命令行参数的处理。
+
+#### test_plot_help_runs_without_ml_dependencies
+
+从项目外目录启动脚本，在禁用 ML 库和 matplotlib 导入的情况下验证命令行帮助。
 
 #### test_python_sources_compile_without_importing_dependencies
 

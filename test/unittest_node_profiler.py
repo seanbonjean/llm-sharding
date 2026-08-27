@@ -84,6 +84,20 @@ def load_profile_module() -> types.ModuleType:
     return module
 
 
+def load_plot_module() -> types.ModuleType:
+    """Import the standalone plotting script using only its standard-library imports.
+    仅通过脚本自身的标准库依赖导入独立绘图模块。
+    """
+    spec = importlib.util.spec_from_file_location(
+        "long_context_plot_under_test", TEST_DIRECTORY / "long_context_prefill_result_fig.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Cannot locate long_context_prefill_result_fig.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def make_profiler(module: types.ModuleType, model_layers: int = 4) -> Any:
     """Build a profiler without initializing a real model.
 
@@ -127,12 +141,15 @@ def read_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(stream))
 
 
-def plot_with_mocked_backend(module: types.ModuleType, csv_path: Path) -> tuple[Path, Any, Any, Any]:
+def plot_with_mocked_backend(
+    module: types.ModuleType, csv_path: Path, output_path: Path | None = None,
+) -> tuple[Path, Any, Any, Any]:
     """Exercise CSV processing with a recording plotting backend.
 
     Args:
-        module: Production profiler module. 真实 profiler 模块。
+        module: Standalone plotting module. 独立绘图模块。
         csv_path: Input CSV, optionally accompanied by metadata. 输入 CSV 及可选元数据。
+        output_path: Optional explicit figure destination. 可选的显式图片输出路径。
     """
     pyplot = types.ModuleType("matplotlib.pyplot")
     figure, axis = mock.MagicMock(), mock.MagicMock()
@@ -142,7 +159,7 @@ def plot_with_mocked_backend(module: types.ModuleType, csv_path: Path) -> tuple[
     matplotlib.use = mock.Mock()
     matplotlib.pyplot = pyplot
     with mock.patch.dict(sys.modules, {"matplotlib": matplotlib, "matplotlib.pyplot": pyplot}):
-        output = module.NodeProfiler.plot_long_context_prefill(csv_path)
+        output = module.plot_long_context_prefill(csv_path, output_path=output_path)
     return output, figure, axis, pyplot
 
 
@@ -184,6 +201,7 @@ class LongContextTests(unittest.TestCase):
         write_dataset(self.dataset)
         self.module = load_profile_module()
         self.profiler = make_profiler(self.module)
+        self.plot_module = load_plot_module()
 
     def run_profile(self, **overrides: Any) -> Path:
         """Run with test defaults; overrides replace individual function arguments.
@@ -470,10 +488,15 @@ class LongContextTests(unittest.TestCase):
         self.assertEqual(result["status"], "context_limit")
         components["tokenizer"].apply_chat_template.return_value.to.assert_not_called()
 
-    def test_plot_reads_csv_without_model_instance(self) -> None:
-        """Plot raw repeats and skip warm-up with mocked matplotlib. 绘图不创建模型实例。"""
+    def test_plot_reads_csv_with_standalone_module(self) -> None:
+        """Plot repeats with ML imports blocked and matplotlib mocked. 禁用 ML 导入后独立绘图。
+
+        Args:
+            self: Test instance containing synthetic CSV results. 持有模拟 CSV 结果的测试实例。
+        """
         result = self.run_profile(layer_num=4, initial_context_length=999, repeat_num=2)
-        output, figure, axis, pyplot = plot_with_mocked_backend(self.module, result)
+        with mock.patch.dict(sys.modules, {"torch": None, "transformers": None, "utils": None}):
+            output, figure, axis, pyplot = plot_with_mocked_backend(self.plot_module, result)
         self.assertEqual(output, result.with_suffix(".png"))
         self.assertEqual(axis.plot.call_count, 2)
         self.assertEqual(axis.fill_between.call_count, 2)
@@ -487,7 +510,7 @@ class LongContextTests(unittest.TestCase):
             stream.write("3,incomplete")
         metadata = {"pending_attempt": {"attempt_id": 3, "context_length": 10, "context_length_unit": "words"}}
         result.with_suffix(".json").write_text(json.dumps(metadata), encoding="utf-8")
-        _, _, axis, _ = plot_with_mocked_backend(self.module, result)
+        _, _, axis, _ = plot_with_mocked_backend(self.plot_module, result)
         self.assertIn("cause unconfirmed", axis.text.call_args.args[2])
         self.assertEqual(axis.plot.call_count, 1)
 
@@ -497,7 +520,7 @@ class LongContextTests(unittest.TestCase):
         for metadata in ([], {"pending_attempt": "invalid"}, {"pending_attempt": {"attempt_id": 2}}):
             with self.subTest(metadata=metadata):
                 result.with_suffix(".json").write_text(json.dumps(metadata), encoding="utf-8")
-                _, _, axis, _ = plot_with_mocked_backend(self.module, result)
+                _, _, axis, _ = plot_with_mocked_backend(self.plot_module, result)
                 axis.text.assert_not_called()
 
     def test_plot_with_no_measurements(self) -> None:
@@ -505,7 +528,54 @@ class LongContextTests(unittest.TestCase):
         self.profiler._long_context_run_trial.return_value = {"status": "context_limit", "input_token_count": 2000}
         result = self.run_profile()
         with self.assertRaisesRegex(ValueError, "no completed measured"):
-            self.module.NodeProfiler.plot_long_context_prefill(result)
+            self.plot_module.plot_long_context_prefill(result)
+
+    def test_plot_relative_paths_use_project_root(self) -> None:
+        """Resolve relative input and output paths against the project root.
+
+        Args:
+            self: Test instance supplying an isolated project root. 提供隔离根目录的测试实例。
+        """
+        result = self.run_profile(initial_context_length=999, repeat_num=1)
+        with mock.patch.object(self.plot_module, "PROJECT_ROOT", self.directory):
+            output, figure, _, _ = plot_with_mocked_backend(
+                self.plot_module, result.relative_to(self.directory), Path("figures/prefill.png"),
+            )
+        self.assertEqual(output, self.directory / "figures/prefill.png")
+        figure.savefig.assert_called_once_with(output, dpi=150)
+
+    def test_plot_cli_default_and_explicit_paths(self) -> None:
+        """Keep the configured default CSV and accept explicit CLI paths.
+
+        Args:
+            self: Test instance used for parser assertions. 用于校验参数解析的测试实例。
+        """
+        with mock.patch.object(self.plot_module, "plot_long_context_prefill", return_value=Path("prefill.png")) as plot:
+            with mock.patch("builtins.print") as print_result:
+                self.plot_module.main([])
+                plot.assert_called_once_with(self.plot_module.DEFAULT_CSV_PATH, output_path=None)
+                self.plot_module.main(["sample.csv", "--output", "figures/sample.png"])
+                plot.assert_called_with("sample.csv", output_path="figures/sample.png")
+                self.assertEqual(print_result.call_count, 2)
+
+    def test_plot_help_runs_without_ml_dependencies(self) -> None:
+        """Start the plotting script outside the repository with ML imports blocked.
+
+        Args:
+            self: Test instance supplying an unrelated working directory. 提供外部工作目录的测试实例。
+        """
+        probe = (
+            "import runpy, sys; "
+            "sys.modules.update({name: None for name in ('torch', 'transformers', 'utils', 'matplotlib', 'numpy')}); "
+            "sys.argv = [sys.argv[1], '--help']; "
+            "runpy.run_path(sys.argv[0], run_name='__main__')"
+        )
+        process = subprocess.run(
+            [sys.executable, "-B", "-c", probe, str(TEST_DIRECTORY / "long_context_prefill_result_fig.py")],
+            cwd=self.directory, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("--output", process.stdout)
 
     def test_python_sources_compile_without_importing_dependencies(self) -> None:
         """Parse and compile project Python files without loading ML dependencies. 静态检查项目代码。"""

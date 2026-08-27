@@ -10,10 +10,9 @@ import argparse
 import csv
 import json
 import math
-from pathlib import Path
 import statistics
+from pathlib import Path
 from typing import Any
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CSV_PATH = (

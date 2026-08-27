@@ -1,14 +1,27 @@
-import os
+from __future__ import annotations
+
+import csv
 import gc
+import json
+import math
+import os
+import platform
+import re
+import statistics
+import tempfile
 import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterator
+
 import torch
-from transformers import LlamaConfig, AutoTokenizer
+from transformers import AutoTokenizer, LlamaConfig
 from transformers.cache_utils import DynamicCache
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
+from utils.forwarding_utils import build_position_ids
 from utils.node_worker import NodeWorker
 from utils.shard_loader import LlamaShardPart
-from utils.forwarding_utils import build_position_ids
 
 
 class NodeProfiler:
@@ -26,6 +39,17 @@ class NodeProfiler:
     ASSISTED_COMMAND_KEY = "profile_command"
     ASSISTED_PREFILL_ACK_COMMAND = "prefill_ack"
     ASSISTED_DECODE_DONE_COMMAND = "decode_done"
+
+    LONG_CONTEXT_CSV_FIELDS = (
+        "attempt_id", "sample_id", "phase", "repeat_index", "model_type",
+        "question_type", "context_length_unit", "context_length",
+        "context_word_count", "context_char_count", "input_token_count",
+        "loaded_layer_count", "include_lm_head", "prefill_latency_ms",
+        "prefill_latency_per_layer_ms", "is_full_context", "status",
+        "peak_cuda_allocated_bytes", "peak_cuda_reserved_bytes",
+        "first_token_id", "failure_stage", "error",
+    )
+
 
     def __init__(self, shards_path: str, device="cpu", dtype=torch.float16):
         """
@@ -1737,6 +1761,509 @@ class NodeProfiler:
         # === 解码最终结果 ===
         final_ids = torch.cat(generated_ids, dim=-1)  # [B, seq_len + out_token_num]
         print("output: ", tokenizer.decode(final_ids[0]))
+
+    @staticmethod
+    def _long_context_read_sample(
+        dataset_path: Path, sample_index: int, chunk_size: int = 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Read one object from a JSON array with bounded streaming buffers.
+
+        Args:
+            dataset_path: UTF-8 JSON array to read. 待读取的 UTF-8 JSON 数组文件。
+            sample_index: Zero-based record to select. 选择的零基样本序号。
+            chunk_size: Characters read per refill. 每次补充缓冲区的字符数。
+        """
+        if sample_index < 0 or chunk_size < 1:
+            raise ValueError("sample_index must be nonnegative and chunk_size positive")
+        decoder = json.JSONDecoder()
+        with dataset_path.open("r", encoding="utf-8-sig") as stream:
+            buffer = ""
+            for record_index in range(sample_index + 1):
+                buffer = buffer.lstrip()
+                while not buffer:
+                    buffer = stream.read(chunk_size).lstrip()
+                    if not buffer:
+                        raise ValueError("Dataset ended before the selected record")
+                if record_index and buffer[0] == "]":
+                    raise IndexError(f"sample_index {sample_index} is outside the dataset")
+                separator = "[" if record_index == 0 else ","
+                if buffer[0] != separator:
+                    raise ValueError(f"Expected {separator!r} before record {record_index}")
+                buffer = buffer[1:].lstrip()
+                while not buffer:
+                    buffer = stream.read(chunk_size).lstrip()
+                    if not buffer:
+                        raise ValueError("Dataset ended before a record value")
+                if buffer[0] == "]":
+                    if record_index == 0:
+                        raise IndexError("Dataset contains no records")
+                    raise ValueError("Dataset contains a trailing comma")
+                while True:
+                    try:
+                        record, end = decoder.raw_decode(buffer)
+                        break
+                    except json.JSONDecodeError:
+                        chunk = stream.read(chunk_size)
+                        if not chunk:
+                            raise
+                        buffer += chunk
+                if not isinstance(record, dict):
+                    raise ValueError(f"Record {record_index} must be a JSON object")
+                if record_index == sample_index:
+                    return record
+                buffer = buffer[end:]
+        raise IndexError(sample_index)
+
+    @staticmethod
+    def _long_context_prefixes(
+        context: str, initial_context_length: int, length_unit: str,
+    ) -> Iterator[tuple[str, int, bool]]:
+        """Yield original-text prefixes with geometrically increasing lengths.
+
+        Args:
+            context: Original document whose whitespace is preserved. 保留空白的原文。
+            initial_context_length: Positive initial unit count. 首轮长度单位数。
+            length_unit: Either words (whitespace-delimited) or characters.
+                words 按空白分词；characters 按 Unicode 字符截断。
+        """
+        if initial_context_length < 1 or length_unit not in {"words", "characters"}:
+            raise ValueError("Invalid initial_context_length or length_unit")
+        word_ends = [match.end() for match in re.finditer(r"\S+", context)] if length_unit == "words" else []
+        total_length = len(word_ends) if length_unit == "words" else len(context)
+        if total_length == 0:
+            raise ValueError("context must contain text")
+        current_length = min(initial_context_length, total_length)
+        while True:
+            is_full_context = current_length == total_length
+            end = word_ends[current_length - 1] if length_unit == "words" else current_length
+            yield (context if is_full_context else context[:end]), current_length, is_full_context
+            if is_full_context:
+                return
+            current_length = min(current_length * 2, total_length)
+
+    @staticmethod
+    def _long_context_write_metadata(path: Path, metadata: dict[str, Any]) -> None:
+        """Atomically persist a run snapshot before potentially fatal work.
+
+        Args:
+            path: Run metadata JSON destination. 运行元数据 JSON 路径。
+            metadata: Configuration and last-started attempt. 配置及最后启动的尝试。
+        """
+        temporary_path = path.with_suffix(".json.tmp")
+        with temporary_path.open("w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+
+    def _long_context_device_label(self, device_label: str | None) -> str:
+        """Identify a device without requiring a platform-specific executable.
+
+        Args:
+            self: Profiler holding the selected device. 持有所选设备的 profiler。
+            device_label: Optional explicit display/file label. 可选的显式设备标签。
+        """
+        detected_label = device_label or ""
+        if not detected_label:
+            try:
+                board_model = Path("/proc/device-tree/model").read_text(encoding="utf-8").strip("\x00\n ")
+                if "jetson" in board_model.casefold():
+                    detected_label = board_model
+            except (OSError, UnicodeError):
+                pass
+        if not detected_label and self.device.type == "cuda":
+            try:
+                detected_label = torch.cuda.get_device_name(self.device)
+            except Exception:
+                # Identification is best-effort; computation reports actual device failures.
+                # 型号识别尽力而为；真实设备不可用的问题由计算路径报告。
+                pass
+        if not detected_label:
+            try:
+                detected_label = f"{self.device.type}-{platform.processor() or platform.machine()}"
+            except Exception:
+                detected_label = str(self.device.type)
+        safe_label = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", detected_label).strip(" ._")
+        return safe_label or "device"
+
+    def _long_context_cuda_stat(self, operation: str) -> int | None:
+        """Read an optional CUDA counter without interrupting a completed trial.
+
+        Args:
+            self: Profiler holding the selected device. 持有所选设备的 profiler。
+            operation: Name of a CUDA memory-counter function. CUDA 显存统计函数名。
+        """
+        if self.device.type != "cuda":
+            return None
+        try:
+            return int(getattr(torch.cuda, operation)(self.device))
+        except Exception:
+            return None
+
+    def _long_context_load_components(self, layer_num: int) -> dict[str, Any]:
+        """Load an exact local prefix of layers and the required input/output modules.
+
+        Args:
+            self: Profiler with model configuration and weights. 持有配置和权重路径。
+            layer_num: Exact number of Transformer layers, starting at zero.
+                从第零层开始精确装载的 Transformer 层数。
+        """
+        components: dict[str, Any] = {}
+        components["tokenizer"] = AutoTokenizer.from_pretrained(self.shards_path)
+        embedding = torch.nn.Embedding(self.config.vocab_size, self.config.hidden_size).to(
+            device=self.device, dtype=self.dtype,
+        )
+        embedding.load_state_dict(torch.load(
+            os.path.join(self.shards_path, "embedding.pth"), map_location=self.device,
+        ))
+        components["embedding"] = embedding.eval()
+        components["rope"] = LlamaRotaryEmbedding(config=self.config, device=self.device).to(self.device).eval()
+        full_model = layer_num == self.layer_num
+        components["shard"] = LlamaShardPart(
+            self.shards_path, [f"block_{index}.pth" for index in range(layer_num)],
+            0, layer_num, device=self.device, dtype=self.dtype,
+            add_final_norm=full_model,
+            final_norm_weight="final_norm.pth" if full_model else None,
+        ).eval()
+        components["lm_head"] = None
+        if full_model:
+            lm_head = torch.nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False).to(
+                device=self.device, dtype=self.dtype,
+            )
+            lm_head.load_state_dict(torch.load(
+                os.path.join(self.shards_path, "lm_head.pth"), map_location=self.device,
+            ))
+            components["lm_head"] = lm_head.eval()
+        return components
+
+    def _long_context_run_trial(
+        self, components: dict[str, Any], context_prefix: str, question: str,
+        model_type: str, include_lm_head: bool, attempt_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Time one uninterrupted input-to-output prefill with a fresh KV cache.
+
+        Args:
+            self: Profiler providing device and model limits. 提供设备和长度上限。
+            components: Resident tokenizer, embedding, RoPE, shard and optional head.
+                常驻 tokenizer、embedding、RoPE、shard 和可选 LM head。
+            context_prefix: Current original-text document prefix. 当前原文前缀。
+            question: Complete selected question. 完整的问题文本。
+            model_type: Prompt-format selector; currently llama3.2ins. 模板分支标识。
+            include_lm_head: End at the first token when true, hidden states otherwise.
+                True 计时到首 token；False 计时到最后一层 hidden states。
+            attempt_state: In-memory token count/stage for failure reporting.
+                失败报告所需的内存中 token 数与执行阶段；计时内不写盘。
+        """
+        if model_type != "llama3.2ins":
+            raise NotImplementedError(f"Unsupported model_type: {model_type}")
+        input_ids = hidden_states = position_ids = cos = sin = logits = token = None
+        past_key_value = DynamicCache()
+        try:
+            with torch.inference_mode():
+                self._synchronize_device()
+                if self.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                started = time.perf_counter()
+                attempt_state["failure_stage"] = "tokenize"
+                input_ids = components["tokenizer"].apply_chat_template(
+                    [{"role": "user", "content": f"{context_prefix}\n\n\n\n{question}"}],
+                    tokenize=True, add_generation_prompt=True, return_tensors="pt",
+                    truncation=False,
+                )
+                token_count = int(input_ids.shape[-1])
+                attempt_state["input_token_count"] = token_count
+                if token_count > int(self.config.max_position_embeddings):
+                    return {"status": "context_limit", "input_token_count": token_count,
+                            "failure_stage": "context_limit"}
+                attempt_state["failure_stage"] = "local_input_copy"
+                input_ids = input_ids.to(device=self.device, dtype=torch.long)
+                attempt_state["failure_stage"] = "embedding"
+                hidden_states = components["embedding"](input_ids)
+                attempt_state["failure_stage"] = "rope"
+                position_ids = build_position_ids(past_key_value, token_count, self.device, batch_size=1)
+                cos, sin = components["rope"](hidden_states, position_ids)
+                attempt_state["failure_stage"] = "shard_forward"
+                hidden_states = components["shard"](
+                    hidden_states, past_key_value=past_key_value, rotary_emb=(cos, sin),
+                )
+                first_token_id = None
+                if include_lm_head:
+                    attempt_state["failure_stage"] = "lm_head"
+                    # Only the final position is needed to produce the first output token.
+                    # 生成首个输出 token 只需最后一个输入位置的 logits。
+                    logits = components["lm_head"](hidden_states[:, -1:, :])
+                    token = torch.argmax(logits[:, -1, :], dim=-1)
+                    first_token_id = int(token.item())
+                self._synchronize_device()
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                # Query peaks after stopping the timer, while outputs and KV are still live.
+                # 停止计时后、输出张量和 KV 仍存活时读取峰值，避免采集影响时延。
+                return {
+                    "status": "success", "input_token_count": token_count,
+                    "prefill_latency_ms": elapsed_ms, "first_token_id": first_token_id,
+                    "peak_cuda_allocated_bytes": self._long_context_cuda_stat("max_memory_allocated"),
+                    "peak_cuda_reserved_bytes": self._long_context_cuda_stat("max_memory_reserved"),
+                    "failure_stage": "",
+                }
+        finally:
+            input_ids = hidden_states = position_ids = cos = sin = logits = token = None
+            past_key_value = None
+
+    def profile_long_context_prefill(
+        self, layer_num: int, model_type: str = "llama3.2ins",
+        use_thinking_question: bool = False, sample_index: int = 0,
+        initial_context_length: int = 32, context_length_unit: str = "auto",
+        repeat_num: int = 3, dataset_path: str | Path | None = None,
+        output_dir: str | Path | None = None, device_label: str | None = None,
+    ) -> Path:
+        """Profile a LongBench-Pro sample with doubling context prefixes; return its CSV.
+
+        Args:
+            self: Profiler configured for local shard weights. 已配置本地权重的 profiler。
+            layer_num: Exact Transformer layer count, in [1, model layer count].
+                精确装载的 Transformer 层数，范围为 1 到模型总层数。
+            model_type: Prompt adapter; only llama3.2ins is implemented.
+                Prompt 适配分支，目前仅实现 llama3.2ins。
+            use_thinking_question: Select question_thinking instead of question_nonthinking.
+                是否选择 question_thinking，默认选择 question_nonthinking。
+            sample_index: Zero-based dataset record to profile. 数据集零基样本序号。
+            initial_context_length: Initial word/character count, capped at full context.
+                起始词数或字符数，上限为完整 context 长度。
+            context_length_unit: words, characters, or auto (Chinese characters, otherwise words).
+                words/characters/auto；auto 对中文按字符，其余按空白分隔词。
+            repeat_num: Measured repetitions per length and output mode. 每个长度、模式的重复次数。
+            dataset_path: JSON array path; default is the repository LongBench-Pro dataset.
+                JSON 数组路径；默认使用项目内 LongBench-Pro 数据集。
+            output_dir: Root for a fresh run directory; default is results/profiling/long_context_prefill.
+                新建运行子目录的根路径，默认位于项目 results/profiling/long_context_prefill。
+            device_label: Optional portable filename label overriding hardware detection.
+                可选设备标签，用于覆盖自动识别结果并生成文件名。
+
+        One warm-up runs at the initial length, including the head for a full model.
+        Input formatting/tokenization, local tensor copies, embedding, RoPE and forward
+        share one timer on a single device. Full models retain the head for both modes
+        and use final normalization.
+        A durable metadata snapshot identifies pending work even after SIGKILL; it is
+        not evidence that an unfinished attempt necessarily failed with OOM.
+        起始长度仅 warm-up 一次；全模型 warm-up 包含 LM head。计时连续覆盖输入格式化、
+        tokenize、本机张量搬运、embedding、RoPE 和单设备前向。全模型两种模式均常驻 head 并执行最终
+        norm。落盘进度用于识别强制结束时未完成的尝试，不据此断言其一定发生 OOM。
+        """
+        if model_type != "llama3.2ins":
+            raise NotImplementedError(f"Unsupported model_type: {model_type}")
+        for name, value, minimum in (
+            ("layer_num", layer_num, 1), ("sample_index", sample_index, 0),
+            ("initial_context_length", initial_context_length, 1), ("repeat_num", repeat_num, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        if layer_num > self.layer_num:
+            raise ValueError("layer_num exceeds the model's Transformer layer count")
+        if not isinstance(use_thinking_question, bool):
+            raise TypeError("use_thinking_question must be bool")
+        if device_label is not None and not isinstance(device_label, str):
+            raise TypeError("device_label must be a string or None")
+        if context_length_unit not in {"auto", "words", "characters"}:
+            raise ValueError("context_length_unit must be auto, words or characters")
+        project_root = Path(__file__).resolve().parents[1]
+        dataset_file = Path(dataset_path) if dataset_path is not None else project_root / "datasets/LongBench-Pro/longbench_pro.json"
+        sample = self._long_context_read_sample(dataset_file, sample_index)
+        question_type = "question_thinking" if use_thinking_question else "question_nonthinking"
+        for field in ("context", question_type):
+            if not isinstance(sample.get(field), str) or not sample[field].strip():
+                raise ValueError(f"Sample field {field!r} must contain nonempty text")
+        length_unit = context_length_unit
+        if length_unit == "auto":
+            length_unit = "characters" if str(sample.get("language", "")).casefold() in {"chinese", "zh", "zh-cn"} else "words"
+        root = Path(output_dir) if output_dir is not None else project_root / "results/profiling/long_context_prefill"
+        root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-"), dir=root))
+        label = self._long_context_device_label(device_label)
+        csv_path = run_dir / f"long_context_prefill_latency-{label}-{layer_num}layers.csv"
+        metadata_path = csv_path.with_suffix(".json")
+        metadata: dict[str, Any] = {
+            "schema_version": 1, "status": "running", "stage": "load_components",
+            "sample_id": sample.get("id", str(sample_index)), "sample_index": sample_index,
+            "dataset_path": str(dataset_file.resolve()), "model_type": model_type,
+            "shards_path": str(Path(self.shards_path).resolve()), "device_label": label,
+            "device": str(self.device), "dtype": str(self.dtype), "layer_num": layer_num,
+            "model_layer_count": self.layer_num, "question_type": question_type,
+            "context_length_unit": length_unit, "initial_context_length": initial_context_length,
+            "repeat_num": repeat_num, "warmup_count": 1,
+            "max_position_embeddings": int(self.config.max_position_embeddings),
+            "torch_version": str(getattr(torch, "__version__", "unknown")),
+            "timing_scope": "single_device_prompt_format_tokenize_local_copy_embedding_rope_shard_optional_last_position_lm_head",
+            "per_layer_definition": "prefill_latency_ms / loaded_layer_count (input/output overhead included)",
+            "attention_mask": None, "final_norm_included": layer_num == self.layer_num,
+            "lm_head_resident": layer_num == self.layer_num,
+            "pending_attempt": None,
+        }
+        components: dict[str, Any] = {}
+        print(f"[PROFILE] results: {csv_path}", flush=True)
+        with csv_path.open("x", encoding="utf-8", newline="") as csv_stream:
+            writer = csv.DictWriter(csv_stream, fieldnames=self.LONG_CONTEXT_CSV_FIELDS)
+            writer.writeheader()
+            csv_stream.flush()
+            os.fsync(csv_stream.fileno())
+            self._long_context_write_metadata(metadata_path, metadata)
+            try:
+                components = self._long_context_load_components(layer_num)
+                metadata["attention_implementation"] = str(getattr(
+                    getattr(components["shard"], "config", self.config), "_attn_implementation", "unknown",
+                ))
+                metadata["stage"] = "prefill"
+                modes = (False, True) if layer_num == self.layer_num else (False,)
+                attempt_number = 0
+                for length_index, (prefix, length, is_full) in enumerate(self._long_context_prefixes(
+                    sample["context"], initial_context_length, length_unit,
+                )):
+                    attempts = [("measure", repeat, mode) for mode in modes for repeat in range(1, repeat_num + 1)]
+                    if length_index == 0:
+                        attempts.insert(0, ("warmup", 0, modes[-1]))
+                    for phase, repeat, include_lm_head in attempts:
+                        attempt_number += 1
+                        row: dict[str, Any] = {
+                            "attempt_id": attempt_number, "sample_id": metadata["sample_id"],
+                            "phase": phase, "repeat_index": repeat, "model_type": model_type,
+                            "question_type": question_type, "context_length_unit": length_unit,
+                            "context_length": length, "context_word_count": sum(1 for _ in re.finditer(r"\S+", prefix)),
+                            "context_char_count": len(prefix), "loaded_layer_count": layer_num,
+                            "include_lm_head": include_lm_head, "is_full_context": is_full,
+                            "status": "started", "input_token_count": None,
+                        }
+                        metadata["pending_attempt"] = dict(row)
+                        self._long_context_write_metadata(metadata_path, metadata)
+                        attempt_state: dict[str, Any] = {"input_token_count": None, "failure_stage": "prepare"}
+                        try:
+                            result = self._long_context_run_trial(
+                                components, prefix, sample[question_type], model_type,
+                                include_lm_head, attempt_state,
+                            )
+                        except (torch.cuda.OutOfMemoryError, MemoryError) as error:
+                            result = {**attempt_state, "status": "oom", "error": str(error)}
+                        row.update(result)
+                        if row["status"] == "success":
+                            row["prefill_latency_per_layer_ms"] = row["prefill_latency_ms"] / layer_num
+                        writer.writerow(row)
+                        csv_stream.flush()
+                        os.fsync(csv_stream.fileno())
+                        metadata["pending_attempt"] = None
+                        metadata["last_completed_attempt_id"] = attempt_number
+                        if row["status"] != "success":
+                            metadata.update(status="stopped", stop_reason=row["status"])
+                        self._long_context_write_metadata(metadata_path, metadata)
+                        print(f"[PROFILE] {phase} length={length} head={include_lm_head}: {row['status']}", flush=True)
+                        gc.collect()
+                        if self.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        if row["status"] != "success":
+                            return csv_path
+                metadata.update(status="completed", stop_reason="full_context")
+                self._long_context_write_metadata(metadata_path, metadata)
+            except BaseException as error:
+                # SIGKILL cannot enter this handler; the prior running snapshot remains durable.
+                # SIGKILL 不会进入此分支；此前 running 状态的快照已持久化。
+                metadata.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "error", error=str(error))
+                self._long_context_write_metadata(metadata_path, metadata)
+                raise
+            finally:
+                components.clear()
+                gc.collect()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+        return csv_path
+
+    @staticmethod
+    def plot_long_context_prefill(csv_path: str | Path, output_path: str | Path | None = None) -> Path:
+        """Plot completed measurements, separately from any model execution.
+
+        Args:
+            csv_path: Profiling CSV, including partial runs. 测量 CSV，允许运行未完成。
+            output_path: Optional image destination; defaults to the CSV basename plus .png.
+                可选图片路径；默认与 CSV 同名并使用 .png 后缀。
+        """
+        source = Path(csv_path)
+        groups: dict[tuple[bool, int], list[float]] = {}
+        full_points: set[tuple[bool, int]] = set()
+        completed_ids: set[int] = set()
+        stops: list[tuple[int, str]] = []
+        invalid_rows = 0
+        with source.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            required = {"attempt_id", "phase", "status", "input_token_count", "include_lm_head", "prefill_latency_per_layer_ms", "is_full_context"}
+            if not required.issubset(reader.fieldnames or []):
+                raise ValueError("CSV is missing long-context profiling columns")
+            for row in reader:
+                try:
+                    attempt_id = int(row["attempt_id"])
+                    if row["status"] in {"oom", "context_limit"}:
+                        completed_ids.add(attempt_id)
+                        if row["input_token_count"]:
+                            stops.append((int(row["input_token_count"]), row["status"]))
+                        continue
+                    if row["status"] != "success":
+                        continue
+                    token_count = int(row["input_token_count"])
+                    latency = float(row["prefill_latency_per_layer_ms"])
+                    if token_count < 1 or not math.isfinite(latency) or latency < 0:
+                        raise ValueError("Invalid numeric measurement")
+                    if row["include_lm_head"] not in {"True", "False"}:
+                        raise ValueError("Invalid include_lm_head")
+                    completed_ids.add(attempt_id)
+                    if row["phase"] != "measure":
+                        continue
+                    key = (row["include_lm_head"] == "True", token_count)
+                    groups.setdefault(key, []).append(latency)
+                    if row["is_full_context"] == "True":
+                        full_points.add(key)
+                except (ValueError, TypeError, KeyError):
+                    invalid_rows += 1
+        if not groups:
+            raise ValueError("CSV contains no completed measured trials to plot")
+        if invalid_rows:
+            print(f"[PROFILE] skipped {invalid_rows} incomplete/invalid CSV rows")
+        metadata: dict[str, Any] = {}
+        try:
+            candidate = json.loads(source.with_suffix(".json").read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                metadata = candidate
+        except (OSError, ValueError):
+            pass
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        figure, axis = plt.subplots(figsize=(9, 5))
+        try:
+            for include_lm_head in sorted({key[0] for key in groups}):
+                lengths = sorted(key[1] for key in groups if key[0] == include_lm_head)
+                samples = [groups[(include_lm_head, length)] for length in lengths]
+                medians = [statistics.median(values) for values in samples]
+                label = "Input to first token (LM head)" if include_lm_head else "Input to hidden state"
+                axis.plot(lengths, medians, marker="o", label=label)
+                axis.fill_between(lengths, [min(values) for values in samples], [max(values) for values in samples], alpha=0.15)
+                for length, median in zip(lengths, medians):
+                    if (include_lm_head, length) in full_points:
+                        axis.annotate("full context", (length, median), xytext=(4, 8), textcoords="offset points", fontsize=8)
+            for length, reason in stops:
+                axis.axvline(length, linestyle="--", color="gray", label=f"{reason}: {length} tokens")
+            pending = metadata.get("pending_attempt") or {}
+            if isinstance(pending, dict) and pending and pending.get("attempt_id") not in completed_ids:
+                axis.text(0.01, 0.99, f"Unfinished attempt: {pending.get('context_length')} {pending.get('context_length_unit')}; cause unconfirmed",
+                          transform=axis.transAxes, va="top", fontsize=8)
+            axis.set_xscale("log", base=2)
+            axis.set_xlabel("Actual model input tokens (chat template included)")
+            axis.set_ylabel("Input-to-output latency / loaded layers (ms)")
+            axis.set_title("Long-context prefill latency: median and min/max")
+            axis.grid(alpha=0.3)
+            axis.legend()
+            figure.tight_layout()
+            destination = Path(output_path) if output_path is not None else source.with_suffix(".png")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            figure.savefig(destination, dpi=150)
+        finally:
+            plt.close(figure)
+        return destination
 
 
 if __name__ == "__main__":

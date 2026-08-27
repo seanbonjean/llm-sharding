@@ -1,5 +1,6 @@
-from utils.node_profiler import NodeProfiler
 import torch
+
+from utils.node_profiler import NodeProfiler
 
 profiler = NodeProfiler(
     "shards/Llama-3___2-3B-Instruct_float16",
@@ -18,4 +19,15 @@ profiler = NodeProfiler(
 #     dst_addr="tcp://172.16.0.1:40800"
 # )
 
-profiler.profile_kv_cache_size()
+# profiler.profile_kv_cache_size()
+
+csv_path = profiler.profile_long_context_prefill(
+    layer_num=6,
+    model_type="llama3.2ins",
+    use_thinking_question=False,
+    sample_index=0,
+    initial_context_length=32,
+    context_length_unit="auto",
+    repeat_num=3,
+)
+print(csv_path)

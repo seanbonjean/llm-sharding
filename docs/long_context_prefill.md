@@ -65,9 +65,11 @@ print(csv_path)
 long_context_prefill_latency-<设备型号>-<N>layers.csv
 ```
 
-设备名优先尝试 Jetson device-tree，再尝试 PyTorch CUDA 型号，最后回退到平台/设备类型；不调用 `nvidia-smi`。识别失败不会因为缺少 PC 命令而中断。可用 `device_label="Jetson Orin Nano"` 等显式覆盖，文件名中的不安全字符自动替换。
+自动设备标签优先使用识别出的 Orin 系列和容量：Nano 使用 `Orin_Nano_8G` / `Orin_Nano_4G`；已确认 Nano 系列但容量未知时使用 `Orin_Nano`。已识别的 NX 使用 `Orin_NX_8G` / `Orin_NX_16G`，容量未知时使用 `Orin_NX`。其余情况依次尝试 Jetson device-tree、PyTorch CUDA 型号和平台/设备类型，不调用 `nvidia-smi`；可选系统接口缺失不会中断测量。显式 `device_label="edge-A"` 优先覆盖自动标签，文件名中的不安全字符自动替换。
 
-Orin Nano 的内存版本另存入同名 JSON，识别发生在模型加载及计时之前，保留文件名的设备标签规则：
+例如 8G Nano 加载六层时，文件名为 `long_context_prefill_latency-Orin_Nano_8G-6layers.csv`，元数据文件同名并使用 `.json` 后缀；单设备绘图的默认输出同名并使用 `.png` 后缀。文件标签和 JSON 复用同一次硬件识别结果。该命名规则用于新生成结果，已有实验文件保持原路径；绘图同时支持两种命名。
+
+Orin Nano 的内存版本和识别依据保存到同名 JSON，识别发生在模型加载及计时之前：
 
 1. 优先只读查询系统公开的模块 EEPROM（支持的格式版本为 2.0），再查询设备树中启动时填入的模块 ID。P3767-0003 / P3767-0005 对应 Nano 8G，P3767-0004 对应 Nano 4G；P3767-0000 / P3767-0001 属于 NX，不会因使用 Nano 载板而按 Nano 处理。映射依据 [NVIDIA EEPROM 文档](https://docs.nvidia.com/jetson/archives/r36.4/DeveloperGuide/HR/JetsonEepromLayout.html)。
 2. 模块 ID 不可用时，读取设备树 `model` 中明确的 `Orin Nano 4GB` / `8GB` 等型号文本。兼容 `/proc/device-tree` 和 `/sys/firmware/devicetree/base`；根 `compatible` 只帮助识别平台，不以共用 DTB 的型号确定内存版本。

@@ -16,7 +16,7 @@
 
 #### profile_long_context_prefill
 
-精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON；模型加载前将识别出的 Jetson 内存版本、来源及总内存写入元数据。异常处理中尝试记录错误状态，二次写入失败时向 stderr 输出诊断并继续抛出最初异常。
+精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON；模型加载前复用一次 Jetson 识别结果生成文件标签，并将内存版本、来源及总内存写入元数据。异常处理中尝试记录错误状态，二次写入失败时向 stderr 输出诊断并继续抛出最初异常。
 
 #### _long_context_read_sample
 
@@ -32,7 +32,7 @@
 
 #### _long_context_device_label
 
-依次尝试显式标签、Jetson device-tree、CUDA 型号和平台信息，生成安全文件名片段。
+显式标签优先；自动标签复用可选的 Jetson 硬件快照，未提供时自行识别。Nano 使用 `Orin_Nano_4G` / `Orin_Nano_8G`，已确认系列但容量未知时为 `Orin_Nano`；已识别 NX 使用 `Orin_NX_8G` / `Orin_NX_16G`，容量未知时为 `Orin_NX`。其他情况依次尝试 Jetson device-tree、CUDA 型号和平台信息，统一生成安全文件名片段。
 
 #### _long_context_cuda_stat
 
@@ -1362,6 +1362,18 @@ NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测�
 
 验证 Jetson、CUDA 查询失败及显式标签的处理。
 
+#### test_orin_device_label_variants
+
+验证 Nano/NX 简短型号与容量标签、未知或不适用容量、显式覆盖，以及命名复用已有快照时不再次读取系统。
+
+#### test_device_label_optional_snapshot_and_pc_fallback
+
+验证独立自动命名会查询一次硬件，已提供的空快照保持复用，PC 使用 CUDA 型号回退。
+
+#### test_orin_profile_filenames_share_metadata_snapshot
+
+验证 7.x / 3.x GiB 容量推断与未知容量下的 CSV/JSON 文件名和字段一致，单设备图片继承文件名，绘图在有无 JSON 时均可解析简短名称。
+
 #### jetson_info
 
 控制设备树型号、物理模块 ID 和系统总内存，构造可测试的 Jetson 识别环境。
@@ -1388,7 +1400,7 @@ NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测�
 
 #### test_jetson_metadata_saved_before_model_loading
 
-验证 Jetson 版本、来源和总内存在模型加载前已保存到 JSON，显式文件标签不影响硬件记录。
+验证 Jetson 版本、来源和总内存在模型加载前已保存到 JSON，单次识别同时用于元数据和命名，显式文件标签保持覆盖且不影响硬件记录。
 
 #### test_optional_memory_counter_failure
 
@@ -1488,7 +1500,7 @@ NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测�
 
 #### test_comparison_short_device_names_and_orin_variant
 
-验证双设备图使用 `Jetson Orin Nano 8G`、`Quadro RTX 5000` 等简短名称，显式昵称仍附带已记录的 Orin 容量。
+验证双设备图使用 `Jetson Orin Nano 8G`、`Quadro RTX 5000` 等简短名称，显式昵称仍附带已记录的 Orin 容量，并验证 `Orin_Nano_4G` / `Orin_Nano_8G` 文件名在有无 JSON 时的兼容性。
 
 #### test_incompatible_csv_settings
 

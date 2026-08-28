@@ -649,13 +649,83 @@ class LongContextTests(unittest.TestCase):
     def test_device_detection_fallbacks(self) -> None:
         """Handle Jetson, CUDA-query failure, CPU and invalid filename characters. 验证设备识别回退。"""
         self.profiler.device.type = "cuda"
-        with mock.patch.object(Path, "read_text", return_value="NVIDIA Jetson Orin Nano\x00"):
-            self.assertEqual(self.profiler._long_context_device_label(None), "NVIDIA_Jetson_Orin_Nano")
+        with mock.patch.object(Path, "read_text", return_value="NVIDIA Jetson Xavier NX\x00"):
+            self.assertEqual(self.profiler._long_context_device_label(None), "NVIDIA_Jetson_Xavier_NX")
             self.module.torch.cuda.get_device_name.assert_not_called()
         self.module.torch.cuda.get_device_name.side_effect = RuntimeError("not supported")
         with mock.patch.object(Path, "read_text", side_effect=OSError("absent")), mock.patch.object(self.module.platform, "processor", side_effect=OSError()):
             self.assertEqual(self.profiler._long_context_device_label(None), "cuda")
         self.assertEqual(self.profiler._long_context_device_label('PC: GPU/0*?'), "PC_GPU_0")
+
+    def test_orin_device_label_variants(self) -> None:
+        """Build compact labels from recorded module families and known capacities.
+        self 为当前测试实例；验证 Nano/NX 系列、容量未知、标签覆盖和已提供快照的复用。
+        """
+        cases = (
+            ("Jetson Orin Nano", "4G", "Orin_Nano_4G"),
+            ("Jetson Orin Nano", "8G", "Orin_Nano_8G"),
+            ("Jetson Orin Nano", None, "Orin_Nano"),
+            ("Jetson Orin Nano", "16G", "Orin_Nano"),
+            ("Jetson Orin NX", "8G", "Orin_NX_8G"),
+            ("Jetson Orin NX", "16G", "Orin_NX_16G"),
+            ("Jetson Orin NX", None, "Orin_NX"),
+        )
+        self.profiler.device.type = "cuda"
+        with mock.patch.object(self.profiler, "_long_context_jetson_info") as detect, \
+                mock.patch.object(Path, "read_text") as read_system:
+            for model, variant, expected_label in cases:
+                with self.subTest(model=model, variant=variant):
+                    info = {"jetson_model": model, "jetson_memory_variant": variant}
+                    self.assertEqual(self.profiler._long_context_device_label(None, info), expected_label)
+                    self.assertEqual(self.profiler._long_context_device_label("edge: A", info), "edge_A")
+            self.assertEqual(self.profiler._long_context_device_label("edge: B"), "edge_B")
+        detect.assert_not_called()
+        read_system.assert_not_called()
+        self.module.torch.cuda.get_device_name.assert_not_called()
+
+    def test_device_label_optional_snapshot_and_pc_fallback(self) -> None:
+        """Probe for standalone automatic naming and preserve PC CUDA labels.
+        self 为当前测试实例；验证独立命名时的识别、空快照复用和 PC 型号回退。
+        """
+        info = {"jetson_model": "Jetson Orin Nano", "jetson_memory_variant": "8G"}
+        with mock.patch.object(self.profiler, "_long_context_jetson_info", return_value=info) as detect:
+            self.assertEqual(self.profiler._long_context_device_label(None), "Orin_Nano_8G")
+        detect.assert_called_once_with()
+        self.profiler.device.type = "cuda"
+        self.module.torch.cuda.get_device_name.return_value = "Quadro RTX 5000"
+        with mock.patch.object(self.profiler, "_long_context_jetson_info") as detect, \
+                mock.patch.object(Path, "read_text", side_effect=PermissionError()):
+            self.assertEqual(self.profiler._long_context_device_label(None, {}), "Quadro_RTX_5000")
+        detect.assert_not_called()
+        self.module.torch.cuda.get_device_name.assert_called_once_with(self.profiler.device)
+
+    def test_orin_profile_filenames_share_metadata_snapshot(self) -> None:
+        """Name CSV/JSON/PNG with one detected capacity snapshot, including RAM inference.
+        self 为当前测试实例；验证容量推断用于文件名和元数据，以及绘图对新名称的兼容性。
+        """
+        for total_gib, variant in ((7.4, "8G"), (3.7, "4G"), (5.5, None)):
+            with self.subTest(total_gib=total_gib):
+                info = self.jetson_info(total_gib=total_gib)
+                with mock.patch.object(self.profiler, "_long_context_jetson_info", side_effect=[info]) as detect:
+                    result = self.run_profile(initial_context_length=999, repeat_num=1)
+                detect.assert_called_once_with()
+                device_label = f"Orin_Nano_{variant}" if variant else "Orin_Nano"
+                self.assertEqual(result.name, f"long_context_prefill_latency-{device_label}-2layers.csv")
+                metadata_path = result.with_suffix(".json")
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                self.assertEqual(metadata["device_label"], device_label)
+                self.assertEqual(metadata["jetson_memory_variant"], variant)
+                self.assertEqual(metadata["jetson_memory_variant_source"], info["jetson_memory_variant_source"])
+                self.assertEqual(metadata["system_memory_total_bytes"], info["system_memory_total_bytes"])
+                legend_name = f"Jetson Orin Nano {variant}" if variant else "Jetson Orin Nano"
+                image_path, _, axis, _ = plot_with_mocked_backend(self.plot_module, result)
+                self.assertEqual(image_path, result.with_suffix(".png"))
+                self.assertEqual(axis.plot.call_args.kwargs["label"], f"{legend_name} | hidden states")
+                # Filenames carry enough evidence for offline plotting when JSON is absent.
+                # 缺少 JSON 时，新文件名仍为离线绘图提供型号和容量依据。
+                metadata_path.unlink()
+                _, _, axis, _ = plot_with_mocked_backend(self.plot_module, result)
+                self.assertEqual(axis.plot.call_args.kwargs["label"], f"{legend_name} | hidden states")
 
     def jetson_info(
         self, model: str = "NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super",
@@ -691,6 +761,8 @@ class LongContextTests(unittest.TestCase):
                 self.assertEqual(info["jetson_model"], family)
                 self.assertEqual(info["jetson_memory_variant"], variant)
                 self.assertEqual(info["jetson_memory_variant_source"], "eeprom:/test/eeprom")
+                expected_label = f"{family.removeprefix('Jetson ').replace(' ', '_')}_{variant}"
+                self.assertEqual(self.profiler._long_context_device_label(None, info), expected_label)
         info = self.jetson_info(model="NVIDIA Jetson Orin Nano 4GB", total_gib=7.4)
         self.assertEqual(info["jetson_memory_variant"], "4G")
         self.assertTrue(info["jetson_memory_variant_source"].startswith("device_tree_model:"))
@@ -811,11 +883,13 @@ class LongContextTests(unittest.TestCase):
             return {"shard": types.SimpleNamespace(config=self.profiler.config)}
 
         self.profiler._long_context_load_components.side_effect = inspect_metadata
-        with mock.patch.object(self.profiler, "_long_context_jetson_info", return_value=detected_info):
+        with mock.patch.object(self.profiler, "_long_context_jetson_info", return_value=detected_info) as detect:
             result = self.run_profile(initial_context_length=999, repeat_num=1, device_label="edge-A")
+        detect.assert_called_once_with()
         metadata = json.loads(result.with_suffix(".json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["jetson_memory_variant"], "8G")
         self.assertEqual(metadata["device_label"], "edge-A")
+        self.assertEqual(result.name, "long_context_prefill_latency-edge-A-2layers.csv")
 
     def test_optional_memory_counter_failure(self) -> None:
         """Unavailable counters remain empty on CUDA or CPU. 不可用内存计数器留空。"""
@@ -1250,6 +1324,15 @@ class PrefillComparisonTests(unittest.TestCase):
         self.assertEqual(axis.plot.call_args_list[0].kwargs["label"], "Jetson Orin Nano")
         _, _, axis = self.plot(first, second, label_a="Jetson Orin Nano 4G")
         self.assertEqual(axis.plot.call_args_list[0].kwargs["label"], "Jetson Orin Nano 4G")
+        for variant in ("4G", "8G"):
+            with self.subTest(filename_variant=variant):
+                first = self.write_run(f"long_context_prefill_latency-Orin_Nano_{variant}-6layers", [32])
+                _, _, axis = self.plot(first, second)
+                self.assertEqual(axis.plot.call_args_list[0].kwargs["label"], f"Jetson Orin Nano {variant}")
+                first.with_suffix(".json").unlink()
+                with self.assertWarnsRegex(UserWarning, "metadata"):
+                    _, _, axis = self.plot(first, second)
+                self.assertEqual(axis.plot.call_args_list[0].kwargs["label"], f"Jetson Orin Nano {variant}")
 
     def test_incompatible_csv_settings(self) -> None:
         """Reject mismatched samples, model adapters, question variants, units and layer counts.

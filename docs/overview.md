@@ -43,7 +43,7 @@
 
 对比脚本的 `DEFAULT_CSV_PATH_A` / `DEFAULT_CSV_PATH_B` 保存默认输入，省略对应参数时使用这些常量。默认图片输出到 `results/profiling/long_context_prefill/comparisons/`，使用 `long_context_prefill_comparison-<A 运行目录 hash>-<B 运行目录 hash>.png` 命名，hash 保留原有下划线，按输入顺序排列。可用 `--output` 覆盖目录和文件名。
 
-Orin Nano 测量在加载模型前识别 4G/8G 版本，并将 `jetson_memory_variant`、识别来源、模块 ID 和系统总内存保存到 JSON。优先模块 SKU / 系统型号，缺少明确版本时按总内存区间推断；系统接口不可用时保留未知。设备元数据独立于文件名标签和计时。两种绘图函数各自直接生成简短设备名，并在有版本信息时追加 Orin 容量，只使用结果中的信息。
+Orin Nano 测量在加载模型前识别 4G/8G 版本，并将 `jetson_memory_variant`、识别来源、模块 ID 和系统总内存保存到 JSON。优先模块 SKU / 系统型号，缺少明确版本时按总内存区间推断；系统接口不可用时保留未知。同一次识别结果用于生成 `Orin_Nano_4G` / `Orin_Nano_8G` 文件标签和 JSON 元数据；已确认系列但容量未知时使用 `Orin_Nano`，已识别 NX 同样采用 `Orin_NX_<容量>`。显式 `device_label` 优先覆盖文件标签，硬件字段仍按实际识别结果保存，全部识别位于计时之外。两种绘图函数各自直接生成简短设备名，并在有版本信息时追加 Orin 容量，只使用结果中的信息；单设备图默认沿用 CSV 文件名并改用 `.png` 后缀。
 
 ## 项目中的约定和共识
 

@@ -1880,14 +1880,33 @@ class NodeProfiler:
                     ) from error
                 time.sleep(retry_delays_seconds[attempt_index])
 
-    def _long_context_device_label(self, device_label: str | None) -> str:
+    def _long_context_device_label(
+        self, device_label: str | None, jetson_info: dict[str, Any] | None = None,
+    ) -> str:
         """Identify a device without requiring a platform-specific executable.
 
         Args:
             self: Profiler holding the selected device. 持有所选设备的 profiler。
             device_label: Optional explicit display/file label. 可选的显式设备标签。
+            jetson_info: Previously detected hardware metadata; None probes when an automatic
+                label is needed. 已识别的硬件元数据；为 None 且需自动标签时才查询系统。
         """
         detected_label = device_label or ""
+        if not detected_label:
+            if jetson_info is None:
+                jetson_info = self._long_context_jetson_info()
+            # Reuse the recorded family and capacity, including module identity over carrier text.
+            # 复用记录中的系列与容量，优先采用模块身份，避免被载板型号文本误导。
+            short_model_labels = {
+                "Jetson Orin Nano": ("Orin_Nano", ("4G", "8G")),
+                "Jetson Orin NX": ("Orin_NX", ("8G", "16G")),
+            }
+            short_model = short_model_labels.get(jetson_info.get("jetson_model"))
+            if short_model is not None:
+                detected_label, valid_variants = short_model
+                variant = jetson_info.get("jetson_memory_variant")
+                if variant in valid_variants:
+                    detected_label = f"{detected_label}_{variant}"
         if not detected_label:
             try:
                 board_model = Path("/proc/device-tree/model").read_text(encoding="utf-8").strip("\x00\n ")
@@ -2188,7 +2207,7 @@ class NodeProfiler:
             output_dir: Root for a fresh run directory; default is results/profiling/long_context_prefill.
                 新建运行子目录的根路径，默认位于项目 results/profiling/long_context_prefill。
             device_label: Optional portable filename label overriding hardware detection.
-                可选设备标签，用于覆盖自动识别结果并生成文件名。
+                可选设备标签，覆盖自动生成的型号/容量文件标签；硬件元数据仍按实际设备记录。
 
         One warm-up runs at the initial length, including the head for a full model.
         Input formatting/tokenization, local tensor copies, embedding, RoPE and forward
@@ -2229,7 +2248,10 @@ class NodeProfiler:
         root = Path(output_dir) if output_dir is not None else project_root / "results/profiling/long_context_prefill"
         root.mkdir(parents=True, exist_ok=True)
         run_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-"), dir=root))
-        label = self._long_context_device_label(device_label)
+        # A single hardware snapshot drives both filenames and the persisted metadata.
+        # 文件命名与持久化元数据使用同一次硬件识别结果。
+        jetson_info = self._long_context_jetson_info()
+        label = self._long_context_device_label(device_label, jetson_info=jetson_info)
         csv_path = run_dir / f"long_context_prefill_latency-{label}-{layer_num}layers.csv"
         metadata_path = csv_path.with_suffix(".json")
         metadata: dict[str, Any] = {
@@ -2249,7 +2271,7 @@ class NodeProfiler:
             "lm_head_resident": layer_num == self.layer_num,
             "pending_attempt": None,
         }
-        metadata.update(self._long_context_jetson_info())
+        metadata.update(jetson_info)
         components: dict[str, Any] = {}
         print(f"[PROFILE] results: {csv_path}", flush=True)
         with csv_path.open("x", encoding="utf-8", newline="") as csv_stream:

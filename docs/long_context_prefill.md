@@ -67,6 +67,25 @@ long_context_prefill_latency-<设备型号>-<N>layers.csv
 
 设备名优先尝试 Jetson device-tree，再尝试 PyTorch CUDA 型号，最后回退到平台/设备类型；不调用 `nvidia-smi`。识别失败不会因为缺少 PC 命令而中断。可用 `device_label="Jetson Orin Nano"` 等显式覆盖，文件名中的不安全字符自动替换。
 
+Orin Nano 的内存版本另存入同名 JSON，识别发生在模型加载及计时之前，保留文件名的设备标签规则：
+
+1. 优先只读查询系统公开的模块 EEPROM（支持的格式版本为 2.0），再查询设备树中启动时填入的模块 ID。P3767-0003 / P3767-0005 对应 Nano 8G，P3767-0004 对应 Nano 4G；P3767-0000 / P3767-0001 属于 NX，不会因使用 Nano 载板而按 Nano 处理。映射依据 [NVIDIA EEPROM 文档](https://docs.nvidia.com/jetson/archives/r36.4/DeveloperGuide/HR/JetsonEepromLayout.html)。
+2. 模块 ID 不可用时，读取设备树 `model` 中明确的 `Orin Nano 4GB` / `8GB` 等型号文本。兼容 `/proc/device-tree` 和 `/sys/firmware/devicetree/base`；根 `compatible` 只帮助识别平台，不以共用 DTB 的型号确定内存版本。
+3. 系统信息确认是 Orin Nano、但仍没有版本时，读取 `/proc/meminfo` 的 `MemTotal`，必要时回退到 `os.sysconf` 的物理页数和页大小。依据总内存而非空闲内存、CUDA 已分配内存或进程内存限制推断：3.0–4.5 GiB 视为标称 4G，6.0–8.5 GiB 视为标称 8G，因此 3.x / 7.x GiB 均可识别。该区间是容量推断规则，不代表标称容量的严格等值。
+4. 不在这些区间、系统信息不足、字段不可读或接口不存在时保留未知状态。设备识别不运行外部命令，不提升权限，不因可选系统接口缺失中断测量。
+
+Jetson 运行的 JSON 附加字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `jetson_model` | 识别出的简短系列，例如 `Jetson Orin Nano`；无法确定时为 `null` |
+| `jetson_module_id` | 物理模块 ID，例如 `P3767-0005`；不可用时为 `null` |
+| `jetson_memory_variant` | Nano 的 `4G` / `8G`；已知 NX 模块可为 `8G` / `16G`；未知为 `null` |
+| `jetson_memory_variant_source` | `eeprom:<路径>`、`device_tree_ids:<路径>`、`device_tree_model:<路径>`、`system_memory_total_inferred` 或 `unknown` |
+| `system_memory_total_bytes` | Orin Nano 操作系统可见的总物理内存字节数，与标称容量及当前空闲量不同；不可用时为 `null` |
+
+PC 等其他平台不追加 Jetson 字段。显式 `device_label` 只覆盖文件标签，不改变实际硬件识别；EEPROM 仅提取版本和产品编号，不保存设备序列号或 MAC 地址。
+
 | 字段 | 含义 |
 | --- | --- |
 | `attempt_id`, `sample_id` | 本轮序号与数据集记录标识 |
@@ -94,9 +113,58 @@ CSV 在每次完成后 `flush` + `fsync`。每轮高内存操作前，先原子�
 从项目根目录运行独立绘图脚本：
 
 ```bash
-python test/long_context_prefill_result_fig.py "results/profiling/long_context_prefill/<运行目录>/<结果文件>.csv"
+python analysis/long_context_prefill_result_fig.py "results/profiling/long_context_prefill/<运行目录>/<结果文件>.csv"
 ```
 
-省略 CSV 参数时使用脚本中的 `DEFAULT_CSV_PATH`；可以在脚本顶部配置默认数据文件。可用 `--output "results/figures/prefill.png"` 指定输出位置，默认图片与 CSV 同名且后缀为 `.png`。相对 CSV 和输出路径都以项目根目录为基准，绝对路径直接使用。因此在 `test/` 目录也可执行 `python long_context_prefill_result_fig.py`，使用相同的默认输入。
+省略 CSV 参数时使用脚本中的 `DEFAULT_CSV_PATH`；可以在脚本顶部配置默认数据文件。可用 `--output "results/figures/prefill.png"` 指定输出位置，默认图片与 CSV 同名且后缀为 `.png`。相对 CSV 和输出路径都以项目根目录为基准，绝对路径直接使用。因此在 `analysis/` 目录也可执行 `python long_context_prefill_result_fig.py`，使用相同的默认输入。
 
 绘图函数 `plot_long_context_prefill(csv_path, output_path=None)` 定义在这个脚本中，外部 Python 调用者也可导入该函数。脚本只使用标准库和 matplotlib，直接读取 CSV 与可选的同名 JSON。横轴是实际模型输入 token 数，纵轴是层均摊时延；按 hidden-state/LM-head 两种终点分别画正式重复的中位数及 min/max 区间，跳过预热和无效行，标记完整 context 与可用的停止位置。至少需要一条成功的正式测量；没有时给出明确错误。
+
+设备图例直接在绘图函数内生成。单设备图保留终点区别，例如 `Jetson Orin Nano 8G | hidden states`、`Jetson Orin Nano 8G | first token (LM head)`；PC 使用 `Quadro RTX 5000` 等简短名称。分析代码仅读取 CSV/JSON，不查询绘图主机的硬件。
+
+## 双设备共同范围对比
+
+在脚本顶部配置 `DEFAULT_CSV_PATH_A` 和 `DEFAULT_CSV_PATH_B`，然后从项目根目录直接运行：
+
+```bash
+python analysis/long_context_prefill_comparison_fig.py
+```
+
+两个常量当前分别指向 Jetson 的 `20260827-231615-zmq7xa6z` 和 Quadro 的 `20260828-003453-_krn076g` 结果。也可通过命令行覆盖：
+
+```bash
+python analysis/long_context_prefill_comparison_fig.py "<设备 A CSV>" "<设备 B CSV>" --label-a "Jetson Orin Nano" --label-b "Quadro RTX 5000" --output "results/figures/prefill_comparison.png"
+```
+
+脚本和 Python 函数 `compare_long_context_prefill(csv_path_a=None, csv_path_b=None, output_path=None, include_lm_head=False, label_a=None, label_b=None)` 均只依赖标准库和 matplotlib，无需 torch 或权重。从项目根目录也可用 `from analysis.long_context_prefill_comparison_fig import compare_long_context_prefill` 调用；直接 `compare_long_context_prefill()` 使用两个默认常量。
+
+两个 CSV 参数均可省略；仅传一个时覆盖 A，B 使用默认常量。相对输入/输出路径以项目根目录为基准，不受启动目录影响。绘图函数从同名 JSON 生成简短设备名，例如 `Jetson Orin Nano 8G`、`Quadro RTX 5000`；缺少 JSON 时从 CSV 文件名提取设备名。`--label-a` / `--label-b` 可指定昵称，Orin 的已知版本会追加到昵称后。
+
+两种图均优先读取记录中的 `jetson_memory_variant`；历史设备名若明确含有 `4G` / `8GB` 等容量，也可作为回退。旧 JSON 没有版本证据时显示 `Jetson Orin Nano`，图例中省略容量。旧结果需要在确认目标设备后补充版本信息；对比图也可用 `--label-a "Jetson Orin Nano 8G"` 显式指定已确认的版本。重新运行 profiling 会自动保存新增硬件字段。
+
+默认输出目录由 `DEFAULT_OUTPUT_DIR` 指定，为 `results/profiling/long_context_prefill/comparisons/`。文件名按 A、B 顺序使用各自 CSV 父目录中 `YYYYMMDD-HHMMSS-` 后的完整 hash，保留开头的下划线。例如上述默认输入生成：
+
+```text
+results/profiling/long_context_prefill/comparisons/long_context_prefill_comparison-zmq7xa6z-_krn076g.png
+```
+
+若 CSV 父目录采用其他命名方式，则用该 CSV 绝对路径的 SHA-256 前八位作为回退标识。`--output` 可直接指定完整图片路径，覆盖默认目录和命名。同一组输入的默认文件名固定，重复运行会更新图片；需要保留 hidden-state 与 LM-head 两张图时，为它们分别指定输出路径。
+
+### 对齐与统计
+
+1. 固定一种输出终点：默认 `include_lm_head=False`；`--include-lm-head` 选择两组中的 `True` 测量。两组都必须具有所选终点的成功正式测量。
+2. 仅使用 `phase=measure` 且 `status=success` 的有效时延。warmup、OOM、context limit、无效记录及 JSON 中的 pending 尝试不参与统计或扩大范围。
+3. 根据 `context_length` 取双方成功点的交集，保留共同上限。若 A 成功测到 2048 词、B 成功测到 8192 词，双方共有 32、64、128、256、512、1024、2048，则仅绘制这七个点。A 在 4096 词处被 kill，并不提供 4096 词的测量值。
+4. 起始长度不同或中间缺点时，只保留双方实际共有的长度，不插值；交集可以只有一个点。无交集时明确报错。
+5. 相同 context 长度须具有相同的实际 token 数、原文词数/字符数及完整原文标志。横轴为实际 token 数（包含完整 question 与 chat template），按 base 2 对数显示。
+6. 两条线分别为各设备每个长度上所有成功正式重复的 `prefill_latency_per_layer_ms` 中位数，阴影为最小/最大值；直接使用 CSV 的层均摊值，不再次除以 N。即使终止前只保存部分重复，也使用已完成值；控制台会报告每组绘制点的重复数范围。阴影不是置信区间。
+
+标题注明加载层数、输出终点和共同 context 范围；控制台同时报告共同点数和各组被排除的成功点数。测量仍是单设备输入到输出的连续时延除以 N，包含输入处理及对应输出开销。
+
+### 可比性检查
+
+CSV 的 `sample_id`、`model_type`、`question_type`、`context_length_unit`、`loaded_layer_count` 必须组内和组间一致；完整性检查发现同一长度的输入属性混杂时会报错。同名 JSON 可用时，还核对其与 CSV 的上述条件，并比较两组的 dtype、模型总层数、窗口、计时定义、attention backend/mask、final norm、LM head 驻留和 warmup 次数。
+
+权重路径仅比较末级目录名，兼容 Linux 与 Windows 的路径分隔符和不同机器的目录前缀。两台机器若为相同权重使用不同目录名，需要在归档结果时确认并统一模型标识；相同目录名本身不等于权重内容校验。实验者仍需保证数据集、权重、tokenizer 和测量代码版本一致。
+
+JSON 缺失、损坏或缺少检查字段时会提示，仅按现有信息校验；CSV 仍可绘制。PyTorch 版本不同时也会提示但继续绘图，以支持 Jetson 与 PC 的不同软件发行版。比较结果反映设备及各自软件环境的整体表现，不能仅凭图形把差异全部归因于 GPU 硬件。

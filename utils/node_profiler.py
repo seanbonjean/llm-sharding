@@ -1884,6 +1884,133 @@ class NodeProfiler:
         safe_label = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", detected_label).strip(" ._")
         return safe_label or "device"
 
+    @staticmethod
+    def _long_context_system_memory_bytes() -> int | None:
+        """Read OS-visible total physical RAM, independently of current memory pressure.
+
+        No arguments. Prefer Linux MemTotal (KiB); use physical page counts as a fallback.
+        无形参。优先读取 Linux MemTotal（KiB），回退到物理页数；不用空闲内存或进程内存限额。
+        """
+        try:
+            memory_info = Path("/proc/meminfo").read_text(encoding="ascii")
+            match = re.search(r"^MemTotal:\s*(\d+)\s+kB\s*$", memory_info, re.MULTILINE)
+            if match and int(match.group(1)) > 0:
+                return int(match.group(1)) * 1024
+        except (OSError, UnicodeError, ValueError):
+            pass
+        try:
+            page_count = int(os.sysconf("SC_PHYS_PAGES"))
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            if page_count > 0 and page_size > 0:
+                return page_count * page_size
+        except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+            pass
+        return None
+
+    @staticmethod
+    def _long_context_jetson_module_id(device_tree_roots: tuple[Path, ...]) -> tuple[str | None, str | None]:
+        """Read a physical Orin NX/Nano module ID from optional system interfaces.
+
+        Args:
+            device_tree_roots: Linux device-tree locations whose boot-populated IDs can identify
+                the module if its EEPROM is unavailable. EEPROM 不可读时用于查询启动时模块 ID 的设备树路径。
+
+        Only read the supported EEPROM header and product-number fields; all I/O is best effort.
+        仅读取已知 EEPROM 格式的版本及产品编号字段；接口缺失或权限不足时跳过。
+        """
+        try:
+            eeprom_paths = sorted(Path("/sys/bus/i2c/devices").glob("*-0050/eeprom"))
+        except OSError:
+            eeprom_paths = []
+        for eeprom_path in eeprom_paths:
+            try:
+                with eeprom_path.open("rb") as stream:
+                    if stream.read(2) != b"\x02\x00":
+                        continue
+                    stream.seek(20)
+                    part_number = stream.read(30).decode("ascii", errors="ignore")
+                match = re.search(r"699-[0-9]3767-([0-9]{4})-", part_number)
+                if match:
+                    return f"P3767-{match.group(1)}", f"eeprom:{eeprom_path.as_posix()}"
+            except (OSError, ValueError):
+                continue
+        # Boot-populated IDs identify the module; the root compatible string may describe a shared DTB.
+        # 启动时填入的 ID 用于识别模块；根 compatible 可能来自共用 DTB，不用于确定内存版本。
+        for root in device_tree_roots:
+            try:
+                module_ids = sorted((root / "chosen/plugin-manager/ids").iterdir())
+            except OSError:
+                continue
+            for module_path in module_ids:
+                match = re.match(r"[pP]?3767-([0-9]{4})(?:-|$)", module_path.name)
+                if match:
+                    return f"P3767-{match.group(1)}", f"device_tree_ids:{module_path.as_posix()}"
+        return None, None
+
+    def _long_context_jetson_info(self) -> dict[str, Any]:
+        """Identify Jetson Orin memory variants before model loading and timed trials.
+
+        Args:
+            self: Profiler running on the machine being measured. 运行在被测机器上的 profiler。
+
+        Prefer module SKU or explicit system model text. Infer Nano 4G/8G from total RAM only
+        after identifying the Nano family; retain the evidence source and measured total in JSON.
+        优先模块 SKU 或系统型号文本；仅在确认 Nano 系列后按总内存推测 4G/8G，并保留依据及实测总量。
+        """
+        roots = (Path("/proc/device-tree"), Path("/sys/firmware/devicetree/base"))
+        system_texts: list[tuple[Path, str]] = []
+        for root in roots:
+            for property_name in ("model", "compatible"):
+                path = root / property_name
+                try:
+                    value = path.read_text(encoding="utf-8").replace("\x00", " ").strip()
+                    system_texts.append((path, value))
+                except (OSError, UnicodeError):
+                    pass
+        combined_text = " ".join(value for _, value in system_texts).casefold()
+        if not (("jetson" in combined_text and "orin" in combined_text) or "tegra234" in combined_text):
+            return {}
+        module_id, module_source = self._long_context_jetson_module_id(roots)
+        # NVIDIA's module SKUs distinguish Nano from NX even when both use a Nano carrier board.
+        # NVIDIA 模块 SKU 可区分 Nano 与 NX，即使二者使用相同的 Nano 载板。
+        module_variants = {
+            "P3767-0003": ("Jetson Orin Nano", "8G"),
+            "P3767-0004": ("Jetson Orin Nano", "4G"),
+            "P3767-0005": ("Jetson Orin Nano", "8G"),
+            "P3767-0000": ("Jetson Orin NX", "16G"),
+            "P3767-0001": ("Jetson Orin NX", "8G"),
+        }
+        jetson_model, variant = module_variants.get(module_id, (None, None))
+        variant_source = module_source if variant else "unknown"
+        model_texts = [(path, value) for path, value in system_texts if path.name == "model"]
+        if module_id is None:
+            for path, value in model_texts:
+                if re.search(r"\borin[\s_-]+nano\b", value, re.IGNORECASE):
+                    jetson_model = "Jetson Orin Nano"
+                    match = re.search(r"\borin[\s_-]+nano\b.*?\b(4|8)\s*G(?:i?B)?\b", value, re.IGNORECASE)
+                    if match:
+                        variant = f"{match.group(1)}G"
+                        variant_source = f"device_tree_model:{path.as_posix()}"
+                        break
+        memory_total_bytes = self._long_context_system_memory_bytes() if jetson_model == "Jetson Orin Nano" else None
+        if jetson_model == "Jetson Orin Nano" and variant is None and memory_total_bytes is not None:
+            memory_total_gib = memory_total_bytes / (1024 ** 3)
+            # Reserve room for firmware/kernel carve-outs: nominal 8G can expose only 7.x GiB.
+            # 为固件/内核保留内存留出余量：标称 8G 可能仅暴露 7.x GiB，4G 同理。
+            if 3.0 <= memory_total_gib <= 4.5:
+                variant = "4G"
+            elif 6.0 <= memory_total_gib <= 8.5:
+                variant = "8G"
+            if variant:
+                variant_source = "system_memory_total_inferred"
+        return {
+            "jetson_model": jetson_model,
+            "jetson_module_id": module_id,
+            "jetson_memory_variant": variant,
+            "jetson_memory_variant_source": variant_source,
+            "system_memory_total_bytes": memory_total_bytes,
+        }
+
     def _long_context_cuda_stat(self, operation: str) -> int | None:
         """Read an optional CUDA counter without interrupting a completed trial.
 
@@ -2096,6 +2223,7 @@ class NodeProfiler:
             "lm_head_resident": layer_num == self.layer_num,
             "pending_attempt": None,
         }
+        metadata.update(self._long_context_jetson_info())
         components: dict[str, Any] = {}
         print(f"[PROFILE] results: {csv_path}", flush=True)
         with csv_path.open("x", encoding="utf-8", newline="") as csv_stream:

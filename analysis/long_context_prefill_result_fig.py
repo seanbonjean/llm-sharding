@@ -1,5 +1,6 @@
 """Plot single-device long-context prefill results using CSV and matplotlib.
 
+Run with ``python analysis/long_context_prefill_result_fig.py <results.csv>``.
 Relative paths are resolved from the repository root, independently of the working directory.
 使用 CSV 和 matplotlib 绘制单设备长上下文结果；相对路径以项目根目录为基准。
 """
@@ -10,14 +11,14 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CSV_PATH = (
-    "results/profiling/long_context_prefill/20260827-231615-zmq7xa6z/"
-    "long_context_prefill_latency-NVIDIA_Jetson_Orin_Nano_Engineering_Reference_Developer_Kit_Super-6layers.csv"
+    "results/profiling/long_context_prefill/20260828-003453-_krn076g/long_context_prefill_latency-Quadro_RTX_5000-6layers.csv"
 )
 
 
@@ -92,11 +93,30 @@ def plot_long_context_prefill(csv_path: str | Path, output_path: str | Path | No
 
     figure, axis = plt.subplots(figsize=(9, 5))
     try:
+        recorded_name = str(metadata.get("device_label") or source.stem)
+        recorded_name = re.sub(r"^long_context_prefill_latency-(.*)-[0-9]+layers$", r"\1", recorded_name)
+        recorded_name = " ".join(recorded_name.replace("_", " ").split())
+        device_name = re.sub(r"^NVIDIA\s+", "", recorded_name, flags=re.IGNORECASE)
+        model_name = metadata.get("jetson_model")
+        if not isinstance(model_name, str):
+            model_name = recorded_name
+        orin_model = re.search(r"\borin\s+(nano|nx)\b", model_name, re.IGNORECASE)
+        if orin_model:
+            model_family = "Nano" if orin_model.group(1).lower() == "nano" else "NX"
+            device_name = f"Jetson Orin {model_family}"
+            valid_variants = ("4G", "8G") if model_family == "Nano" else ("8G", "16G")
+            variant = metadata.get("jetson_memory_variant")
+            if variant not in valid_variants:
+                capacity_match = re.search(r"\b(4|8|16)\s*G(?:i?B)?\b", recorded_name, re.IGNORECASE)
+                variant = f"{capacity_match.group(1)}G" if capacity_match else None
+            if variant in valid_variants:
+                device_name = f"{device_name} {variant}"
         for include_lm_head in sorted({key[0] for key in groups}):
             lengths = sorted(key[1] for key in groups if key[0] == include_lm_head)
             samples = [groups[(include_lm_head, length)] for length in lengths]
             medians = [statistics.median(values) for values in samples]
-            label = "Input to first token (LM head)" if include_lm_head else "Input to hidden state"
+            endpoint_label = "first token (LM head)" if include_lm_head else "hidden states"
+            label = f"{device_name} | {endpoint_label}"
             axis.plot(lengths, medians, marker="o", label=label)
             axis.fill_between(
                 lengths, [min(values) for values in samples], [max(values) for values in samples], alpha=0.15,

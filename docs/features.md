@@ -16,7 +16,7 @@
 
 #### profile_long_context_prefill
 
-精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON。
+精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON；模型加载前将识别出的 Jetson 内存版本、来源及总内存写入元数据。
 
 #### _long_context_read_sample
 
@@ -37,6 +37,18 @@
 #### _long_context_cuda_stat
 
 读取可选 CUDA 内存计数器；非 CUDA 或不可用统计返回空值。
+
+#### _long_context_system_memory_bytes
+
+读取 `/proc/meminfo` 的 MemTotal 并将 KiB 换算为字节；必要时回退到 sysconf 的物理页数和页大小。返回操作系统可见总物理内存，不使用空闲内存；接口不存在或不可读时返回空值。
+
+#### _long_context_jetson_module_id
+
+只读访问可用 EEPROM 的格式版本和产品编号，识别 Orin NX/Nano 的 P3767 模块 SKU；EEPROM 不可用时查询设备树中启动时填入的模块 ID。不使用共用 DTB 的根 compatible 确定内存版本。返回模块 ID 及来源，读取失败时安全回退。
+
+#### _long_context_jetson_info
+
+从设备树识别 Orin 平台，优先模块 SKU，其次明确的 Nano 型号文本；仍缺少版本时，Nano 的 3.0–4.5 GiB 总内存推断为 4G、6.0–8.5 GiB 推断为 8G。返回简短系列、模块 ID、版本、识别来源和总内存；信息不足时保留未知，非 Orin 平台返回空字典。
 
 #### _long_context_load_components
 
@@ -1138,21 +1150,53 @@ pipeline 节点入口。创建 PipelineNodeController 并运行循环，等待�
 
 Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内容。
 
-## test/long_context_prefill_result_fig.py
+## analysis/long_context_prefill_result_fig.py
 
-单设备长上下文结果的独立绘图入口，使用标准库和 matplotlib。`DEFAULT_CSV_PATH` 保存默认结果文件；输入及输出的相对路径均以项目根目录解析，支持从根目录或 `test/` 目录启动。
+单设备长上下文结果的独立绘图入口，使用标准库和 matplotlib。`DEFAULT_CSV_PATH` 保存默认结果文件；输入及输出的相对路径均以项目根目录解析，支持从根目录或 `analysis/` 目录启动。
 
 ### plot_long_context_prefill
 
-读取 CSV 和可选同名 JSON，按实际输入 token 数、hidden-state/LM-head 终点分组，绘制正式重复的中位数及 min/max。标记完整原文、确认的停止原因与未完成尝试，支持部分运行结果，返回图片路径。
+读取 CSV 和可选同名 JSON，按实际输入 token 数、hidden-state/LM-head 终点分组，绘制正式重复的中位数及 min/max。函数内直接生成简短设备名，有记录的 Orin 内存版本追加到名称后，并保留输出终点。标记完整原文、确认的停止原因与未完成尝试，支持部分运行结果，返回图片路径。
 
 ### main
 
 解析可选 CSV 位置参数和 `--output`，省略 CSV 时使用脚本默认路径，调用绘图函数并打印图片保存位置。模块导入与 `--help` 只加载标准库，matplotlib 在实际绘图时加载。
 
+## analysis/long_context_prefill_comparison_fig.py
+
+双设备长上下文 prefill 结果的独立对比入口，仅需标准库和 matplotlib。`DEFAULT_CSV_PATH_A` / `DEFAULT_CSV_PATH_B` 保存默认两组 CSV，可由命令行覆盖；按共同原文前缀和同一输出终点绘制两条层均摊时延曲线。相对路径统一基于项目根目录，`DEFAULT_OUTPUT_DIR` 为默认图片目录。
+
+### PrefillPoint
+
+保存一个前缀的实际 token 数、词数、字符数、完整原文标志和成功正式重复的层均摊时延列表。使用具名元组，无自定义方法。
+
+### PrefillRun
+
+保存输入 CSV 路径、组内一致的实验条件、按 context 长度索引的 `PrefillPoint` 与可选 JSON 元数据。使用具名元组，无自定义方法。
+
+### _read_run
+
+解析指定输出终点的成功正式 CSV 记录，跳过预热、失败及无效测量并聚合重复；混合实验条件或同一长度输入属性不一致时报错。读取同名 JSON，检查样本等属性与 CSV 的一致性；元数据不可用时提示并保留 CSV 分析能力。
+
+### _common_context_lengths
+
+检查样本、模板、问题、截断单位、层数及可用 JSON 运行配置，兼容跨操作系统的权重目录前缀。返回成功原文长度的精确交集，检查交集上的 token 数及前缀属性；无共同点或条件冲突时报错。PyTorch 版本差异、元数据不完整时提示。
+
+### _run_directory_hash
+
+从 CSV 父目录的 `YYYYMMDD-HHMMSS-hash` 名称提取完整 hash，保留下划线；其他目录结构使用 CSV 绝对路径的 SHA-256 前八位生成稳定回退标识，用于图片命名。
+
+### compare_long_context_prefill
+
+省略 CSV 参数时使用对应默认常量。默认选择 hidden-state 终点，可用 `include_lm_head=True` 选择首 token。按共同点绘制两个设备系列，横轴实际 token 数，纵轴 CSV 层均摊时延的中位数，阴影 min/max。函数内直接生成简短设备名和已记录的 Orin 内存版本，支持显式昵称/输出路径；默认保存到 `results/profiling/long_context_prefill/comparisons/`，文件名为 `long_context_prefill_comparison-<A hash>-<B hash>.png`。报告共同范围、排除点数与重复数范围，关闭图形并返回保存路径。
+
+### main
+
+接收两个可选 CSV 位置参数及 `--output`、`--include-lm-head`、`--label-a`、`--label-b`；省略某个 CSV 时使用其默认常量。调用对比并打印输出路径。输入或兼容性错误以命令行错误反馈；帮助信息不加载绘图库或 ML 依赖。
+
 ## test/unittest_node_profiler.py
 
-NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/` 目录，并使用不与标准库冲突的文件名。通过模拟 ML/通信依赖执行真实 profiler 调度和计时代码；语法检查不导入 ML 库，实际 CUDA/模型数值正确性由目标设备验证。直接运行时临时排除测试目录以加载标准库 unittest，随后恢复搜索路径。
+NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测试统一位于 `test/` 目录，并使用不与标准库冲突的文件名。通过模拟 ML/通信依赖执行真实 profiler 调度和计时代码，绘图使用记录调用的 matplotlib 替身；语法检查不导入 ML 库，实际 CUDA/模型数值正确性由目标设备验证。直接运行时临时排除测试目录以加载标准库 unittest，随后恢复搜索路径。
 
 ### load_profile_module
 
@@ -1160,7 +1204,7 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 
 ### load_plot_module
 
-通过脚本自身的标准库依赖加载独立绘图模块。
+按 `filename` 从 `analysis/` 加载独立绘图模块，仅依赖其标准库导入；默认加载单设备脚本，也支持对比脚本。
 
 ### make_profiler
 
@@ -1282,6 +1326,34 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 
 验证 Jetson、CUDA 查询失败及显式标签的处理。
 
+#### jetson_info
+
+控制设备树型号、物理模块 ID 和系统总内存，构造可测试的 Jetson 识别环境。
+
+#### test_jetson_variant_system_evidence_priority
+
+验证 Nano 4G/8G 与 NX SKU 区分，以及物理模块 ID、系统型号文本和内存推断的优先级。
+
+#### test_jetson_variant_uses_nominal_memory_ranges
+
+验证 7.x / 3.x GiB 对应标称 8G / 4G，异常总量保留未知，非 Jetson 设备不套用容量推断。
+
+#### test_system_memory_reader_and_fallbacks
+
+验证 MemTotal 的 KiB 换算、忽略空闲量、sysconf 物理页回退和不可用系统接口。
+
+#### test_jetson_eeprom_module_id_and_permissions
+
+验证 EEPROM 版本及产品编号解析，区分模块与载板，跳过未知格式和权限错误。
+
+#### test_jetson_device_tree_ids_and_model_fallback
+
+验证启动时模块 ID、备用设备树路径及 MemTotal 读取；共用 DTB 的根 compatible 不作为容量版本证据。
+
+#### test_jetson_metadata_saved_before_model_loading
+
+验证 Jetson 版本、来源和总内存在模型加载前已保存到 JSON，显式文件标签不影响硬件记录。
+
 #### test_optional_memory_counter_failure
 
 验证不可用显存计数器返回空值。
@@ -1314,6 +1386,14 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 
 验证缺少正式测量时给出明确错误。
 
+#### test_plot_short_orin_names_and_endpoints
+
+验证单设备图使用简短 Orin 4G/8G 名称，同时分别标注 hidden-state 和 LM-head 终点。
+
+#### test_short_device_labels_legacy_and_overrides
+
+验证单设备绘图直接处理旧 JSON、已知容量、字段异常及 PC 名称；版本未知时保留简短名称。
+
 #### test_plot_relative_paths_use_project_root
 
 验证相对 CSV 和图片输出路径均基于项目根目录解析。
@@ -1328,8 +1408,92 @@ NodeProfiler 的标准库回归测试入口，与其他测试统一位于 `test/
 
 #### test_python_sources_compile_without_importing_dependencies
 
-对项目 Python 源码做 AST/compile 静态检查。
+对项目根目录、utils、test 和 analysis 的 Python 源码做 AST/compile 静态检查。
 
 #### test_standard_library_imports_from_application_directories
 
-在新进程中分别从项目根目录和 pipeline 入口目录导入 unittest/mock，验证解析到标准库包，覆盖应用启动时尚无 unittest 缓存的情况。
+在新进程中分别从项目根目录、test 和 analysis 目录导入 unittest/mock，验证解析到标准库包，覆盖应用启动时尚无 unittest 缓存的情况。
+
+### PrefillComparisonTests
+
+使用独立 CSV/JSON 测试数据检查双设备绘图的共同范围、兼容性及命令行行为，执行绘图时禁用 ML 导入。
+
+#### setUp
+
+创建临时目录、加载独立对比模块并注册清理。
+
+#### write_run
+
+生成可指定原文长度、时延比例、输出终点、CSV 条件及 JSON 属性的三次重复测量。
+
+#### write_rows
+
+按记录中的字段名写入 CSV，用于构造输入属性或失败状态等测试情况。
+
+#### plot
+
+替换 matplotlib 后端并禁止 ML 导入，调用真实对比函数，检查图形关闭并返回图形调用记录。
+
+#### test_shared_upper_bound_and_statistics
+
+验证 32–2048 与 32–8192 的共同范围包含 2048，两个系列使用相同横轴，且中位数和 min/max 直接来自层均摊值。
+
+#### test_exact_shared_points_and_single_point
+
+验证离散长度只取精确交集，并支持只有一个共同点的输入。
+
+#### test_failed_warmup_and_pending_attempts_are_excluded
+
+验证 warmup、OOM、context limit、不完整 CSV 尾行及 pending JSON 不扩大成功测量范围。
+
+#### test_endpoint_selection_and_labels
+
+验证 hidden-state/LM-head 终点选择、两条设备图例及同组输入的固定默认输出文件名。
+
+#### test_comparison_short_device_names_and_orin_variant
+
+验证双设备图使用 `Jetson Orin Nano 8G`、`Quadro RTX 5000` 等简短名称，显式昵称仍附带已记录的 Orin 容量。
+
+#### test_incompatible_csv_settings
+
+逐项验证样本、模型模板、问题类型、截断单位和层数不一致时拒绝比较。
+
+#### test_inconsistent_tokens_prefixes_and_run_rows
+
+验证两组 token 数/前缀属性不一致、单组重复输入不一致和混合层数时的错误。
+
+#### test_metadata_compatibility_and_host_paths
+
+验证模型、精度、计时、attention 等条件检查，兼容 Windows/Linux 路径前缀，并对 PyTorch 版本差异提示。
+
+#### test_optional_metadata_and_duplicate_labels
+
+验证缺失/无效 JSON 时的提示与 CSV 回退，以及相同设备标签的区分。
+
+#### test_empty_overlap_missing_endpoint_and_bad_columns
+
+验证无共同点、缺少所选终点、非法布尔参数和缺列输入的明确错误。
+
+#### test_invalid_numeric_rows_are_skipped
+
+验证空值、负时延及非有限时延不会混入有效点统计。
+
+#### test_relative_paths_and_cli
+
+验证相对输入/输出路径以项目根目录解析，并正确转发命令行选项。
+
+#### test_default_inputs_and_run_hash_output
+
+验证默认 CSV 常量、统一的 comparisons 输出目录，以及按输入顺序使用完整运行目录 hash 命名，保留 hash 开头的下划线。
+
+#### test_cli_default_and_partial_csv_overrides
+
+验证不传 CSV、仅传第一组和同时指定两组时的命令行默认值与覆盖行为。
+
+#### test_run_hash_fallback_for_other_directories
+
+验证普通目录下的 CSV 使用稳定的八位路径 hash，且不同路径具有不同标识。
+
+#### test_help_without_ml_or_plotting_dependencies
+
+从项目外启动对比脚本，在禁用 ML 与绘图库导入时验证命令行帮助。

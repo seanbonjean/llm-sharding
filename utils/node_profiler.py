@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -1846,13 +1847,38 @@ class NodeProfiler:
         Args:
             path: Run metadata JSON destination. 运行元数据 JSON 路径。
             metadata: Configuration and last-started attempt. 配置及最后启动的尝试。
+
+        Windows access/sharing/lock errors allow six replacement attempts, with
+        1.55 seconds of total backoff. A failed replacement retains both snapshots.
+        Windows 访问或共享/锁冲突最多尝试替换六次，累计退避 1.55 秒；替换失败保留两份快照。
         """
         temporary_path = path.with_suffix(".json.tmp")
         with temporary_path.open("w", encoding="utf-8") as stream:
             json.dump(metadata, stream, ensure_ascii=False, indent=2, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        # Retry only replacement of the closed, durable snapshot. Metadata I/O is
+        # outside the trial timer; the last committed JSON stays intact while waiting.
+        # 仅重试已关闭、已落盘快照的替换；元数据 I/O 位于 trial 计时外，等待期间保留旧 JSON。
+        retry_delays_seconds = (0.05, 0.1, 0.2, 0.4, 0.8)
+        for attempt_index in range(len(retry_delays_seconds) + 1):
+            try:
+                os.replace(temporary_path, path)
+                return
+            except PermissionError as error:
+                # Native Windows errors: access denied, sharing violation, lock violation.
+                # 原生 Windows 错误：拒绝访问、共享冲突、锁冲突；其他错误立即传播。
+                if getattr(error, "winerror", None) not in {5, 32, 33}:
+                    raise
+                if attempt_index == len(retry_delays_seconds):
+                    raise PermissionError(
+                        error.errno,
+                        f"Cannot replace profiling metadata after {attempt_index + 1} attempts. "
+                        "Check file locks, read-only attributes and directory permissions. "
+                        f"Previous JSON (if present): {path}; pending snapshot: {temporary_path}",
+                        str(temporary_path), error.winerror, str(path),
+                    ) from error
+                time.sleep(retry_delays_seconds[attempt_index])
 
     def _long_context_device_label(self, device_label: str | None) -> str:
         """Identify a device without requiring a platform-specific executable.
@@ -2290,7 +2316,16 @@ class NodeProfiler:
                 # SIGKILL cannot enter this handler; the prior running snapshot remains durable.
                 # SIGKILL 不会进入此分支；此前 running 状态的快照已持久化。
                 metadata.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "error", error=str(error))
-                self._long_context_write_metadata(metadata_path, metadata)
+                try:
+                    self._long_context_write_metadata(metadata_path, metadata)
+                except Exception as metadata_error:
+                    # Error reporting must preserve the original failure and its traceback.
+                    # 记录错误状态失败时，仍保留最初异常及其堆栈。
+                    print(
+                        f"[PROFILE] Could not save error metadata to {metadata_path}: {metadata_error}. "
+                        "The original profiling error follows.",
+                        file=sys.stderr, flush=True,
+                    )
                 raise
             finally:
                 components.clear()

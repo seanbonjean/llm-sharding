@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -364,6 +365,266 @@ class LongContextTests(unittest.TestCase):
             return {"status": "context_limit", "input_token_count": 2000}
         self.profiler._long_context_run_trial.side_effect = inspect_pending
         self.run_profile()
+
+    def test_metadata_atomic_write_and_replace(self) -> None:
+        """Persist and replace JSON without waiting on successful writes.
+        self 为当前测试实例；验证首次写入、后续替换及成功路径的零等待。
+        """
+        metadata_path = self.directory / "progress.json"
+        with mock.patch.object(self.module.time, "sleep") as retry_sleep:
+            for snapshot in ({"status": "running"}, {"status": "completed", "device": "设备 A"}):
+                self.profiler._long_context_write_metadata(metadata_path, snapshot)
+                self.assertEqual(json.loads(metadata_path.read_text(encoding="utf-8")), snapshot)
+                self.assertFalse(metadata_path.with_suffix(".json.tmp").exists())
+        retry_sleep.assert_not_called()
+
+    def test_metadata_retries_windows_replace_errors(self) -> None:
+        """Retry native Windows errors using the same durable temporary snapshot.
+        self 为当前测试实例；验证 Windows 错误重试期间保留旧文件且只写一次临时快照。
+        """
+        for winerror in (5, 32, 33):
+            for existing_json in (False, True):
+                with self.subTest(winerror=winerror, existing_json=existing_json):
+                    metadata_path = self.directory / f"progress-{winerror}-{existing_json}.json"
+                    temporary_path = metadata_path.with_suffix(".json.tmp")
+                    previous_bytes = b'{"status": "previous"}'
+                    if existing_json:
+                        metadata_path.write_bytes(previous_bytes)
+                    snapshot = {"status": "running", "device": "设备 A"}
+                    lock_error = PermissionError(errno.EACCES, "temporarily locked")
+                    lock_error.winerror = winerror
+
+                    def inspect_backoff(delay_seconds: float) -> None:
+                        """Inspect both snapshots during a retry delay.
+
+                        Args:
+                            delay_seconds: Requested backoff, replaced by this check.
+                                用文件检查代替的退避等待秒数。
+                        """
+                        self.assertIn(delay_seconds, (0.05, 0.1))
+                        self.assertEqual(json.loads(temporary_path.read_text(encoding="utf-8")), snapshot)
+                        if existing_json:
+                            self.assertEqual(metadata_path.read_bytes(), previous_bytes)
+                        else:
+                            self.assertFalse(metadata_path.exists())
+
+                    with mock.patch.object(
+                        self.module.os, "replace", wraps=os.replace,
+                        side_effect=[lock_error, lock_error, mock.DEFAULT],
+                    ) as replace, mock.patch.object(
+                        self.module.time, "sleep", side_effect=inspect_backoff,
+                    ) as retry_sleep, mock.patch.object(
+                        self.module.json, "dump", wraps=json.dump,
+                    ) as dump, mock.patch.object(self.module.os, "fsync", wraps=os.fsync) as fsync:
+                        self.profiler._long_context_write_metadata(metadata_path, snapshot)
+                    self.assertEqual(replace.call_args_list, [mock.call(temporary_path, metadata_path)] * 3)
+                    self.assertEqual(retry_sleep.call_args_list, [mock.call(0.05), mock.call(0.1)])
+                    self.assertEqual(dump.call_count, 1)
+                    self.assertEqual(fsync.call_count, 1)
+                    self.assertEqual(json.loads(metadata_path.read_text(encoding="utf-8")), snapshot)
+                    self.assertFalse(temporary_path.exists())
+
+    def test_metadata_retry_exhaustion_preserves_snapshots(self) -> None:
+        """Bound retry attempts and retain the committed JSON and pending snapshot.
+        self 为当前测试实例；验证次数上限、诊断信息及两份快照的保留。
+        """
+        metadata_path = self.directory / "progress.json"
+        previous_bytes = b'{"status": "previous"}'
+        metadata_path.write_bytes(previous_bytes)
+        snapshot = {"status": "running", "pending_attempt": {"attempt_id": 2}}
+        lock_error = PermissionError(errno.EACCES, "persistently locked")
+        lock_error.winerror = 5
+        with mock.patch.object(self.module.os, "replace", side_effect=lock_error) as replace, \
+                mock.patch.object(self.module.time, "sleep") as retry_sleep:
+            with self.assertRaisesRegex(PermissionError, "after 6 attempts") as caught:
+                self.profiler._long_context_write_metadata(metadata_path, snapshot)
+        self.assertIs(caught.exception.__cause__, lock_error)
+        self.assertIn(str(metadata_path), str(caught.exception))
+        self.assertIn(str(metadata_path.with_suffix(".json.tmp")), str(caught.exception))
+        self.assertIn("directory permissions", str(caught.exception))
+        self.assertEqual(replace.call_count, 6)
+        self.assertEqual(retry_sleep.call_args_list, [mock.call(delay) for delay in (0.05, 0.1, 0.2, 0.4, 0.8)])
+        self.assertEqual(metadata_path.read_bytes(), previous_bytes)
+        self.assertEqual(json.loads(metadata_path.with_suffix(".json.tmp").read_text()), snapshot)
+
+    def test_metadata_nonretryable_errors_propagate_immediately(self) -> None:
+        """Propagate non-Windows permission failures and other filesystem errors.
+        self 为当前测试实例；验证非目标错误立即抛出，保留原异常对象。
+        """
+        other_windows_error = PermissionError(errno.EACCES, "write protected")
+        other_windows_error.winerror = 19
+        errors = (
+            PermissionError(errno.EACCES, "permission denied"), other_windows_error,
+            FileNotFoundError(errno.ENOENT, "missing file"), OSError(errno.ENOSPC, "disk full"),
+        )
+        metadata_path = self.directory / "progress.json"
+        metadata_path.write_text('{"status": "previous"}', encoding="utf-8")
+        for error in errors:
+            with self.subTest(error=error), \
+                    mock.patch.object(self.module.os, "replace", side_effect=error) as replace, \
+                    mock.patch.object(self.module.time, "sleep") as retry_sleep:
+                with self.assertRaises(type(error)) as caught:
+                    self.profiler._long_context_write_metadata(metadata_path, {"status": "running"})
+                self.assertIs(caught.exception, error)
+                replace.assert_called_once()
+                retry_sleep.assert_not_called()
+                self.assertEqual(json.loads(metadata_path.read_text()), {"status": "previous"})
+
+    def test_metadata_temporary_write_failures_do_not_retry_replace(self) -> None:
+        """Replace only snapshots that were written and synced successfully.
+        self 为当前测试实例；验证临时文件打开或同步失败时不会进入替换重试。
+        """
+        metadata_path = self.directory / "progress.json"
+        metadata_path.write_text('{"status": "previous"}', encoding="utf-8")
+        write_error = PermissionError(errno.EACCES, "temporary write denied")
+        write_error.winerror = 5
+        for target, attribute in ((Path, "open"), (self.module.os, "fsync")):
+            with self.subTest(operation=attribute), \
+                    mock.patch.object(target, attribute, side_effect=write_error), \
+                    mock.patch.object(self.module.os, "replace") as replace, \
+                    mock.patch.object(self.module.time, "sleep") as retry_sleep:
+                with self.assertRaises(PermissionError) as caught:
+                    self.profiler._long_context_write_metadata(metadata_path, {"status": "running"})
+            self.assertIs(caught.exception, write_error)
+            replace.assert_not_called()
+            retry_sleep.assert_not_called()
+            self.assertEqual(json.loads(metadata_path.read_text()), {"status": "previous"})
+
+    @unittest.skipUnless(os.name == "nt", "Requires native Windows file-sharing semantics")
+    def test_metadata_real_windows_file_lock(self) -> None:
+        """Recover from a real Windows reader denying replacement until it closes.
+        self 为当前测试实例；通过真实只读句柄复现 Windows 替换失败并在释放后恢复。
+        """
+        metadata_path = self.directory / "progress.json"
+        metadata_path.write_text('{"status": "previous"}', encoding="utf-8")
+        with metadata_path.open(encoding="utf-8") as locked_stream:
+            def release_reader(delay_seconds: float) -> None:
+                """Release the real reader during the first backoff.
+
+                Args:
+                    delay_seconds: Requested wait before retrying replacement.
+                        再次尝试替换前的等待秒数，测试中改为释放文件句柄。
+                """
+                self.assertEqual(delay_seconds, 0.05)
+                self.assertEqual(json.load(locked_stream), {"status": "previous"})
+                locked_stream.close()
+
+            with mock.patch.object(self.module.os, "replace", wraps=os.replace) as replace, \
+                    mock.patch.object(self.module.time, "sleep", side_effect=release_reader) as retry_sleep:
+                self.profiler._long_context_write_metadata(metadata_path, {"status": "running"})
+            self.assertEqual(replace.call_count, 2)
+            retry_sleep.assert_called_once_with(0.05)
+        self.assertEqual(json.loads(metadata_path.read_text()), {"status": "running"})
+        self.assertFalse(metadata_path.with_suffix(".json.tmp").exists())
+
+    def test_metadata_retry_finishes_before_trial(self) -> None:
+        """Finish retrying pending progress before entering the timed trial.
+        self 为当前测试实例；验证进度替换重试先于模型 trial，CSV 时延仍来自 trial。
+        """
+        real_replace = os.replace
+        lock_error = PermissionError(errno.EACCES, "temporarily locked")
+        lock_error.winerror = 5
+        lock_released = False
+
+        def replace_progress(source: Path, destination: Path) -> None:
+            """Deny the first pending snapshot once, then perform real replacements.
+
+            Args:
+                source: Synced temporary JSON to inspect. 待检查的已同步临时 JSON。
+                destination: Committed metadata destination. 已提交元数据路径。
+            """
+            nonlocal lock_released
+            snapshot = json.loads(source.read_text())
+            if snapshot["pending_attempt"] is not None and not lock_released:
+                lock_released = True
+                raise lock_error
+            real_replace(source, destination)
+
+        def inspect_retry(delay_seconds: float) -> None:
+            """Check that computation has not started during backoff.
+
+            Args:
+                delay_seconds: Requested retry delay, not actually slept.
+                    计划的重试等待秒数，测试中不实际等待。
+            """
+            self.assertEqual(delay_seconds, 0.05)
+            self.profiler._long_context_run_trial.assert_not_called()
+
+        with mock.patch.object(self.module.os, "replace", side_effect=replace_progress), \
+                mock.patch.object(self.module.time, "sleep", side_effect=inspect_retry) as retry_sleep:
+            result = self.run_profile()
+        retry_sleep.assert_called_once_with(0.05)
+        rows = read_rows(result)
+        self.assertEqual(len(rows), 7)
+        self.assertTrue(all(float(row["prefill_latency_ms"]) == 8.0 for row in rows))
+        self.assertTrue(all(float(row["prefill_latency_per_layer_ms"]) == 4.0 for row in rows))
+
+    def test_metadata_failure_retains_completed_csv(self) -> None:
+        """Keep a completed row when subsequent metadata and error reporting fail.
+        self 为当前测试实例；验证持续替换失败时保留已完成 CSV、旧 JSON 和错误快照。
+        """
+        real_replace = os.replace
+        lock_error = PermissionError(errno.EACCES, "persistently locked")
+        lock_error.winerror = 5
+
+        def replace_progress(source: Path, destination: Path) -> None:
+            """Allow setup and pending progress, then lock after the first result.
+
+            Args:
+                source: Synced temporary JSON to inspect. 待检查的已同步临时 JSON。
+                destination: Committed metadata destination. 已提交元数据路径。
+            """
+            if json.loads(source.read_text()).get("last_completed_attempt_id") == 1:
+                raise lock_error
+            real_replace(source, destination)
+
+        stderr = io.StringIO()
+        with mock.patch.object(self.module.os, "replace", side_effect=replace_progress), \
+                mock.patch.object(self.module.time, "sleep") as retry_sleep, contextlib.redirect_stderr(stderr):
+            with self.assertRaisesRegex(PermissionError, "after 6 attempts") as caught:
+                self.run_profile()
+        self.assertIs(caught.exception.__cause__, lock_error)
+        self.assertEqual(retry_sleep.call_count, 10)
+        self.profiler._long_context_run_trial.assert_called_once()
+        csv_path = next(self.directory.glob("*/long_context*.csv"))
+        rows = read_rows(csv_path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "success")
+        self.assertEqual(float(rows[0]["prefill_latency_ms"]), 8.0)
+        committed = json.loads(csv_path.with_suffix(".json").read_text())
+        pending = json.loads(csv_path.with_suffix(".json.tmp").read_text())
+        self.assertEqual(committed["pending_attempt"]["attempt_id"], 1)
+        self.assertEqual(pending["last_completed_attempt_id"], 1)
+        self.assertEqual(pending["status"], "error")
+        self.assertIn("Could not save error metadata", stderr.getvalue())
+
+    def test_error_metadata_failure_preserves_original_exception(self) -> None:
+        """Keep the original trial exception when persisting its diagnostic fails.
+        self 为当前测试实例；验证错误状态落盘失败时仍抛出原始推理异常。
+        """
+        original_error = RuntimeError("invalid tensor")
+        self.profiler._long_context_run_trial.side_effect = original_error
+        real_replace = os.replace
+
+        def replace_progress(source: Path, destination: Path) -> None:
+            """Simulate a storage failure only when recording the trial error.
+
+            Args:
+                source: Synced temporary JSON to inspect. 待检查的已同步临时 JSON。
+                destination: Committed metadata destination. 已提交元数据路径。
+            """
+            if json.loads(source.read_text())["status"] == "error":
+                raise OSError(errno.ENOSPC, "disk full")
+            real_replace(source, destination)
+
+        stderr = io.StringIO()
+        with mock.patch.object(self.module.os, "replace", side_effect=replace_progress), \
+                contextlib.redirect_stderr(stderr):
+            with self.assertRaises(RuntimeError) as caught:
+                self.run_profile()
+        self.assertIs(caught.exception, original_error)
+        self.assertIn("disk full", stderr.getvalue())
+        self.assertIn("original profiling error", stderr.getvalue())
 
     def test_process_exit_retains_durable_progress(self) -> None:
         """A child exit bypasses handlers while keeping flushed results and pending metadata.

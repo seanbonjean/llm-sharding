@@ -16,7 +16,7 @@
 
 #### profile_long_context_prefill
 
-精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON；模型加载前将识别出的 Jetson 内存版本、来源及总内存写入元数据。
+精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON；模型加载前将识别出的 Jetson 内存版本、来源及总内存写入元数据。异常处理中尝试记录错误状态，二次写入失败时向 stderr 输出诊断并继续抛出最初异常。
 
 #### _long_context_read_sample
 
@@ -28,7 +28,7 @@
 
 #### _long_context_write_metadata
 
-将运行状态写入临时 JSON，flush/fsync 后原子替换同名元数据文件。
+将运行状态写入临时 JSON，flush/fsync 并关闭后替换同名元数据文件。替换遇到 Windows 错误码 5/32/33 时最多尝试六次，依次等待 0.05、0.1、0.2、0.4、0.8 秒，累计退避 1.55 秒；等待期间保留已提交 JSON，仅复用已落盘临时快照。持续失败时保留两份文件，抛出带路径及权限/占用检查提示的 PermissionError。其他错误立即传播；全部写盘和退避均在 prefill 计时区间外。
 
 #### _long_context_device_label
 
@@ -1313,6 +1313,42 @@ NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测�
 #### test_pending_snapshot_precedes_trial
 
 验证开始模型计算前已有 CSV 表头和进度快照。
+
+#### test_metadata_atomic_write_and_replace
+
+验证 JSON 首次写入和后续替换成功，正常路径无需退避。
+
+#### test_metadata_retries_windows_replace_errors
+
+分别模拟 Windows 错误码 5/32/33，验证首次写入与已有 JSON 更新的重试、退避间隔，以及临时快照只写入和同步一次。
+
+#### test_metadata_retry_exhaustion_preserves_snapshots
+
+验证持续拒绝访问最多替换六次，保留旧 JSON 和临时快照，并提供诊断路径及原始异常链。
+
+#### test_metadata_nonretryable_errors_propagate_immediately
+
+验证非目标 Windows 错误、普通权限错误、缺失文件和存储错误立即传播。
+
+#### test_metadata_temporary_write_failures_do_not_retry_replace
+
+验证临时文件打开或 fsync 失败时保留旧 JSON，且不进入替换重试。
+
+#### test_metadata_real_windows_file_lock
+
+在 Windows 上以真实只读句柄阻止 JSON 替换，验证释放句柄后重试成功；其他平台跳过此项。
+
+#### test_metadata_retry_finishes_before_trial
+
+验证 pending 进度的替换重试完成后才进入 trial，CSV 总时延和层均摊时延继续使用 trial 返回值。
+
+#### test_metadata_failure_retains_completed_csv
+
+验证结果落盘后的持续替换失败保留成功 CSV、此前 JSON 和错误状态临时快照，并终止后续 trial。
+
+#### test_error_metadata_failure_preserves_original_exception
+
+验证写入错误状态失败时向 stderr 输出诊断，继续抛出最初的 trial 异常。
 
 #### test_process_exit_retains_durable_progress
 

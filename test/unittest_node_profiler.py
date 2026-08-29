@@ -1280,6 +1280,34 @@ class LongContextTests(unittest.TestCase):
         figure.savefig.assert_called_once_with(output, dpi=150)
         pyplot.close.assert_called_once_with(figure)
 
+    def test_per_layer_plot_resolves_csv_from_result_directory(self) -> None:
+        """Resolve the only per-layer CSV when the plotting input is an experiment directory.
+        self 为当前测试实例；传入实验目录时定位其中唯一的逐层 CSV。
+        """
+        module = load_plot_module("long_context_prefill_per_layer_fig.py")
+        result_directory = self.directory / "per-layer-run"
+        result_directory.mkdir()
+        source = result_directory / "long_context_prefill_per_layer_latency-Mock_GPU-1layers-32words.csv"
+        source.write_text("header\n", encoding="utf-8")
+        self.assertEqual(module._resolve_per_layer_csv_path(result_directory), source)
+
+    def test_per_layer_plot_main_uses_default_result_directory(self) -> None:
+        """Use the configurable result directory when the plotting CLI omits its input.
+        self 为当前测试实例；命令行省略输入时使用可配置的默认实验目录。
+        """
+        module = load_plot_module("long_context_prefill_per_layer_fig.py")
+        configured_directory = "results/profiling/long_context_prefill_per_layer/example-run"
+        expected_output = self.directory / "figure.png"
+        with (
+            mock.patch.object(module, "DEFAULT_RESULT_DIRECTORY", configured_directory),
+            mock.patch.object(
+                module, "plot_long_context_prefill_per_layer", return_value=expected_output,
+            ) as plot,
+            mock.patch("builtins.print"),
+        ):
+            module.main([])
+        plot.assert_called_once_with(configured_directory, output_path=None)
+
     def test_per_layer_plot_help_without_ml_dependencies(self) -> None:
         """Run the per-layer plotting CLI help without torch, transformers or matplotlib.
         self 为当前测试实例；在无 ML/绘图库依赖时运行逐层绘图帮助。
@@ -1295,7 +1323,7 @@ class LongContextTests(unittest.TestCase):
             cwd=self.directory, capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn("csv_path", process.stdout)
+        self.assertIn("result_path", process.stdout)
 
     def test_plot_incomplete_tail_and_pending_attempt(self) -> None:
         """Plot durable rows and annotate unfinished work without asserting OOM. 绘制已完成记录并标记未完成轮次。"""

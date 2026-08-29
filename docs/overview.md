@@ -44,7 +44,7 @@
 
 `NodeProfiler.profile_long_context_prefill_per_layer()` 固定一个空白分隔的 context 词数，完成相同模板、tokenize、embedding 和 RoPE 后，按 `[0, layer_num)` 顺序运行 Transformer 层。每层从 decoder-layer 调用前计时到同步确认该层输出完成；输入准备、final norm 和 LM head 不计入单层时延。逐层同步是测量边界，因此各层时延之和不等同于不中断的端到端时延。每轮使用一份新的共享 KV，正式测量前完整预热一次。
 
-逐层 CSV 每个 attempt 为每个 layer index 保存一行；`analysis/long_context_prefill_per_layer_fig.py` 按层聚合正式重复，绘制中位数及 min/max 阴影。输入和输出相对路径均以项目根目录为基准，默认图片与 CSV 同名同目录。
+逐层 CSV 每个 attempt 为每个 layer index 保存一行；`analysis/long_context_prefill_per_layer_fig.py` 按层聚合正式重复，绘制中位数及 min/max 阴影。脚本的 `DEFAULT_RESULT_DIRECTORY` 指定默认实验运行目录，并自动定位目录中唯一的逐层 CSV；命令行也可传入其他运行目录或完整 CSV。输入和输出相对路径均以项目根目录为基准，默认图片与 CSV 同名同目录。
 
 `analysis/long_context_prefill_without_last_length_fig.py` 接收任意单设备长上下文 CSV，从成功正式测量中找出最大的 `context_length`，排除其全部 token 点，并复用通用单设备图的全部统计和显示规则。默认图片使用 `-without-last-length` 后缀保存在输入 CSV 同目录。
 

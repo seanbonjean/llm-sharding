@@ -1,8 +1,10 @@
 """Plot per-Transformer-layer latency from a fixed-length long-context prefill run.
 
-Run with ``python analysis/long_context_prefill_per_layer_fig.py <results.csv>``.
+Run with ``python analysis/long_context_prefill_per_layer_fig.py [result directory or CSV]``.
+When the argument is omitted, ``DEFAULT_RESULT_DIRECTORY`` selects the experiment run.
 Relative paths are resolved from the repository root.
-绘制固定长文本输入下各 Transformer 层的 prefill 时延；相对路径以项目根目录为基准。
+绘制固定长文本输入下各 Transformer 层的 prefill 时延；省略参数时由
+``DEFAULT_RESULT_DIRECTORY`` 指定实验目录，相对路径以项目根目录为基准。
 """
 
 from __future__ import annotations
@@ -17,6 +19,39 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RESULT_DIRECTORY = (
+    "results/profiling/long_context_prefill_per_layer/20260829-201056-e1x4ob6_"
+)
+
+
+def _resolve_per_layer_csv_path(result_path: str | Path) -> Path:
+    """Resolve a per-layer profiling CSV from either its file or run directory.
+
+    Args:
+        result_path: Per-layer CSV or experiment run directory. Relative paths are based on
+            PROJECT_ROOT. 逐层 CSV 或实验运行目录；相对路径以项目根目录为基准。
+
+    Returns:
+        The explicit CSV path or the only matching per-layer CSV in the run directory.
+        显式 CSV 路径，或实验目录中唯一匹配的逐层 CSV 路径。
+    """
+    source = Path(result_path)
+    if not source.is_absolute():
+        source = PROJECT_ROOT / source
+    if source.is_file():
+        if source.suffix.lower() != ".csv":
+            raise ValueError(f"Per-layer result file must be a CSV: {source}")
+        return source
+    if not source.is_dir():
+        raise FileNotFoundError(f"Per-layer result path does not exist: {source}")
+    candidates = sorted(source.glob("long_context_prefill_per_layer_latency-*.csv"))
+    if not candidates:
+        raise FileNotFoundError(f"No per-layer profiling CSV found in result directory: {source}")
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Multiple per-layer profiling CSV files found in result directory: {source}"
+        )
+    return candidates[0]
 
 
 def _short_device_name(source: Path, metadata: dict[str, Any]) -> str:
@@ -60,15 +95,14 @@ def plot_long_context_prefill_per_layer(
     """Plot median and min/max latency for every loaded Transformer layer.
 
     Args:
-        csv_path: Per-layer profiling CSV; a relative path is based on PROJECT_ROOT.
-            逐层测量 CSV；相对路径以项目根目录为基准，支持部分完成的运行。
+        csv_path: Per-layer profiling CSV or its experiment run directory; a relative path is
+            based on PROJECT_ROOT. 逐层测量 CSV 或其实验运行目录；相对路径以项目根目录为基准，
+            支持部分完成的运行。
         output_path: Optional image path, also relative to PROJECT_ROOT when not absolute.
             Defaults to the CSV basename plus .png.
             可选图片路径；相对路径以项目根目录为基准，默认与 CSV 同名并使用 .png 后缀。
     """
-    source = Path(csv_path)
-    if not source.is_absolute():
-        source = PROJECT_ROOT / source
+    source = _resolve_per_layer_csv_path(csv_path)
     groups: dict[int, list[float]] = {}
     completed_attempt_ids: set[int] = set()
     loaded_layer_counts: set[int] = set()
@@ -196,14 +230,20 @@ def main(argv: list[str] | None = None) -> None:
         argv: Optional argument list; None reads the process command line.
             可选参数列表；None 表示读取当前进程的命令行参数。
     """
-    parser = argparse.ArgumentParser(description="Plot fixed-input per-layer prefill latency from CSV.")
-    parser.add_argument("csv_path", help="Input CSV; relative paths use the repository root.")
+    parser = argparse.ArgumentParser(description="Plot fixed-input per-layer prefill latency.")
+    parser.add_argument(
+        "result_path", nargs="?", default=DEFAULT_RESULT_DIRECTORY,
+        help=(
+            "Experiment directory or CSV; relative paths use the repository root. "
+            "Defaults to DEFAULT_RESULT_DIRECTORY in this script."
+        ),
+    )
     parser.add_argument(
         "-o", "--output", default=None,
         help="Output image; relative paths use the repository root. Defaults beside the CSV.",
     )
     arguments = parser.parse_args(argv)
-    print(plot_long_context_prefill_per_layer(arguments.csv_path, output_path=arguments.output))
+    print(plot_long_context_prefill_per_layer(arguments.result_path, output_path=arguments.output))
 
 
 if __name__ == "__main__":

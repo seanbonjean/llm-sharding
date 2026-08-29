@@ -49,4 +49,5 @@ csv_path = profiler.profile_long_context_prefill_per_layer(
     sample_index=0,
     repeat_num=3,
 )
+print(csv_path)
 #################################

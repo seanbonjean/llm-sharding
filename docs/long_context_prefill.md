@@ -60,13 +60,13 @@ long_context_prefill_per_layer_latency-<设备型号>-<N>layers-<实际词数>wo
 
 CSV 中一个完整 attempt 为每个 `layer_index` 保存一行。`layer_index` 为零基索引，`layer_latency_ms` 为该层同步完成的毫秒时延；`peak_cuda_allocated_bytes` 和 `peak_cuda_reserved_bytes` 是整轮结束后读取的 trial 级峰值，会重复写入该轮的各层行。warmup 行保留但不参与绘图。失败行不包含单层时延；若捕获到 OOM，会记录发生时的层索引和阶段。JSON 的持久化、设备识别和强制结束语义与端到端长上下文实验一致。
 
-绘图命令：
+可以先在脚本顶部通过 `DEFAULT_RESULT_DIRECTORY` 指定实验结果文件夹，然后直接运行：
 
 ```bash
-python analysis/long_context_prefill_per_layer_fig.py "<逐层结果 CSV 路径>"
+python analysis/long_context_prefill_per_layer_fig.py
 ```
 
-图中横轴为零基层索引，纵轴为单层 prefill 时延；折线是正式重复的中位数，阴影是 min/max。默认 PNG 与 CSV 同名同目录，可用 `--output` 指定其他位置。
+也可以将其他实验结果文件夹或完整逐层 CSV 作为位置参数传入。实验文件夹中应当只有一份匹配 `long_context_prefill_per_layer_latency-*.csv` 的结果文件。图中横轴为零基层索引，纵轴为单层 prefill 时延；折线是正式重复的中位数，阴影是 min/max。默认 PNG 与 CSV 同名同目录，可用 `--output` 指定其他位置。
 
 ## 输入规则与终止条件
 

@@ -1172,7 +1172,11 @@ Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内�
 
 ## analysis/long_context_prefill_per_layer_fig.py
 
-固定长文本输入的逐 Transformer 层时延绘图入口，仅依赖标准库和 matplotlib。读取逐层 CSV 与可选同名 JSON，校验层数、实际 token 数和 context 词数一致，支持已完成正式重复及可用的失败/未完成标记。
+固定长文本输入的逐 Transformer 层时延绘图入口，仅依赖标准库和 matplotlib。`DEFAULT_RESULT_DIRECTORY` 保存默认实验运行目录；省略命令行输入时自动定位该目录中唯一的逐层 CSV，也可显式传入其他实验目录或完整 CSV。读取逐层 CSV 与可选同名 JSON，校验层数、实际 token 数和 context 词数一致，支持已完成正式重复及可用的失败/未完成标记。
+
+### _resolve_per_layer_csv_path
+
+统一解析项目根目录下的相对路径。输入为 CSV 时直接使用；输入为实验目录时匹配其中唯一的 `long_context_prefill_per_layer_latency-*.csv`，缺失或存在多份匹配文件时给出明确错误。
 
 ### _short_device_name
 
@@ -1184,7 +1188,7 @@ Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内�
 
 ### main
 
-解析必需的逐层 CSV 路径和可选 `--output`，调用绘图函数并打印图片保存位置；帮助信息不加载 ML 或绘图库依赖。
+解析可选的实验目录/逐层 CSV 和 `--output`；省略输入时使用 `DEFAULT_RESULT_DIRECTORY`，调用绘图函数并打印图片保存位置。帮助信息不加载 ML 或绘图库依赖。
 
 ## analysis/long_context_prefill_without_last_length_fig.py
 

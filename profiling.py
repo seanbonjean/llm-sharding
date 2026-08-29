@@ -41,7 +41,8 @@ profiler = NodeProfiler(
 #################################
 ### 长文本 prefill 各层各自时延实验
 
-csv_path = profiler.profile_long_context_prefill_per_layer(
+# csv_path = profiler.profile_long_context_prefill_per_layer(
+csv_path = profiler.profile_long_context_prefill_per_layer_reuse_allocator_cache(
     layer_num=6,
     context_word_count=2048,
     model_type="llama3.2ins",

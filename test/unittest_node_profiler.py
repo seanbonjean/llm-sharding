@@ -406,6 +406,45 @@ class LongContextTests(unittest.TestCase):
         self.assertEqual(rows[-1]["layer_latency_ms"], "")
         self.assertEqual(json.loads(result.with_suffix(".json").read_text())["stop_reason"], "oom")
 
+    def test_per_layer_allocator_cache_policy(self) -> None:
+        """Select whether released allocator blocks persist between otherwise identical attempts.
+        self 为当前测试实例；验证两种逐层方法仅选择不同的轮次间 allocator 缓存策略。
+        """
+        self.profiler.device.type = "cuda"
+        empty_cache = self.module.torch.cuda.empty_cache
+
+        empty_cache.reset_mock()
+        cold_allocation_result = self.run_per_layer_profile(repeat_num=2)
+        self.assertEqual(empty_cache.call_count, 4)
+        cold_allocation_metadata = json.loads(
+            cold_allocation_result.with_suffix(".json").read_text(encoding="utf-8"),
+        )
+        self.assertTrue(cold_allocation_metadata["clear_cuda_allocator_cache_between_attempts"])
+        self.assertEqual(
+            cold_allocation_metadata["profile_type"], "long_context_prefill_per_layer",
+        )
+
+        empty_cache.reset_mock()
+        reused_allocator_result = (
+            self.profiler.profile_long_context_prefill_per_layer_reuse_allocator_cache(
+                layer_num=2,
+                context_word_count=3,
+                dataset_path=self.dataset,
+                output_dir=self.directory,
+                repeat_num=2,
+            )
+        )
+        self.assertEqual(empty_cache.call_count, 1)
+        reused_allocator_metadata = json.loads(
+            reused_allocator_result.with_suffix(".json").read_text(encoding="utf-8"),
+        )
+        self.assertFalse(reused_allocator_metadata["clear_cuda_allocator_cache_between_attempts"])
+        self.assertEqual(
+            reused_allocator_metadata["profile_type"],
+            "long_context_prefill_per_layer_reuse_allocator_cache",
+        )
+        self.assertEqual(len(read_rows(cold_allocation_result)), len(read_rows(reused_allocator_result)))
+
     def test_per_layer_trial_timer_boundaries(self) -> None:
         """Synchronize and time each ordered decoder layer while excluding input preparation.
         self 为当前测试实例；逐层同步计时，并将输入准备排除在各层时延之外。

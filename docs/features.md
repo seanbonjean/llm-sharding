@@ -20,7 +20,15 @@
 
 #### profile_long_context_prefill_per_layer
 
-精确加载 `[0, layer_num)`，从 LongBench-Pro 截取形参指定的 context 词数。完整预热一次后重复执行逐层前向，每轮使用新的共享 KV；每个 attempt 为每个零基层索引保存独立时延行。CSV 和进度 JSON 使用独立运行目录持续落盘，保留设备、模型、输入和 OOM/强制结束诊断信息。
+精确加载 `[0, layer_num)`，从 LongBench-Pro 截取形参指定的 context 词数。完整预热一次后重复执行逐层前向，每轮使用新的共享 KV；每个 attempt 为每个零基层索引保存独立时延行。预热及每轮正式遍历后清理 CUDA allocator 缓存，保留偏冷分配的测试口径。CSV 和进度 JSON 使用独立运行目录持续落盘，保留设备、模型、输入和 OOM/强制结束诊断信息。
+
+#### profile_long_context_prefill_per_layer_reuse_allocator_cache
+
+复用相同的固定输入、逐层计时、独立 KV Cache 和持久化流程。一次完整预热后，在正式重复之间保留 CUDA allocator 已释放的显存块，避免将重复显存申请集中计入最前面的层；整个实验结束后统一清理显存。JSON 通过 `profile_type` 和 `clear_cuda_allocator_cache_between_attempts=false` 标识该口径。
+
+#### _profile_long_context_prefill_per_layer
+
+逐层实验的共享实现，通过 `clear_cuda_allocator_cache_between_attempts` 精确选择轮次间清理策略，确保两种公开方法除 allocator 缓存策略和对应元数据外使用相同流程。
 
 #### _long_context_read_sample
 

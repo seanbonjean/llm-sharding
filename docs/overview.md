@@ -9,7 +9,7 @@
 | 顺序单请求模型链 | `start_node.py`；`run_this.sh` 可启动多个 controller | `send_config.py` / `ConfigSender` | `NodeController.receive_request()`；`run_worker_loop` 的演示请求开关默认关闭 |
 | 多请求 pipeline | `pipeline_start_node.py` | `test/pipeline_test.py` 或 `test/pipeline_send_config.py` | `test/pipeline_test.py` 向 owner 投递 `user_request` / 请求批次 |
 | 单设备长上下文 prefill | 本地 Python 中创建 `NodeProfiler` | 本地函数形参 | `profile_long_context_prefill()` |
-| 固定输入逐层 prefill | 本地 Python 中创建 `NodeProfiler` | 层数、context 词数及重复次数 | `profile_long_context_prefill_per_layer()` |
+| 固定输入逐层 prefill | 本地 Python 中创建 `NodeProfiler` | 层数、context 词数、重复次数及 allocator 缓存口径 | `profile_long_context_prefill_per_layer()` / `profile_long_context_prefill_per_layer_reuse_allocator_cache()` |
 | 长上下文结果绘图 | `analysis/long_context_prefill_result_fig.py` | CSV 路径和可选输出路径 | 独立函数 `plot_long_context_prefill()` 或脚本命令行 |
 | 逐层 prefill 绘图 | `analysis/long_context_prefill_per_layer_fig.py` | 逐层 CSV 路径和可选输出路径 | 各层中位数折线及 min/max 阴影 |
 | 末长度去点图 | `analysis/long_context_prefill_without_last_length_fig.py` | CSV 路径和可选输出路径 | 自动排除最大的成功正式实验长度 |
@@ -43,6 +43,8 @@
 长上下文逐步翻倍，起始长度只预热一次。每次正式重复使用全新的 KV，CSV 保存原始重复测量。绘图实现位于 `analysis/long_context_prefill_result_fig.py`，独立读取已完成记录，仅需标准库和 matplotlib。脚本中的相对输入/输出路径以项目根目录为基准，因此运行目录不影响数据定位。参数、字段、OOM 后恢复分析和调用示例见 [long_context_prefill.md](long_context_prefill.md)。
 
 `NodeProfiler.profile_long_context_prefill_per_layer()` 固定一个空白分隔的 context 词数，完成相同模板、tokenize、embedding 和 RoPE 后，按 `[0, layer_num)` 顺序运行 Transformer 层。每层从 decoder-layer 调用前计时到同步确认该层输出完成；输入准备、final norm 和 LM head 不计入单层时延。逐层同步是测量边界，因此各层时延之和不等同于不中断的端到端时延。每轮使用一份新的共享 KV，正式测量前完整预热一次。
+
+原逐层方法在 warmup 和各正式轮次后清理 CUDA allocator 缓存；`profile_long_context_prefill_per_layer_reuse_allocator_cache()` 保留轮次间已释放的 allocator 显存块，用于观察稳态逐层时延。两者每轮都新建 `DynamicCache`，不会跨请求复用 KV 内容，并在整个实验结束后统一清理显存。JSON 记录具体缓存策略。
 
 逐层 CSV 每个 attempt 为每个 layer index 保存一行；`analysis/long_context_prefill_per_layer_fig.py` 按层聚合正式重复，绘制中位数及 min/max 阴影。脚本的 `DEFAULT_RESULT_DIRECTORY` 指定默认实验运行目录，并自动定位目录中唯一的逐层 CSV；命令行也可传入其他运行目录或完整 CSV。输入和输出相对路径均以项目根目录为基准，默认图片与 CSV 同名同目录。
 

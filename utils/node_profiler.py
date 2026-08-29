@@ -2456,7 +2456,7 @@ class NodeProfiler:
         dataset_path: str | Path | None = None, output_dir: str | Path | None = None,
         device_label: str | None = None,
     ) -> Path:
-        """Profile every loaded Transformer layer at one fixed LongBench-Pro word length.
+        """Profile fixed-input layers while clearing CUDA allocator cache after every attempt.
 
         Args:
             self: Profiler configured for local shard weights. 已配置本地权重的 profiler。
@@ -2479,6 +2479,114 @@ class NodeProfiler:
             device_label: Optional portable filename label overriding hardware detection.
                 可选设备标签，覆盖自动生成的文件标签；硬件元数据仍按实际设备记录。
 
+        Returns:
+            Path to the durable per-layer CSV. 持续落盘的逐层时延 CSV 路径。
+
+        This method preserves the original cold-allocation-oriented behavior. The warm-up and
+        every measured traversal are followed by ``torch.cuda.empty_cache()``.
+        该方法保留原有的偏冷分配口径：预热及每轮正式遍历后均调用
+        ``torch.cuda.empty_cache()``。
+        """
+        return self._profile_long_context_prefill_per_layer(
+            layer_num=layer_num,
+            context_word_count=context_word_count,
+            model_type=model_type,
+            use_thinking_question=use_thinking_question,
+            sample_index=sample_index,
+            repeat_num=repeat_num,
+            dataset_path=dataset_path,
+            output_dir=output_dir,
+            device_label=device_label,
+            clear_cuda_allocator_cache_between_attempts=True,
+        )
+
+    def profile_long_context_prefill_per_layer_reuse_allocator_cache(
+        self, layer_num: int, context_word_count: int,
+        model_type: str = "llama3.2ins", use_thinking_question: bool = False,
+        sample_index: int = 0, repeat_num: int = 3,
+        dataset_path: str | Path | None = None, output_dir: str | Path | None = None,
+        device_label: str | None = None,
+    ) -> Path:
+        """Profile fixed-input layers while reusing CUDA allocator cache across attempts.
+
+        Args:
+            self: Profiler configured for local shard weights. 已配置本地权重的 profiler。
+            layer_num: Exact Transformer layer count, in [1, model layer count].
+                从第零层开始精确装载并依次测量的 Transformer 层数。
+            context_word_count: Requested whitespace-delimited context words, capped at the full
+                selected context. 期望截取的空白分隔 context 词数；超过原文时使用完整原文。
+            model_type: Prompt adapter; only llama3.2ins is implemented.
+                Prompt 适配分支，目前仅实现 llama3.2ins。
+            use_thinking_question: Select question_thinking instead of question_nonthinking.
+                是否选择 question_thinking，默认选择 question_nonthinking。
+            sample_index: Zero-based LongBench-Pro record index. LongBench-Pro 样本零基序号。
+            repeat_num: Number of measured full layer traversals after one warm-up.
+                一次完整逐层预热后的正式重复轮数。
+            dataset_path: JSON array path; default is the repository LongBench-Pro dataset.
+                JSON 数组路径；默认使用项目内 LongBench-Pro 数据集。
+            output_dir: Root for a fresh run directory; default is
+                results/profiling/long_context_prefill_per_layer.
+                新建运行子目录的根路径；默认位于 results/profiling/long_context_prefill_per_layer。
+            device_label: Optional portable filename label overriding hardware detection.
+                可选设备标签，覆盖自动生成的文件标签；硬件元数据仍按实际设备记录。
+
+        Returns:
+            Path to the durable per-layer CSV. 持续落盘的逐层时延 CSV 路径。
+
+        The warm-up and measured traversals each use a fresh DynamicCache. Released CUDA allocator
+        blocks remain cached between attempts, and final cleanup still releases them after the run.
+        预热与正式遍历仍各自使用新的 DynamicCache；轮次间保留已释放的 CUDA allocator 显存块，
+        整个实验结束后仍统一清理。
+        """
+        return self._profile_long_context_prefill_per_layer(
+            layer_num=layer_num,
+            context_word_count=context_word_count,
+            model_type=model_type,
+            use_thinking_question=use_thinking_question,
+            sample_index=sample_index,
+            repeat_num=repeat_num,
+            dataset_path=dataset_path,
+            output_dir=output_dir,
+            device_label=device_label,
+            clear_cuda_allocator_cache_between_attempts=False,
+        )
+
+    def _profile_long_context_prefill_per_layer(
+        self, layer_num: int, context_word_count: int,
+        model_type: str, use_thinking_question: bool,
+        sample_index: int, repeat_num: int,
+        dataset_path: str | Path | None, output_dir: str | Path | None,
+        device_label: str | None, clear_cuda_allocator_cache_between_attempts: bool,
+    ) -> Path:
+        """Implement fixed-input per-layer profiling with an explicit allocator-cache policy.
+
+        Args:
+            self: Profiler configured for local shard weights. 已配置本地权重的 profiler。
+            layer_num: Exact Transformer layer count, in [1, model layer count].
+                从第零层开始精确装载并依次测量的 Transformer 层数。
+            context_word_count: Requested whitespace-delimited context words, capped at the full
+                selected context. 期望截取的空白分隔 context 词数；超过原文时使用完整原文。
+            model_type: Prompt adapter; only llama3.2ins is implemented.
+                Prompt 适配分支，目前仅实现 llama3.2ins。
+            use_thinking_question: Select question_thinking instead of question_nonthinking.
+                是否选择 question_thinking，默认选择 question_nonthinking。
+            sample_index: Zero-based LongBench-Pro record index. LongBench-Pro 样本零基序号。
+            repeat_num: Number of measured full layer traversals after one warm-up.
+                一次完整逐层预热后的正式重复轮数。
+            dataset_path: JSON array path; default is the repository LongBench-Pro dataset.
+                JSON 数组路径；默认使用项目内 LongBench-Pro 数据集。
+            output_dir: Root for a fresh run directory; default is
+                results/profiling/long_context_prefill_per_layer.
+                新建运行子目录的根路径；默认位于 results/profiling/long_context_prefill_per_layer。
+            device_label: Optional portable filename label overriding hardware detection.
+                可选设备标签，覆盖自动生成的文件标签；硬件元数据仍按实际设备记录。
+            clear_cuda_allocator_cache_between_attempts: Whether every completed attempt calls
+                ``torch.cuda.empty_cache()`` before the next attempt. 是否在每个已完成轮次后、
+                下一轮开始前调用 ``torch.cuda.empty_cache()``。
+
+        Returns:
+            Path to the durable per-layer CSV. 持续落盘的逐层时延 CSV 路径。
+
         Each attempt creates a fresh KV cache and traverses the layers in order. Input preparation
         is excluded; each layer interval starts immediately before its decoder-layer call and ends
         after synchronized output completion. Final normalization and LM head are not loaded.
@@ -2499,6 +2607,8 @@ class NodeProfiler:
             raise TypeError("use_thinking_question must be bool")
         if device_label is not None and not isinstance(device_label, str):
             raise TypeError("device_label must be a string or None")
+        if not isinstance(clear_cuda_allocator_cache_between_attempts, bool):
+            raise TypeError("clear_cuda_allocator_cache_between_attempts must be bool")
 
         project_root = Path(__file__).resolve().parents[1]
         dataset_file = (
@@ -2526,9 +2636,14 @@ class NodeProfiler:
             f"{actual_word_count}words.csv"
         )
         metadata_path = csv_path.with_suffix(".json")
+        profile_type = (
+            "long_context_prefill_per_layer"
+            if clear_cuda_allocator_cache_between_attempts
+            else "long_context_prefill_per_layer_reuse_allocator_cache"
+        )
         metadata: dict[str, Any] = {
             "schema_version": 1, "status": "running", "stage": "load_components",
-            "profile_type": "long_context_prefill_per_layer",
+            "profile_type": profile_type,
             "sample_id": sample.get("id", str(sample_index)), "sample_index": sample_index,
             "dataset_path": str(dataset_file.resolve()), "model_type": model_type,
             "shards_path": str(Path(self.shards_path).resolve()), "device_label": label,
@@ -2545,7 +2660,11 @@ class NodeProfiler:
                 "prompt formatting, tokenize, local copy, embedding, RoPE, final norm and LM head excluded"
             ),
             "attention_mask": None, "final_norm_included": False,
-            "lm_head_resident": False, "pending_attempt": None,
+            "lm_head_resident": False,
+            "clear_cuda_allocator_cache_between_attempts": (
+                clear_cuda_allocator_cache_between_attempts
+            ),
+            "pending_attempt": None,
         }
         metadata.update(jetson_info)
         components: dict[str, Any] = {}
@@ -2620,7 +2739,10 @@ class NodeProfiler:
                         flush=True,
                     )
                     gc.collect()
-                    if self.device.type == "cuda":
+                    if (
+                        self.device.type == "cuda"
+                        and clear_cuda_allocator_cache_between_attempts
+                    ):
                         torch.cuda.empty_cache()
                     if result["status"] != "success":
                         return csv_path

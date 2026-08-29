@@ -49,6 +49,21 @@ print(csv_path)
 
 该实验精确加载并按顺序执行 `[0, layer_num)`：先在计时外完成模板、tokenize、本机张量搬运、embedding 和 RoPE，再对每个 Transformer layer 分别执行“同步—开始计时—layer forward—同步—停止计时”。同一轮中的各层使用上一层输出和同一份新 KV Cache；下一轮重新创建 KV。固定输入完整预热一次，随后执行 `repeat_num` 次正式测量。
 
+原方法会在 warmup 和每轮正式遍历后调用 `torch.cuda.empty_cache()`，适合保留偏冷分配口径。若要测量复用 CUDA allocator 显存块后的稳态逐层时延，可改用：
+
+```python
+csv_path = profiler.profile_long_context_prefill_per_layer_reuse_allocator_cache(
+    layer_num=6,
+    context_word_count=2048,
+    model_type="llama3.2ins",
+    use_thinking_question=False,
+    sample_index=0,
+    repeat_num=3,
+)
+```
+
+该方法仍为 warmup 和每轮正式测量分别创建新的 `DynamicCache`，不会复用上一轮 KV 内容；它只保留已释放的 CUDA allocator 显存块供下一轮使用，并在整个实验结束后统一执行 `torch.cuda.empty_cache()`。两种方法使用相同的 CSV 结构和绘图脚本；同名 JSON 中的 `profile_type` 与 `clear_cuda_allocator_cache_between_attempts` 用于区分测试口径。
+
 逐层模式不加载 final norm 和 LM head，即使 `layer_num` 等于模型总层数也是如此。每层边界的同步用于隔离 GPU 工作，因此 `layer_latency_ms` 的总和不能直接视为原始端到端函数的 `prefill_latency_ms`；后者不中断地计入输入准备和可选输出模块。
 
 默认结果目录和文件名为：

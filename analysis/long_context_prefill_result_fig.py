@@ -13,16 +13,21 @@ import json
 import math
 import re
 import statistics
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CSV_PATH = (
-    "results/profiling/long_context_prefill/20260828-003453-_krn076g/long_context_prefill_latency-Quadro_RTX_5000-6layers.csv"
+    "results/profiling/long_context_prefill/20260828-192652-u3ww306j/long_context_prefill_latency-NVIDIA_Jetson_Orin_Nano_Engineering_Reference_Developer_Kit_Super-6layers.csv"
 )
 
 
-def plot_long_context_prefill(csv_path: str | Path, output_path: str | Path | None = None) -> Path:
+def plot_long_context_prefill(
+    csv_path: str | Path,
+    output_path: str | Path | None = None,
+    excluded_input_token_counts: Collection[int] | None = None,
+) -> Path:
     """Plot completed measurements from a full or partially finished profiling run.
 
     Args:
@@ -31,10 +36,13 @@ def plot_long_context_prefill(csv_path: str | Path, output_path: str | Path | No
         output_path: Optional image path, also relative to PROJECT_ROOT when not absolute.
             Defaults to the CSV basename plus .png.
             可选图片路径，相对路径同样以项目根目录为基准；默认与 CSV 同名，后缀为 .png。
+        excluded_input_token_counts: Actual model input token counts omitted from measured series.
+            需要从正式测量系列中排除的实际模型输入 token 数；默认不排除任何点。
     """
     source = Path(csv_path)
     if not source.is_absolute():
         source = PROJECT_ROOT / source
+    excluded_token_counts = set(excluded_input_token_counts or ())
     groups: dict[tuple[bool, int], list[float]] = {}
     full_points: set[tuple[bool, int]] = set()
     completed_ids: set[int] = set()
@@ -62,6 +70,8 @@ def plot_long_context_prefill(csv_path: str | Path, output_path: str | Path | No
                 latency = float(row["prefill_latency_per_layer_ms"])
                 if token_count < 1 or not math.isfinite(latency) or latency < 0:
                     raise ValueError("Invalid numeric measurement")
+                if token_count in excluded_token_counts:
+                    continue
                 if row["include_lm_head"] not in {"True", "False"}:
                     raise ValueError("Invalid include_lm_head")
                 completed_ids.add(attempt_id)

@@ -18,6 +18,10 @@
 
 精确加载 layer_num 层，对 LongBench-Pro 原文前缀翻倍测量。默认普通问题和 llama3.2ins chat template；起始长度仅一次预热。单设备连续计时到 hidden states，完整模型另测 LM head 到首 token。逐行落盘 CSV，并在高内存工作前更新进度 JSON；模型加载前复用一次 Jetson 识别结果生成文件标签，并将内存版本、来源及总内存写入元数据。异常处理中尝试记录错误状态，二次写入失败时向 stderr 输出诊断并继续抛出最初异常。
 
+#### profile_long_context_prefill_per_layer
+
+精确加载 `[0, layer_num)`，从 LongBench-Pro 截取形参指定的 context 词数。完整预热一次后重复执行逐层前向，每轮使用新的共享 KV；每个 attempt 为每个零基层索引保存独立时延行。CSV 和进度 JSON 使用独立运行目录持续落盘，保留设备、模型、输入和 OOM/强制结束诊断信息。
+
 #### _long_context_read_sample
 
 逐块解析 JSON 数组，读取指定零基样本，保留当前记录缓冲区而非整个数据集。
@@ -52,11 +56,15 @@
 
 #### _long_context_load_components
 
-直接加载 tokenizer、embedding、RoPE 和 [0,N) 层；完整模型加载 final norm/head，组件设为 eval。
+直接加载 tokenizer、embedding、RoPE 和 [0,N) 层；端到端测试的完整模型加载 final norm/head，逐层测试通过 `include_output_modules=False` 排除这些输出模块，组件设为 eval。
 
 #### _long_context_run_trial
 
 创建独立 KV，连续测量模板/tokenize、本机张量搬运及前向；停止计时后、释放张量前读显存峰值。完整模型 head 仅计算末位置 logits。
+
+#### _long_context_run_per_layer_trial
+
+先执行模板/tokenize、本机拷贝、embedding 和 RoPE，再按顺序直接调用 shard 中的各 Transformer layer。各层调用前后分别同步设备和读取计时器，使用同一份新 KV Cache；返回每层时延列表，并在全部层计时结束后读取整轮峰值显存。final norm 与 LM head 不参与。
 
 #### profile_max_layer_num
 
@@ -1156,11 +1164,43 @@ Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内�
 
 ### plot_long_context_prefill
 
-读取 CSV 和可选同名 JSON，按实际输入 token 数、hidden-state/LM-head 终点分组，绘制正式重复的中位数及 min/max。函数内直接生成简短设备名，有记录的 Orin 内存版本追加到名称后，并保留输出终点。标记完整原文、确认的停止原因与未完成尝试，支持部分运行结果，返回图片路径。
+读取 CSV 和可选同名 JSON，按实际输入 token 数、hidden-state/LM-head 终点分组，绘制正式重复的中位数及 min/max。可通过 `excluded_input_token_counts` 排除指定实际 token 数的全部正式重复。函数内直接生成简短设备名，有记录的 Orin 内存版本追加到名称后，并保留输出终点。标记完整原文、确认的停止原因与未完成尝试，支持部分运行结果，返回图片路径。
 
 ### main
 
 解析可选 CSV 位置参数和 `--output`，省略 CSV 时使用脚本默认路径，调用绘图函数并打印图片保存位置。模块导入与 `--help` 只加载标准库，matplotlib 在实际绘图时加载。
+
+## analysis/long_context_prefill_per_layer_fig.py
+
+固定长文本输入的逐 Transformer 层时延绘图入口，仅依赖标准库和 matplotlib。读取逐层 CSV 与可选同名 JSON，校验层数、实际 token 数和 context 词数一致，支持已完成正式重复及可用的失败/未完成标记。
+
+### _short_device_name
+
+依据 JSON 的设备标签、Jetson 系列和内存版本生成简短图例；JSON 不可用时从逐层 CSV 文件名回退提取。
+
+### plot_long_context_prefill_per_layer
+
+按零基层索引聚合 `phase=measure`、`status=success` 的 `layer_latency_ms`，绘制各层中位数折线及 min/max 阴影。横轴显示全部已加载层，标题包含固定 context 词数与模板后的实际 token 数；默认将图片保存为 CSV 同目录同主干的 PNG。
+
+### main
+
+解析必需的逐层 CSV 路径和可选 `--output`，调用绘图函数并打印图片保存位置；帮助信息不加载 ML 或绘图库依赖。
+
+## analysis/long_context_prefill_without_last_length_fig.py
+
+单设备长上下文实验的通用末长度去点入口。输入任意同结构 CSV，自动排除最大的成功正式 `context_length` 及其全部实际 token 点；复用通用单设备绘图函数以保持中位数、min/max 阴影、坐标、图例和停止标记一致。
+
+### _last_successful_measurement_token_counts
+
+读取成功正式测量，忽略预热和失败轮次，返回最大的成功 `context_length` 及其对应的全部实际输入 token 数。少于两个可用实验长度时给出明确错误。
+
+### plot_long_context_prefill_without_last_length
+
+接收 CSV 和可选输出路径，自动检测并排除最后一个成功实验长度。默认在输入 CSV 同目录保存 `<CSV 主干>-without-last-length.png`，也可显式覆盖，最后返回实际图片路径。
+
+### main
+
+解析必需的 CSV 位置参数和可选 `--output`，调用末长度去点函数并打印排除信息及图片保存位置。
 
 ## analysis/long_context_prefill_comparison_fig.py
 
@@ -1205,6 +1245,10 @@ NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测�
 ### load_plot_module
 
 按 `filename` 从 `analysis/` 加载独立绘图模块，仅依赖其标准库导入；默认加载单设备脚本，也支持对比脚本。
+
+### plot_per_layer_with_mocked_backend
+
+使用记录调用的 matplotlib 替身执行逐层绘图函数，验证数据聚合、图形参数、输出位置和资源关闭，无需安装或启动真实 ML 模型。
 
 ### make_profiler
 

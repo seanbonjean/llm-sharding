@@ -117,10 +117,19 @@ def make_profiler(module: types.ModuleType, model_layers: int = 4) -> Any:
     profiler.dtype = "float16"
     profiler.shards_path = "test-weights"
     profiler._long_context_load_components = mock.Mock(
-        side_effect=lambda layer_num: {"shard": types.SimpleNamespace(config=profiler.config)},
+        side_effect=lambda layer_num, include_output_modules=True: {
+            "shard": types.SimpleNamespace(
+                config=profiler.config, layers=[object() for _ in range(layer_num)],
+            ),
+        },
     )
     profiler._long_context_run_trial = mock.Mock(return_value={
         "status": "success", "input_token_count": 12, "prefill_latency_ms": 8.0,
+    })
+    profiler._long_context_run_per_layer_trial = mock.Mock(side_effect=lambda components, *arguments: {
+        "status": "success", "input_token_count": 12,
+        "layer_latencies_ms": [float(index + 1) for index in range(len(components["shard"].layers))],
+        "failure_stage": "", "layer_index": None,
     })
     return profiler
 
@@ -148,12 +157,41 @@ def read_rows(path: Path) -> list[dict[str, str]]:
 
 def plot_with_mocked_backend(
     module: types.ModuleType, csv_path: Path, output_path: Path | None = None,
+    excluded_input_token_counts: set[int] | None = None,
 ) -> tuple[Path, Any, Any, Any]:
     """Exercise CSV processing with a recording plotting backend.
 
     Args:
         module: Standalone plotting module. 独立绘图模块。
         csv_path: Input CSV, optionally accompanied by metadata. 输入 CSV 及可选元数据。
+        output_path: Optional explicit figure destination. 可选的显式图片输出路径。
+        excluded_input_token_counts: Actual input token counts omitted from the plotted series.
+            从绘图系列中排除的实际输入 token 数。
+    """
+    pyplot = types.ModuleType("matplotlib.pyplot")
+    figure, axis = mock.MagicMock(), mock.MagicMock()
+    pyplot.subplots = mock.Mock(return_value=(figure, axis))
+    pyplot.close = mock.Mock()
+    matplotlib = types.ModuleType("matplotlib")
+    matplotlib.use = mock.Mock()
+    matplotlib.pyplot = pyplot
+    with mock.patch.dict(sys.modules, {"matplotlib": matplotlib, "matplotlib.pyplot": pyplot}):
+        output = module.plot_long_context_prefill(
+            csv_path,
+            output_path=output_path,
+            excluded_input_token_counts=excluded_input_token_counts,
+        )
+    return output, figure, axis, pyplot
+
+
+def plot_per_layer_with_mocked_backend(
+    module: types.ModuleType, csv_path: Path, output_path: Path | None = None,
+) -> tuple[Path, Any, Any, Any]:
+    """Exercise per-layer CSV plotting with a recording matplotlib replacement.
+
+    Args:
+        module: Standalone per-layer plotting module. 独立逐层绘图模块。
+        csv_path: Per-layer profiling CSV and optional metadata. 逐层测量 CSV 及可选元数据。
         output_path: Optional explicit figure destination. 可选的显式图片输出路径。
     """
     pyplot = types.ModuleType("matplotlib.pyplot")
@@ -164,7 +202,7 @@ def plot_with_mocked_backend(
     matplotlib.use = mock.Mock()
     matplotlib.pyplot = pyplot
     with mock.patch.dict(sys.modules, {"matplotlib": matplotlib, "matplotlib.pyplot": pyplot}):
-        output = module.plot_long_context_prefill(csv_path, output_path=output_path)
+        output = module.plot_long_context_prefill_per_layer(csv_path, output_path=output_path)
     return output, figure, axis, pyplot
 
 
@@ -216,6 +254,21 @@ class LongContextTests(unittest.TestCase):
                          initial_context_length=2, repeat_num=2)
         arguments.update(overrides)
         return self.profiler.profile_long_context_prefill(**arguments)
+
+    def run_per_layer_profile(self, **overrides: Any) -> Path:
+        """Run fixed-word per-layer profiling with dependency-free defaults.
+
+        Args:
+            self: Test instance containing the profiler and temporary paths. 持有 profiler 与临时路径。
+            overrides: Named arguments replacing the default per-layer configuration.
+                覆盖默认逐层实验配置的命名参数。
+        """
+        arguments = dict(
+            layer_num=2, context_word_count=3, dataset_path=self.dataset,
+            output_dir=self.directory, repeat_num=2,
+        )
+        arguments.update(overrides)
+        return self.profiler.profile_long_context_prefill_per_layer(**arguments)
 
     def test_streamed_selection_and_unicode(self) -> None:
         """Select records across tiny UTF-8 chunks without decoding the later record. 验证流式选样本。"""
@@ -289,6 +342,143 @@ class LongContextTests(unittest.TestCase):
                 self.assertEqual(components["lm_head"] is not None, layer_count == 4)
         self.module.torch.nn.Linear.assert_called_once_with(8, 128, bias=False)
         self.module.NodeWorker.assert_not_called()
+
+    def test_component_loading_can_exclude_full_model_output_modules(self) -> None:
+        """Keep final norm and LM head absent when a full model is loaded only for layer timing.
+        self 为当前测试实例；全模型逐层计时时不加载 final norm 与 LM head。
+        """
+        self.profiler.config.vocab_size = 128
+        self.profiler.config.hidden_size = 8
+        self.module.torch.nn = types.SimpleNamespace(Embedding=mock.Mock(), Linear=mock.Mock())
+        self.module.torch.load = mock.Mock(return_value={"weight": "fixture"})
+        components = self.module.NodeProfiler._long_context_load_components(
+            self.profiler, 4, include_output_modules=False,
+        )
+        self.assertIsNone(components["lm_head"])
+        self.assertFalse(self.module.LlamaShardPart.call_args.kwargs["add_final_norm"])
+        self.module.torch.nn.Linear.assert_not_called()
+
+    def test_per_layer_profile_fixed_words_and_rows(self) -> None:
+        """Warm once and persist one timing row per layer for every fixed-word traversal.
+        self 为当前测试实例；固定词数预热一次，每轮为每个 Transformer 层写一行。
+        """
+        result = self.run_per_layer_profile()
+        rows = read_rows(result)
+        self.profiler._long_context_load_components.assert_called_once_with(
+            2, include_output_modules=False,
+        )
+        self.assertEqual(len(rows), 6)
+        self.assertEqual([row["phase"] for row in rows], ["warmup", "warmup", *["measure"] * 4])
+        self.assertEqual([int(row["layer_index"]) for row in rows], [0, 1, 0, 1, 0, 1])
+        self.assertEqual([float(row["layer_latency_ms"]) for row in rows], [1, 2, 1, 2, 1, 2])
+        self.assertTrue(all(row["context_word_count"] == "3" for row in rows))
+        measured_prefix = self.profiler._long_context_run_per_layer_trial.call_args_list[0].args[1]
+        self.assertEqual(measured_prefix, "one\n two\tthree")
+        metadata = json.loads(result.with_suffix(".json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["status"], "completed")
+        self.assertEqual(metadata["context_word_count_requested"], 3)
+        self.assertFalse(metadata["final_norm_included"])
+        self.assertFalse(metadata["lm_head_resident"])
+        self.assertTrue(result.name.startswith("long_context_prefill_per_layer_latency-"))
+
+    def test_per_layer_profile_validation_and_oom_row(self) -> None:
+        """Validate fixed-word settings and retain a catchable failed traversal after warm-up.
+        self 为当前测试实例；校验逐层参数，并在预热后保存可捕获的 OOM 失败轮次。
+        """
+        for values, error in (
+            ({"layer_num": 5}, ValueError), ({"layer_num": True}, ValueError),
+            ({"context_word_count": 0}, ValueError), ({"context_word_count": True}, ValueError),
+            ({"repeat_num": 0}, ValueError), ({"model_type": "future-model"}, NotImplementedError),
+            ({"use_thinking_question": 1}, TypeError), ({"device_label": 7}, TypeError),
+        ):
+            with self.subTest(values=values), self.assertRaises(error):
+                self.run_per_layer_profile(**values)
+        successful_warmup = {
+            "status": "success", "input_token_count": 12,
+            "layer_latencies_ms": [1.0, 2.0], "failure_stage": "", "layer_index": None,
+        }
+        self.profiler._long_context_run_per_layer_trial.side_effect = [
+            successful_warmup, FakeOutOfMemoryError("allocation failed"),
+        ]
+        result = self.run_per_layer_profile(repeat_num=1)
+        rows = read_rows(result)
+        self.assertEqual([row["status"] for row in rows], ["success", "success", "oom"])
+        self.assertEqual(rows[-1]["layer_latency_ms"], "")
+        self.assertEqual(json.loads(result.with_suffix(".json").read_text())["stop_reason"], "oom")
+
+    def test_per_layer_trial_timer_boundaries(self) -> None:
+        """Synchronize and time each ordered decoder layer while excluding input preparation.
+        self 为当前测试实例；逐层同步计时，并将输入准备排除在各层时延之外。
+        """
+        events: list[str] = []
+
+        class Tensor:
+            """Provide the minimal tensor shape and transfer used by the trial. 提供最小张量接口。"""
+
+            def __init__(self, shape: tuple[int, ...]) -> None:
+                """Store a test shape.
+
+                Args:
+                    self: Tensor test double. 张量替身。
+                    shape: Shape exposed to production code. 向生产代码暴露的形状。
+                """
+                self.shape = shape
+
+            def to(self, **options: Any) -> Tensor:
+                """Record a local device copy.
+
+                Args:
+                    self: Tensor test double returned unchanged. 原样返回的张量替身。
+                    options: Device and dtype selected by production code. 生产代码选择的设备与精度。
+                """
+                events.append("transfer")
+                return self
+
+        input_ids = Tensor((1, 12))
+        hidden_states = Tensor((1, 12, 8))
+
+        def run_layer(layer_name: str) -> tuple[Tensor]:
+            """Record one decoder-layer invocation and return its hidden states.
+
+            Args:
+                layer_name: Stable name identifying the test layer. 标识测试层的稳定名称。
+            """
+            events.append(layer_name)
+            return (hidden_states,)
+
+        layers = [
+            mock.Mock(side_effect=lambda **kwargs: run_layer("layer0")),
+            mock.Mock(side_effect=lambda **kwargs: run_layer("layer1")),
+        ]
+        components = {
+            "tokenizer": types.SimpleNamespace(
+                apply_chat_template=mock.Mock(side_effect=lambda *args, **kwargs: events.append("tokenize") or input_ids),
+            ),
+            "embedding": mock.Mock(side_effect=lambda *args: events.append("embedding") or hidden_states),
+            "rope": mock.Mock(side_effect=lambda *args: events.append("rope") or (hidden_states, hidden_states)),
+            "shard": types.SimpleNamespace(layers=layers),
+        }
+        self.module.build_position_ids = mock.Mock(return_value=input_ids)
+        self.profiler.device.type = "cuda"
+        self.profiler._synchronize_device = mock.Mock(side_effect=lambda: events.append("sync"))
+        self.profiler._long_context_cuda_stat = mock.Mock(return_value=100)
+        timer_values = iter((1.0, 1.003, 2.0, 2.004))
+        with mock.patch.object(
+            self.module.time, "perf_counter", side_effect=lambda: events.append("timer") or next(timer_values),
+        ):
+            result = self.module.NodeProfiler._long_context_run_per_layer_trial(
+                self.profiler, components, "context", "question", "llama3.2ins", {},
+            )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["layer_latencies_ms"]), 2)
+        self.assertAlmostEqual(result["layer_latencies_ms"][0], 3.0)
+        self.assertAlmostEqual(result["layer_latencies_ms"][1], 4.0)
+        self.assertEqual(events.count("timer"), 4)
+        self.assertEqual(events.count("sync"), 5)
+        self.assertLess(events.index("embedding"), events.index("timer"))
+        self.assertEqual([event for event in events if event.startswith("layer")], ["layer0", "layer1"])
+        for layer in layers:
+            self.assertIsNone(layer.call_args.kwargs["attention_mask"])
 
     def test_thinking_selection_and_chinese_auto_unit(self) -> None:
         """Choose the thinking field and character units from explicit metadata. 验证问题与语言选项。"""
@@ -1001,6 +1191,111 @@ class LongContextTests(unittest.TestCase):
         self.assertEqual(axis.fill_between.call_count, 2)
         figure.savefig.assert_called_once_with(output, dpi=150)
         pyplot.close.assert_called_once_with(figure)
+
+    def test_plot_excludes_selected_actual_token_count(self) -> None:
+        """Omit every repeat of a selected token point while preserving the remaining style.
+        self 为当前测试实例；排除指定 token 点的全部重复，并保留其余绘图行为。
+        """
+        result = self.run_profile(initial_context_length=999, repeat_num=1)
+        rows = read_rows(result)
+        retained_row = dict(rows[-1])
+        retained_row["attempt_id"] = str(max(int(row["attempt_id"]) for row in rows) + 1)
+        retained_row["input_token_count"] = "13"
+        with result.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows([*rows, retained_row])
+
+        _, _, axis, _ = plot_with_mocked_backend(
+            self.plot_module, result, excluded_input_token_counts={12},
+        )
+        self.assertEqual(axis.plot.call_args.args[0], [13])
+        self.assertEqual(axis.fill_between.call_args.args[0], [13])
+
+    def test_without_last_length_plot_detects_input_and_output(self) -> None:
+        """Exclude the largest successful length and derive the output beside any input CSV.
+        self 为当前测试实例；从任意 CSV 检出最大成功长度，并在输入目录生成默认输出路径。
+        """
+        module = load_plot_module("long_context_prefill_without_last_length_fig.py")
+        source = self.directory / "arbitrary-run" / "latency.csv"
+        source.parent.mkdir()
+        with source.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=["phase", "status", "context_length", "input_token_count"],
+            )
+            writer.writeheader()
+            writer.writerows([
+                {"phase": "warmup", "status": "success", "context_length": 32, "input_token_count": 179},
+                {"phase": "measure", "status": "success", "context_length": 32, "input_token_count": 179},
+                {"phase": "measure", "status": "success", "context_length": 64, "input_token_count": 214},
+                {"phase": "measure", "status": "success", "context_length": 64, "input_token_count": 215},
+                {"phase": "measure", "status": "oom", "context_length": 128, "input_token_count": 288},
+            ])
+        expected_output = source.with_name("latency-without-last-length.png")
+        with mock.patch.object(module, "plot_long_context_prefill", return_value=expected_output) as plot:
+            result = module.plot_long_context_prefill_without_last_length(source)
+        self.assertEqual(result, expected_output)
+        plot.assert_called_once_with(
+            source,
+            output_path=expected_output,
+            excluded_input_token_counts=frozenset({214, 215}),
+        )
+
+    def test_per_layer_plot_statistics_and_labels(self) -> None:
+        """Plot layer medians and min/max intervals with fixed-input metadata.
+        self 为当前测试实例；绘制各层中位数、最小/最大区间及固定输入信息。
+        """
+        module = load_plot_module("long_context_prefill_per_layer_fig.py")
+        source = self.directory / "long_context_prefill_per_layer_latency-Quadro_RTX_5000-2layers-64words.csv"
+        fieldnames = [
+            "attempt_id", "phase", "status", "context_word_count", "input_token_count",
+            "loaded_layer_count", "layer_index", "layer_latency_ms",
+        ]
+        with source.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows([
+                {"attempt_id": 1, "phase": "warmup", "status": "success", "context_word_count": 64,
+                 "input_token_count": 214, "loaded_layer_count": 2, "layer_index": 0, "layer_latency_ms": 9},
+                {"attempt_id": 1, "phase": "warmup", "status": "success", "context_word_count": 64,
+                 "input_token_count": 214, "loaded_layer_count": 2, "layer_index": 1, "layer_latency_ms": 10},
+                {"attempt_id": 2, "phase": "measure", "status": "success", "context_word_count": 64,
+                 "input_token_count": 214, "loaded_layer_count": 2, "layer_index": 0, "layer_latency_ms": 2},
+                {"attempt_id": 2, "phase": "measure", "status": "success", "context_word_count": 64,
+                 "input_token_count": 214, "loaded_layer_count": 2, "layer_index": 1, "layer_latency_ms": 4},
+                {"attempt_id": 3, "phase": "measure", "status": "success", "context_word_count": 64,
+                 "input_token_count": 214, "loaded_layer_count": 2, "layer_index": 0, "layer_latency_ms": 6},
+                {"attempt_id": 3, "phase": "measure", "status": "success", "context_word_count": 64,
+                 "input_token_count": 214, "loaded_layer_count": 2, "layer_index": 1, "layer_latency_ms": 8},
+            ])
+        source.with_suffix(".json").write_text(
+            json.dumps({"device_label": "Quadro_RTX_5000"}), encoding="utf-8",
+        )
+        output, figure, axis, pyplot = plot_per_layer_with_mocked_backend(module, source)
+        self.assertEqual(output, source.with_suffix(".png"))
+        self.assertEqual(axis.plot.call_args.args[:2], ([0, 1], [4.0, 6.0]))
+        self.assertEqual(axis.fill_between.call_args.args[:3], ([0, 1], [2.0, 4.0], [6.0, 8.0]))
+        self.assertEqual(axis.plot.call_args.kwargs["label"], "Quadro RTX 5000 | 2 layers")
+        self.assertIn("64 context words / 214 input tokens", axis.set_title.call_args.args[0])
+        figure.savefig.assert_called_once_with(output, dpi=150)
+        pyplot.close.assert_called_once_with(figure)
+
+    def test_per_layer_plot_help_without_ml_dependencies(self) -> None:
+        """Run the per-layer plotting CLI help without torch, transformers or matplotlib.
+        self 为当前测试实例；在无 ML/绘图库依赖时运行逐层绘图帮助。
+        """
+        probe = (
+            "import runpy, sys; "
+            "sys.modules.update({name: None for name in ('torch', 'transformers', 'utils', 'matplotlib', 'numpy')}); "
+            "sys.argv = [sys.argv[1], '--help']; runpy.run_path(sys.argv[0], run_name='__main__')"
+        )
+        process = subprocess.run(
+            [sys.executable, "-B", "-c", probe,
+             str(PROJECT_ROOT / "analysis/long_context_prefill_per_layer_fig.py")],
+            cwd=self.directory, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("csv_path", process.stdout)
 
     def test_plot_incomplete_tail_and_pending_attempt(self) -> None:
         """Plot durable rows and annotate unfinished work without asserting OOM. 绘制已完成记录并标记未完成轮次。"""

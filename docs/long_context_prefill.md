@@ -29,6 +29,45 @@ print(csv_path)
 
 默认从 `datasets/LongBench-Pro/longbench_pro.json` 按零基 `sample_index` 流式读取一条记录，只在内存中保留当前读取的记录/缓冲区，不一次加载整个数据集数组。可以通过 `dataset_path` 指定其他同结构的 JSON 数组。
 
+### 固定输入的逐层时延
+
+需要观察不同 Transformer 层的实际时延时，使用相同的 profiler：
+
+```python
+csv_path = profiler.profile_long_context_prefill_per_layer(
+    layer_num=6,
+    context_word_count=2048,
+    model_type="llama3.2ins",
+    use_thinking_question=False,
+    sample_index=0,
+    repeat_num=3,
+)
+print(csv_path)
+```
+
+`context_word_count` 指定从 `context` 开头保留的空白分隔词数；超过样本总词数时使用完整 context，并在 JSON 同时记录请求词数和实际词数。完整 question 与 chat template 仍全部保留，实际模型输入长度记录在 `input_token_count`。
+
+该实验精确加载并按顺序执行 `[0, layer_num)`：先在计时外完成模板、tokenize、本机张量搬运、embedding 和 RoPE，再对每个 Transformer layer 分别执行“同步—开始计时—layer forward—同步—停止计时”。同一轮中的各层使用上一层输出和同一份新 KV Cache；下一轮重新创建 KV。固定输入完整预热一次，随后执行 `repeat_num` 次正式测量。
+
+逐层模式不加载 final norm 和 LM head，即使 `layer_num` 等于模型总层数也是如此。每层边界的同步用于隔离 GPU 工作，因此 `layer_latency_ms` 的总和不能直接视为原始端到端函数的 `prefill_latency_ms`；后者不中断地计入输入准备和可选输出模块。
+
+默认结果目录和文件名为：
+
+```text
+results/profiling/long_context_prefill_per_layer/<运行目录>/
+long_context_prefill_per_layer_latency-<设备型号>-<N>layers-<实际词数>words.csv
+```
+
+CSV 中一个完整 attempt 为每个 `layer_index` 保存一行。`layer_index` 为零基索引，`layer_latency_ms` 为该层同步完成的毫秒时延；`peak_cuda_allocated_bytes` 和 `peak_cuda_reserved_bytes` 是整轮结束后读取的 trial 级峰值，会重复写入该轮的各层行。warmup 行保留但不参与绘图。失败行不包含单层时延；若捕获到 OOM，会记录发生时的层索引和阶段。JSON 的持久化、设备识别和强制结束语义与端到端长上下文实验一致。
+
+绘图命令：
+
+```bash
+python analysis/long_context_prefill_per_layer_fig.py "<逐层结果 CSV 路径>"
+```
+
+图中横轴为零基层索引，纵轴为单层 prefill 时延；折线是正式重复的中位数，阴影是 min/max。默认 PNG 与 CSV 同名同目录，可用 `--output` 指定其他位置。
+
 ## 输入规则与终止条件
 
 选择 `context` 和完整的 `question_nonthinking`，`use_thinking_question=True` 时选择 `question_thinking`。数据中的 `answer` 不参与输入。拼接内容为：
@@ -55,7 +94,7 @@ print(csv_path)
 - `prefill_latency_ms` 为整个连续区间的毫秒数；`prefill_latency_per_layer_ms = prefill_latency_ms / loaded_layer_count`，包含输入/输出开销的层均摊值。
 - CUDA 计时前同步并重置峰值统计；完成输出、同步、停止计时后，先读取峰值，再释放张量和 KV。统计包括常驻权重和该轮峰值，CPU/不可用计数器留空。PyTorch allocated/reserved 并不等于设备总内存或 Jetson 系统 RAM 峰值。
 
-当前前向沿用 `LlamaShardPart` 的掩码行为。解释结果前请阅读 [attention mask 优先事项](TODO.md)。
+端到端与逐层长上下文前向目前均使用 `attention_mask=None`。解释结果前请阅读 [attention mask 优先事项](TODO.md)。
 
 ## 文件与字段
 

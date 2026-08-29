@@ -48,6 +48,14 @@ class NodeProfiler:
         "peak_cuda_allocated_bytes", "peak_cuda_reserved_bytes",
         "first_token_id", "failure_stage", "error",
     )
+    LONG_CONTEXT_PER_LAYER_CSV_FIELDS = (
+        "attempt_id", "sample_id", "phase", "repeat_index", "model_type",
+        "question_type", "context_length_unit", "context_length",
+        "context_word_count", "context_char_count", "input_token_count",
+        "loaded_layer_count", "layer_index", "layer_latency_ms",
+        "is_full_context", "status", "peak_cuda_allocated_bytes",
+        "peak_cuda_reserved_bytes", "failure_stage", "error",
+    )
 
 
     def __init__(self, shards_path: str, device="cpu", dtype=torch.float16):
@@ -2070,13 +2078,17 @@ class NodeProfiler:
         except Exception:
             return None
 
-    def _long_context_load_components(self, layer_num: int) -> dict[str, Any]:
+    def _long_context_load_components(
+        self, layer_num: int, include_output_modules: bool = True,
+    ) -> dict[str, Any]:
         """Load an exact local prefix of layers and the required input/output modules.
 
         Args:
             self: Profiler with model configuration and weights. 持有配置和权重路径。
             layer_num: Exact number of Transformer layers, starting at zero.
                 从第零层开始精确装载的 Transformer 层数。
+            include_output_modules: Load final normalization and LM head when all model layers
+                are selected. 全模型时是否加载 final norm 与 LM head；逐层计时不需要输出模块。
         """
         components: dict[str, Any] = {}
         components["tokenizer"] = AutoTokenizer.from_pretrained(self.shards_path)
@@ -2088,7 +2100,7 @@ class NodeProfiler:
         ))
         components["embedding"] = embedding.eval()
         components["rope"] = LlamaRotaryEmbedding(config=self.config, device=self.device).to(self.device).eval()
-        full_model = layer_num == self.layer_num
+        full_model = include_output_modules and layer_num == self.layer_num
         components["shard"] = LlamaShardPart(
             self.shards_path, [f"block_{index}.pth" for index in range(layer_num)],
             0, layer_num, device=self.device, dtype=self.dtype,
@@ -2177,6 +2189,87 @@ class NodeProfiler:
                 }
         finally:
             input_ids = hidden_states = position_ids = cos = sin = logits = token = None
+            past_key_value = None
+
+    def _long_context_run_per_layer_trial(
+        self, components: dict[str, Any], context_prefix: str, question: str,
+        model_type: str, attempt_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Time each Transformer layer separately during one ordered prefill traversal.
+
+        Args:
+            self: Profiler providing device synchronization and model limits.
+                提供设备同步和模型长度限制的 profiler。
+            components: Resident tokenizer, embedding, RoPE and Transformer shard.
+                常驻 tokenizer、embedding、RoPE 与 Transformer 分片。
+            context_prefix: Fixed word-truncated document prefix. 固定词数截断后的原文前缀。
+            question: Complete selected question. 完整的问题文本。
+            model_type: Prompt-format selector; currently llama3.2ins. 模板分支标识。
+            attempt_state: In-memory token count, layer index and failure stage for diagnostics.
+                诊断所需的 token 数、层索引和失败阶段；计时区间内不写盘。
+
+        Tokenization, local copy, embedding and RoPE run before layer timers. Every layer uses
+        the preceding layer's output and one shared fresh KV cache. CUDA is synchronized at each
+        layer boundary, so these values intentionally differ from uninterrupted end-to-end timing.
+        tokenize、本机拷贝、embedding 与 RoPE 位于逐层计时外；各层依次使用上一层输出和同一份新 KV。
+        每层边界均执行 CUDA 同步，因此该口径与不中断的端到端计时不同。
+        """
+        if model_type != "llama3.2ins":
+            raise NotImplementedError(f"Unsupported model_type: {model_type}")
+        input_ids = hidden_states = position_ids = cos = sin = layer_outputs = None
+        past_key_value = DynamicCache()
+        try:
+            with torch.inference_mode():
+                self._synchronize_device()
+                if self.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                attempt_state["failure_stage"] = "tokenize"
+                input_ids = components["tokenizer"].apply_chat_template(
+                    [{"role": "user", "content": f"{context_prefix}\n\n\n\n{question}"}],
+                    tokenize=True, add_generation_prompt=True, return_tensors="pt",
+                    truncation=False,
+                )
+                token_count = int(input_ids.shape[-1])
+                attempt_state["input_token_count"] = token_count
+                if token_count > int(self.config.max_position_embeddings):
+                    return {
+                        "status": "context_limit", "input_token_count": token_count,
+                        "layer_index": None, "failure_stage": "context_limit",
+                    }
+                attempt_state["failure_stage"] = "local_input_copy"
+                input_ids = input_ids.to(device=self.device, dtype=torch.long)
+                attempt_state["failure_stage"] = "embedding"
+                hidden_states = components["embedding"](input_ids)
+                attempt_state["failure_stage"] = "rope"
+                position_ids = build_position_ids(past_key_value, token_count, self.device, batch_size=1)
+                cos, sin = components["rope"](hidden_states, position_ids)
+                layer_latencies_ms: list[float] = []
+                for layer_index, layer in enumerate(components["shard"].layers):
+                    attempt_state["layer_index"] = layer_index
+                    attempt_state["failure_stage"] = "layer_forward"
+                    self._synchronize_device()
+                    started = time.perf_counter()
+                    layer_outputs = layer(
+                        hidden_states=hidden_states,
+                        attention_mask=None,
+                        past_key_value=past_key_value,
+                        position_embeddings=(cos, sin),
+                        use_cache=True,
+                    )
+                    hidden_states = layer_outputs[0]
+                    self._synchronize_device()
+                    layer_latencies_ms.append((time.perf_counter() - started) * 1000.0)
+                # Read trial-level peaks after every layer timer has stopped and before releasing KV/output.
+                # 全部单层计时结束后、释放 KV/输出前读取整轮峰值；该统计不归属于某个单独层。
+                return {
+                    "status": "success", "input_token_count": token_count,
+                    "layer_latencies_ms": layer_latencies_ms,
+                    "peak_cuda_allocated_bytes": self._long_context_cuda_stat("max_memory_allocated"),
+                    "peak_cuda_reserved_bytes": self._long_context_cuda_stat("max_memory_reserved"),
+                    "failure_stage": "", "layer_index": None,
+                }
+        finally:
+            input_ids = hidden_states = position_ids = cos = sin = layer_outputs = None
             past_key_value = None
 
     def profile_long_context_prefill(
@@ -2343,6 +2436,204 @@ class NodeProfiler:
                 except Exception as metadata_error:
                     # Error reporting must preserve the original failure and its traceback.
                     # 记录错误状态失败时，仍保留最初异常及其堆栈。
+                    print(
+                        f"[PROFILE] Could not save error metadata to {metadata_path}: {metadata_error}. "
+                        "The original profiling error follows.",
+                        file=sys.stderr, flush=True,
+                    )
+                raise
+            finally:
+                components.clear()
+                gc.collect()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+        return csv_path
+
+    def profile_long_context_prefill_per_layer(
+        self, layer_num: int, context_word_count: int,
+        model_type: str = "llama3.2ins", use_thinking_question: bool = False,
+        sample_index: int = 0, repeat_num: int = 3,
+        dataset_path: str | Path | None = None, output_dir: str | Path | None = None,
+        device_label: str | None = None,
+    ) -> Path:
+        """Profile every loaded Transformer layer at one fixed LongBench-Pro word length.
+
+        Args:
+            self: Profiler configured for local shard weights. 已配置本地权重的 profiler。
+            layer_num: Exact Transformer layer count, in [1, model layer count].
+                从第零层开始精确装载并依次测量的 Transformer 层数。
+            context_word_count: Requested whitespace-delimited context words, capped at the full
+                selected context. 期望截取的空白分隔 context 词数；超过原文时使用完整原文。
+            model_type: Prompt adapter; only llama3.2ins is implemented.
+                Prompt 适配分支，目前仅实现 llama3.2ins。
+            use_thinking_question: Select question_thinking instead of question_nonthinking.
+                是否选择 question_thinking，默认选择 question_nonthinking。
+            sample_index: Zero-based LongBench-Pro record index. LongBench-Pro 样本零基序号。
+            repeat_num: Number of measured full layer traversals after one warm-up.
+                一次完整逐层预热后的正式重复轮数。
+            dataset_path: JSON array path; default is the repository LongBench-Pro dataset.
+                JSON 数组路径；默认使用项目内 LongBench-Pro 数据集。
+            output_dir: Root for a fresh run directory; default is
+                results/profiling/long_context_prefill_per_layer.
+                新建运行子目录的根路径；默认位于 results/profiling/long_context_prefill_per_layer。
+            device_label: Optional portable filename label overriding hardware detection.
+                可选设备标签，覆盖自动生成的文件标签；硬件元数据仍按实际设备记录。
+
+        Each attempt creates a fresh KV cache and traverses the layers in order. Input preparation
+        is excluded; each layer interval starts immediately before its decoder-layer call and ends
+        after synchronized output completion. Final normalization and LM head are not loaded.
+        每轮使用新的 KV Cache 并按顺序运行各层。输入准备位于计时外；每层从调用 decoder layer
+        前开始，到同步确认该层输出完成后结束。该实验不加载 final norm 和 LM head。
+        """
+        if model_type != "llama3.2ins":
+            raise NotImplementedError(f"Unsupported model_type: {model_type}")
+        for name, value, minimum in (
+            ("layer_num", layer_num, 1), ("context_word_count", context_word_count, 1),
+            ("sample_index", sample_index, 0), ("repeat_num", repeat_num, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        if layer_num > self.layer_num:
+            raise ValueError("layer_num exceeds the model's Transformer layer count")
+        if not isinstance(use_thinking_question, bool):
+            raise TypeError("use_thinking_question must be bool")
+        if device_label is not None and not isinstance(device_label, str):
+            raise TypeError("device_label must be a string or None")
+
+        project_root = Path(__file__).resolve().parents[1]
+        dataset_file = (
+            Path(dataset_path) if dataset_path is not None
+            else project_root / "datasets/LongBench-Pro/longbench_pro.json"
+        )
+        sample = self._long_context_read_sample(dataset_file, sample_index)
+        question_type = "question_thinking" if use_thinking_question else "question_nonthinking"
+        for field in ("context", question_type):
+            if not isinstance(sample.get(field), str) or not sample[field].strip():
+                raise ValueError(f"Sample field {field!r} must contain nonempty text")
+        context_prefix, actual_word_count, is_full_context = next(
+            self._long_context_prefixes(sample["context"], context_word_count, "words"),
+        )
+        root = (
+            Path(output_dir) if output_dir is not None
+            else project_root / "results/profiling/long_context_prefill_per_layer"
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-"), dir=root))
+        jetson_info = self._long_context_jetson_info()
+        label = self._long_context_device_label(device_label, jetson_info=jetson_info)
+        csv_path = run_dir / (
+            f"long_context_prefill_per_layer_latency-{label}-{layer_num}layers-"
+            f"{actual_word_count}words.csv"
+        )
+        metadata_path = csv_path.with_suffix(".json")
+        metadata: dict[str, Any] = {
+            "schema_version": 1, "status": "running", "stage": "load_components",
+            "profile_type": "long_context_prefill_per_layer",
+            "sample_id": sample.get("id", str(sample_index)), "sample_index": sample_index,
+            "dataset_path": str(dataset_file.resolve()), "model_type": model_type,
+            "shards_path": str(Path(self.shards_path).resolve()), "device_label": label,
+            "device": str(self.device), "dtype": str(self.dtype), "layer_num": layer_num,
+            "model_layer_count": self.layer_num, "question_type": question_type,
+            "context_length_unit": "words", "context_word_count_requested": context_word_count,
+            "context_word_count": actual_word_count, "context_char_count": len(context_prefix),
+            "is_full_context": is_full_context, "repeat_num": repeat_num, "warmup_count": 1,
+            "max_position_embeddings": int(self.config.max_position_embeddings),
+            "torch_version": str(getattr(torch, "__version__", "unknown")),
+            "timing_scope": "individual_transformer_layer_call_to_synchronized_output",
+            "layer_timing_definition": (
+                "ordered prefill with a fresh shared KV cache; synchronize before/after each layer; "
+                "prompt formatting, tokenize, local copy, embedding, RoPE, final norm and LM head excluded"
+            ),
+            "attention_mask": None, "final_norm_included": False,
+            "lm_head_resident": False, "pending_attempt": None,
+        }
+        metadata.update(jetson_info)
+        components: dict[str, Any] = {}
+        print(f"[PROFILE] per-layer results: {csv_path}", flush=True)
+        with csv_path.open("x", encoding="utf-8", newline="") as csv_stream:
+            writer = csv.DictWriter(csv_stream, fieldnames=self.LONG_CONTEXT_PER_LAYER_CSV_FIELDS)
+            writer.writeheader()
+            csv_stream.flush()
+            os.fsync(csv_stream.fileno())
+            self._long_context_write_metadata(metadata_path, metadata)
+            try:
+                components = self._long_context_load_components(
+                    layer_num, include_output_modules=False,
+                )
+                loaded_layers = getattr(components["shard"], "layers", ())
+                if len(loaded_layers) != layer_num:
+                    raise RuntimeError("Loaded Transformer layer count does not match layer_num")
+                metadata["attention_implementation"] = str(getattr(
+                    getattr(components["shard"], "config", self.config),
+                    "_attn_implementation", "unknown",
+                ))
+                metadata["stage"] = "per_layer_prefill"
+                attempts = [("warmup", 0), *[("measure", repeat) for repeat in range(1, repeat_num + 1)]]
+                for attempt_number, (phase, repeat_index) in enumerate(attempts, start=1):
+                    base_row: dict[str, Any] = {
+                        "attempt_id": attempt_number, "sample_id": metadata["sample_id"],
+                        "phase": phase, "repeat_index": repeat_index, "model_type": model_type,
+                        "question_type": question_type, "context_length_unit": "words",
+                        "context_length": actual_word_count,
+                        "context_word_count": actual_word_count,
+                        "context_char_count": len(context_prefix), "input_token_count": None,
+                        "loaded_layer_count": layer_num, "layer_index": None,
+                        "layer_latency_ms": None, "is_full_context": is_full_context,
+                        "status": "started",
+                    }
+                    metadata["pending_attempt"] = dict(base_row)
+                    self._long_context_write_metadata(metadata_path, metadata)
+                    attempt_state: dict[str, Any] = {
+                        "input_token_count": None, "layer_index": None, "failure_stage": "prepare",
+                    }
+                    try:
+                        result = self._long_context_run_per_layer_trial(
+                            components, context_prefix, sample[question_type], model_type, attempt_state,
+                        )
+                    except (torch.cuda.OutOfMemoryError, MemoryError) as error:
+                        result = {**attempt_state, "status": "oom", "error": str(error)}
+
+                    layer_latencies_ms = result.get("layer_latencies_ms")
+                    shared_result = {
+                        key: value for key, value in result.items() if key != "layer_latencies_ms"
+                    }
+                    if result["status"] == "success":
+                        if not isinstance(layer_latencies_ms, list) or len(layer_latencies_ms) != layer_num:
+                            raise RuntimeError("Per-layer trial did not return one latency per loaded layer")
+                        for layer_index, layer_latency_ms in enumerate(layer_latencies_ms):
+                            row = {
+                                **base_row, **shared_result,
+                                "layer_index": layer_index, "layer_latency_ms": layer_latency_ms,
+                            }
+                            writer.writerow(row)
+                    else:
+                        writer.writerow({**base_row, **shared_result})
+                    csv_stream.flush()
+                    os.fsync(csv_stream.fileno())
+                    metadata["pending_attempt"] = None
+                    metadata["last_completed_attempt_id"] = attempt_number
+                    if result["status"] != "success":
+                        metadata.update(status="stopped", stop_reason=result["status"])
+                    self._long_context_write_metadata(metadata_path, metadata)
+                    print(
+                        f"[PROFILE] per-layer {phase} words={actual_word_count}: {result['status']}",
+                        flush=True,
+                    )
+                    gc.collect()
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    if result["status"] != "success":
+                        return csv_path
+                metadata.update(status="completed", stop_reason="fixed_context_completed")
+                self._long_context_write_metadata(metadata_path, metadata)
+            except BaseException as error:
+                metadata.update(
+                    status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
+                    error=str(error),
+                )
+                try:
+                    self._long_context_write_metadata(metadata_path, metadata)
+                except Exception as metadata_error:
                     print(
                         f"[PROFILE] Could not save error metadata to {metadata_path}: {metadata_error}. "
                         "The original profiling error follows.",

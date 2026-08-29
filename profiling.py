@@ -25,14 +25,28 @@ profiler = NodeProfiler(
 #################################
 ### 不同设备长文本 prefill 时延实验
 
-csv_path = profiler.profile_long_context_prefill(
+# csv_path = profiler.profile_long_context_prefill(
+#     layer_num=6,
+#     model_type="llama3.2ins",
+#     use_thinking_question=False,
+#     sample_index=0,
+#     initial_context_length=32,
+#     context_length_unit="auto",
+#     repeat_num=3,
+# )
+# print(csv_path)
+#################################
+
+
+#################################
+### 长文本 prefill 各层各自时延实验
+
+csv_path = profiler.profile_long_context_prefill_per_layer(
     layer_num=6,
+    context_word_count=2048,
     model_type="llama3.2ins",
     use_thinking_question=False,
     sample_index=0,
-    initial_context_length=32,
-    context_length_unit="auto",
     repeat_num=3,
 )
-print(csv_path)
 #################################

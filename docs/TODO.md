@@ -6,6 +6,8 @@
 
 涉及位置：`utils/shard_loader.py:LlamaShardPart.forward`，以及顺序推理、pipeline、NodeProfiler 调用该分片前向的路径。本次长上下文 profiling 使用现有分片前向行为，结果应同时保留 attention 实现和掩码状态。正式解释模型质量、比较有效 causal prefill 性能之前，需要完成以下验证。
 
+为了正确测试batching的前向推理时延，B/L 前向时延测试 `analysis\batch_forward_latency.py`中单独设置了正确的因果掩码 attention mask，绕开了 `shard_loader.forward`
+
 建议的排查和修改方案：
 
 1. 在远程环境固定模型权重、tokenizer、chat template、dtype、PyTorch/Transformers 版本及 attention backend。建立官方完整模型与同设备逐层模型的对照，先用短输入、batch size 1、无 padding 验证。

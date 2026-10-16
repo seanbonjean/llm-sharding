@@ -315,6 +315,7 @@ class LongContextTests(unittest.TestCase):
         self.assertTrue(all(float(row["prefill_latency_per_layer_ms"]) == 4 for row in measured))
         metadata = json.loads(result.with_suffix(".json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["stop_reason"], "full_context")
+        self.assertEqual(metadata["attention_mask"], "causal")
         self.assertIsNone(metadata["pending_attempt"])
         self.assertTrue(result.name.startswith("long_context_prefill_latency-"))
         self.assertTrue(result.name.endswith("-2layers.csv"))
@@ -377,6 +378,7 @@ class LongContextTests(unittest.TestCase):
         metadata = json.loads(result.with_suffix(".json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["status"], "completed")
         self.assertEqual(metadata["context_word_count_requested"], 3)
+        self.assertEqual(metadata["attention_mask"], "causal")
         self.assertFalse(metadata["final_norm_included"])
         self.assertFalse(metadata["lm_head_resident"])
         self.assertTrue(result.name.startswith("long_context_prefill_per_layer_latency-"))
@@ -489,13 +491,17 @@ class LongContextTests(unittest.TestCase):
             mock.Mock(side_effect=lambda **kwargs: run_layer("layer0")),
             mock.Mock(side_effect=lambda **kwargs: run_layer("layer1")),
         ]
+        causal_mask, cache_position = object(), object()
+        prepare_attention_mask = mock.Mock(
+            side_effect=lambda *args, **kwargs: events.append("mask") or (causal_mask, cache_position),
+        )
         components = {
             "tokenizer": types.SimpleNamespace(
                 apply_chat_template=mock.Mock(side_effect=lambda *args, **kwargs: events.append("tokenize") or input_ids),
             ),
             "embedding": mock.Mock(side_effect=lambda *args: events.append("embedding") or hidden_states),
             "rope": mock.Mock(side_effect=lambda *args: events.append("rope") or (hidden_states, hidden_states)),
-            "shard": types.SimpleNamespace(layers=layers),
+            "shard": types.SimpleNamespace(layers=layers, prepare_attention_mask=prepare_attention_mask),
         }
         self.module.build_position_ids = mock.Mock(return_value=input_ids)
         self.profiler.device.type = "cuda"
@@ -515,9 +521,16 @@ class LongContextTests(unittest.TestCase):
         self.assertEqual(events.count("timer"), 4)
         self.assertEqual(events.count("sync"), 5)
         self.assertLess(events.index("embedding"), events.index("timer"))
+        self.assertLess(events.index("mask"), events.index("timer"))
+        prepare_attention_mask.assert_called_once()
         self.assertEqual([event for event in events if event.startswith("layer")], ["layer0", "layer1"])
         for layer in layers:
-            self.assertIsNone(layer.call_args.kwargs["attention_mask"])
+            self.assertIs(layer.call_args.kwargs["attention_mask"], causal_mask)
+            self.assertIs(layer.call_args.kwargs["cache_position"], cache_position)
+            self.assertIs(
+                layer.call_args.kwargs["past_key_value"],
+                prepare_attention_mask.call_args.kwargs["past_key_value"],
+            )
 
     def test_thinking_selection_and_chinese_auto_unit(self) -> None:
         """Choose the thinking field and character units from explicit metadata. 验证问题与语言选项。"""

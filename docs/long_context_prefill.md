@@ -109,7 +109,7 @@ python analysis/long_context_prefill_per_layer_fig.py
 - `prefill_latency_ms` 为整个连续区间的毫秒数；`prefill_latency_per_layer_ms = prefill_latency_ms / loaded_layer_count`，包含输入/输出开销的层均摊值。
 - CUDA 计时前同步并重置峰值统计；完成输出、同步、停止计时后，先读取峰值，再释放张量和 KV。统计包括常驻权重和该轮峰值，CPU/不可用计数器留空。PyTorch allocated/reserved 并不等于设备总内存或 Jetson 系统 RAM 峰值。
 
-端到端与逐层长上下文前向目前均使用 `attention_mask=None`。解释结果前请阅读 [attention mask 优先事项](TODO.md)。
+端到端与逐层长上下文前向均通过 LlamaShardPart.prepare_attention_mask 使用官方因果掩码构造逻辑，结果 JSON 记录 `attention_mask="causal"`。无 padding 时，eager 使用显式掩码，SDPA 可通过内置因果路径执行。端到端计时包含掩码构造；逐层实验在各层计时前统一准备掩码，各层应用掩码的开销计入时延。历史 `eager + attention_mask=null` 数据与当前实现的注意力行为不同，重新比较时使用一致的实现和后端；验证进度见 [attention mask 验证事项](TODO.md)。
 
 ## 文件与字段
 

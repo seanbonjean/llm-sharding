@@ -2208,15 +2208,16 @@ class NodeProfiler:
             attempt_state: In-memory token count, layer index and failure stage for diagnostics.
                 诊断所需的 token 数、层索引和失败阶段；计时区间内不写盘。
 
-        Tokenization, local copy, embedding and RoPE run before layer timers. Every layer uses
+        Tokenization, local copy, embedding, RoPE and mask preparation run before layer timers. Every layer uses
         the preceding layer's output and one shared fresh KV cache. CUDA is synchronized at each
         layer boundary, so these values intentionally differ from uninterrupted end-to-end timing.
-        tokenize、本机拷贝、embedding 与 RoPE 位于逐层计时外；各层依次使用上一层输出和同一份新 KV。
+        tokenize、本机拷贝、embedding、RoPE 与掩码构造位于逐层计时外；各层依次使用上一层输出和同一份新 KV。
         每层边界均执行 CUDA 同步，因此该口径与不中断的端到端计时不同。
         """
         if model_type != "llama3.2ins":
             raise NotImplementedError(f"Unsupported model_type: {model_type}")
         input_ids = hidden_states = position_ids = cos = sin = layer_outputs = None
+        causal_mask = cache_position = None
         past_key_value = DynamicCache()
         try:
             with torch.inference_mode():
@@ -2243,6 +2244,10 @@ class NodeProfiler:
                 attempt_state["failure_stage"] = "rope"
                 position_ids = build_position_ids(past_key_value, token_count, self.device, batch_size=1)
                 cos, sin = components["rope"](hidden_states, position_ids)
+                attempt_state["failure_stage"] = "attention_mask"
+                causal_mask, cache_position = components["shard"].prepare_attention_mask(
+                    hidden_states, past_key_value=past_key_value,
+                )
                 layer_latencies_ms: list[float] = []
                 for layer_index, layer in enumerate(components["shard"].layers):
                     attempt_state["layer_index"] = layer_index
@@ -2251,8 +2256,9 @@ class NodeProfiler:
                     started = time.perf_counter()
                     layer_outputs = layer(
                         hidden_states=hidden_states,
-                        attention_mask=None,
+                        attention_mask=causal_mask,
                         past_key_value=past_key_value,
+                        cache_position=cache_position,
                         position_embeddings=(cos, sin),
                         use_cache=True,
                     )
@@ -2270,6 +2276,7 @@ class NodeProfiler:
                 }
         finally:
             input_ids = hidden_states = position_ids = cos = sin = layer_outputs = None
+            causal_mask = cache_position = None
             past_key_value = None
 
     def profile_long_context_prefill(
@@ -2360,7 +2367,7 @@ class NodeProfiler:
             "torch_version": str(getattr(torch, "__version__", "unknown")),
             "timing_scope": "single_device_prompt_format_tokenize_local_copy_embedding_rope_shard_optional_last_position_lm_head",
             "per_layer_definition": "prefill_latency_ms / loaded_layer_count (input/output overhead included)",
-            "attention_mask": None, "final_norm_included": layer_num == self.layer_num,
+            "attention_mask": "causal", "final_norm_included": layer_num == self.layer_num,
             "lm_head_resident": layer_num == self.layer_num,
             "pending_attempt": None,
         }
@@ -2657,9 +2664,9 @@ class NodeProfiler:
             "timing_scope": "individual_transformer_layer_call_to_synchronized_output",
             "layer_timing_definition": (
                 "ordered prefill with a fresh shared KV cache; synchronize before/after each layer; "
-                "prompt formatting, tokenize, local copy, embedding, RoPE, final norm and LM head excluded"
+                "prompt formatting, tokenize, local copy, embedding, RoPE, mask preparation, final norm and LM head excluded"
             ),
-            "attention_mask": None, "final_norm_included": False,
+            "attention_mask": "causal", "final_norm_included": False,
             "lm_head_resident": False,
             "clear_cuda_allocator_cache_between_attempts": (
                 clear_cuda_allocator_cache_between_attempts

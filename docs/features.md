@@ -72,7 +72,7 @@
 
 #### _long_context_run_per_layer_trial
 
-先执行模板/tokenize、本机拷贝、embedding 和 RoPE，再按顺序直接调用 shard 中的各 Transformer layer。各层调用前后分别同步设备和读取计时器，使用同一份新 KV Cache；返回每层时延列表，并在全部层计时结束后读取整轮峰值显存。final norm 与 LM head 不参与。
+先执行模板/tokenize、本机拷贝、embedding 和 RoPE，并调用分片的 prepare_attention_mask 一次性准备因果掩码和 cache_position，再按顺序直接调用各 Transformer layer。各层共用本轮掩码、位置和新 KV Cache；调用前后分别同步设备和读取计时器，返回每层时延列表，并在全部层计时结束后读取整轮峰值显存。掩码构造位于逐层计时外，掩码应用位于计时内；final norm 与 LM head 不参与。结果 JSON 的 attention_mask 记录为 causal。
 
 #### profile_max_layer_num
 
@@ -202,9 +202,17 @@ torch.nn.Module，代表连续 Transformer 层区间及可选 final norm。
 
 按 [start,end) 建立相对索引的 LlamaDecoderLayer，加载每个 block 权重及可选 final_norm.pth。
 
+#### prepare_attention_mask
+
+调用 Transformers 4.53.2 的 create_causal_mask，按当前 backend、输入形状和分片缓存长度构造因果约束，同时返回本轮绝对 cache_position。二维 padding mask 必须覆盖全部历史和当前 token；None 表示输入无 padding，仍启用因果注意力；已准备的四维因果掩码按官方接口传递。eager 使用显式掩码，SDPA 在适用条件下通过 is_causal 实现约束。此方法在第一个 decoder layer 更新 KV 之前调用。
+
 #### forward
 
-依次运行各层，共用传入的 KV/RoPE，最后执行可选 norm 并返回 hidden states。attention_mask 默认 None，核查计划见 TODO。
+调用 prepare_attention_mask 一次，然后向各层传入相同的因果掩码、cache_position 及传入的 KV/RoPE，最后执行可选 norm 并返回 hidden states。各分片使用自己的缓存和相对层索引；多 token decode 按历史 KV 长度偏移因果边界。
+
+注意力计算封装在 Transformers 中，调用链为 `LlamaShardPart.forward → LlamaDecoderLayer → LlamaAttention → attention backend`。eager 内部计算 QK 分数、掩码、softmax 和对 V 的加权；本方法只取 `outputs[0]` 的 hidden states，内部注意力矩阵不会作为本方法的返回值暴露给调用方。prefill 的分数形状为 `[B,头数,L,L]`，带 KV 的单 token decode 则为 `[B,头数,1,当前 KV 总长度]`。
+
+分片与完整 LlamaModel 共用官方掩码构造逻辑，接口依据为 [create_causal_mask](https://github.com/huggingface/transformers/blob/v4.53.2/src/transformers/masking_utils.py#L644-L724)。eager 应用掩码时仍计算完整注意力矩阵；时延与峰值显存需使用修复后的实现重新标定。
 
 ## utils/forwarding_utils.py
 
@@ -1246,6 +1254,172 @@ Jetson 监控工具安装辅助脚本；运行前检查设备环境和脚本内�
 
 接收两个可选 CSV 位置参数及 `--output`、`--include-lm-head`、`--label-a`、`--label-b`；省略某个 CSV 时使用其默认常量。调用对比并打印输出路径。输入或兼容性错误以命令行错误反馈；帮助信息不加载绘图库或 ML 依赖。
 
+## analysis/batch_forward_latency.py
+
+独立扫描 B/L 的 Llama prefill Transformer 前向时延；支持项目分片与本地完整模型目录。计时定义、运行命令和结果文件见 [batch_forward_latency.md](batch_forward_latency.md)。
+
+### StageComponents
+
+保存配置、分词器、embedding、RoPE、精确 Transformer 前缀及设备/精度/后端设置。输入模块用于计时外准备，只有所选 Transformer 层进入前向计时。
+
+### resolve_path
+
+把相对路径解析到项目根目录，使从项目外启动时也能定位模型、数据和结果。
+
+### write_json
+
+写入同目录临时文件并在关闭后替换目标，保存运行元数据和分析规则。
+
+### write_csv
+
+按显式列顺序写入二维结果表，包括汇总和实测等时延 batch 对。
+
+### iter_dataset_records
+
+从本地 JSON 数组逐条解码记录，缓冲区按块增长，不一次读取完整 LongBench-Pro。
+
+### read_token_bank
+
+从指定索引开始选取不同的足够长 context，使用模型分词器截取严格 token 前缀；记录样本 ID 和 token 哈希。过短记录跳过，不重复文本补长度。
+
+### load_stage
+
+从分片或本地 Llama 基础模型中保留 `[0,N)` 层，关闭训练与梯度；设置 eager/SDPA、精度、TF32 和设备，并记录环境。
+
+### prepare_batch
+
+构造无 padding 的连续 `[B,L]` 输入，在计时外完成设备搬运、embedding、位置编号、RoPE 和 eager 因果掩码。
+
+eager 使用可广播的 `[1,1,L,L]` 加性因果掩码，SDPA 使用无 padding、等长、空 KV 条件下的 `is_causal` 路径。该独立测量不调用 LlamaShardPart.forward；掩码构造在计时外，各层应用掩码的开销仍在计时内。
+
+### measure_forward
+
+每次创建新 DynamicCache，连续执行所选层，并在 CUDA 前后同步。停止计时后核对 KV 长度并读取峰值显存，随后释放输出与本轮 KV。
+
+峰值 allocated 包含常驻权重、KV 及前向临时张量。eager 在内部生成 `[B,注意力头数,L,L]` 的分数矩阵，并以 FP32 执行 softmax；即使 `output_attentions=False`，这些计算仍会发生。分数矩阵的元素数随 L 的平方增长，KV 则按实际 KV 头数、层数、B 和缓存长度线性增长，分析 OOM 时需分别核算。
+
+当前 eager 的 `softmax(..., dtype=torch.float32).to(query.dtype)` 会先得到 FP32 权重，再生成 FP16 权重。右侧计算完成前，变量仍引用旧 FP16 分数；转换时旧分数、FP32 softmax 结果和新 FP16 权重存在存活重叠，同一变量名的重新赋值不会原地改写这些张量。
+
+### run_measurements
+
+按种子打乱 B/L 形状顺序，每种形状预热并正式重复；逐行刷新原始 CSV。记录 OOM 和上下文超限，OOM 后清理并继续其他形状。
+
+### percentile
+
+对重复时延做线性插值得到描述性分位数，用于曲线 p10/p90 波动范围。
+
+### summarize_trials
+
+排除预热与非法记录，按重复索引聚合各形状；仅重复次数完整且没有失败的形状标记为成功，保留 OOM、部分完成及未测状态。
+
+### plot_latency_curves
+
+绘制固定 L 扫 B、固定 B 扫 L 的中位数曲线与 p10/p90 区间，并输出带失败状态的 B/L 时延热力图；使用 Agg 和 300 DPI。
+
+### analyze_results
+
+从已有运行聚合汇总，拟合并验证均衡规则，导出稳定实测匹配对和三张图。模型与表格先于绘图落盘，支持中断后只分析。
+
+### run_experiment
+
+创建北京时间命名的独立运行目录，保存参数和进度；依次加载、准备数据、测量，异常或中断时保留已有 CSV 并尝试分析完整点。
+
+### parse_arguments
+
+解析模型来源、层数、设备、精度、B/L 网格、重复次数、容差及只分析选项，规范网格并在加载 ML 包前验证范围。
+
+### main
+
+分派实际测量或已有运行的离线分析；导入模块不会启动实验。
+
+## analysis/batch_latency_balance.py
+
+以成功形状的实测中位数为依据，提供非负函数拟合和实测优先的等时延推荐；导入与实测查表不依赖 ML 库。
+
+### relative_latency_gap
+
+计算两时延差除以均值的对称相对差，用于判定近似相等。
+
+### _features
+
+构造常数、B、BL 和 $BL^2$（长度平方）项，分别表示固定、逐请求、逐 token 和 attention 工作量因素。
+
+### _fit_coefficients
+
+缩放特征列后，枚举至多四项特征的活跃集合求非负最小二乘；拒绝秩不足设计，不依赖 SciPy。
+
+### fit_latency_rule
+
+比较两参数 token 总量模型与四参数混合模型。整种 B/L 形状留出验证、重复波动和最少覆盖要求通过后才采纳函数；优先较少参数，否则使用实测查表。
+
+### predict_latency
+
+只对已采纳函数、成功测量覆盖范围内的正 B/L 预测时延，拒绝外推。
+
+### find_equivalent_batches
+
+寻找 B 与 L 反向变化、中位数差在容差内且 CV 不超过半容差的实测 batch 对。
+
+### recommend_equivalent_batch
+
+以一个实测参考点确定目标时延，优先选择指定新 L 下的稳定实测匹配；必要时用反函数检查相邻整数 B，标注未测预测。已有实测不匹配的形状不会被预测覆盖。
+
+## test/unittest_batch_forward_latency.py
+
+无需模型权重/GPU的 B/L 分析回归测试；函数拟合测试需要 NumPy。
+
+### make_point
+
+构造带 B/L、时延中位数和 CV 的成功形状测试点。
+
+### BalanceRuleTests
+
+检查拟合恢复、模型采纳门槛以及实测和预测推荐的区别。
+
+#### test_full_cost_formula_is_recovered
+
+用合成非负函数验证整种形状留出预测、混合模型恢复及外推拒绝。
+
+#### test_simple_formula_is_preferred_when_valid
+
+BL 模型足以解释数据时优先使用较少参数的函数。
+
+#### test_sparse_noisy_and_irregular_data_use_lookup
+
+样本覆盖不足、波动过大或验证误差过大时回退实测查表。
+
+#### test_measured_pairs_require_tradeoff_and_stability
+
+只导出 B/L 反向变化且时延稳定、近似相等的实测对。
+
+#### test_recommendation_prefers_stable_measured_match
+
+更接近的点波动过大时，仍可选择容差内的稳定实测点。
+
+#### test_model_estimates_do_not_override_measured_mismatches
+
+拒绝用预测结果覆盖同一形状已测得的不匹配结论。
+
+#### test_integer_prediction_is_labeled_as_an_estimate
+
+未测整数 B 的反函数推荐标记为模型估计与待补测。
+
+### DataPreparationTests
+
+检查流式样本读取、严格输入长度、聚合口径及命令行设置。
+
+#### test_streaming_and_exact_token_bank_selection
+
+跳过短文本，选取不同记录的严格长度前缀。
+
+#### test_warmups_failures_and_partial_shapes_are_excluded
+
+预热不进入统计，OOM 和部分测量形状不标记为完整成功。
+
+#### test_cli_deduplicates_grid_and_rejects_invalid_counts
+
+网格去重排序，并拒绝非法重复次数、请求数和容差。
+
 ## test/unittest_node_profiler.py
 
 NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测试统一位于 `test/` 目录，并使用不与标准库冲突的文件名。通过模拟 ML/通信依赖执行真实 profiler 调度和计时代码，绘图使用记录调用的 matplotlib 替身；语法检查不导入 ML 库，实际 CUDA/模型数值正确性由目标设备验证。直接运行时临时排除测试目录以加载标准库 unittest，随后恢复搜索路径。
@@ -1601,3 +1775,59 @@ NodeProfiler 和长上下文绘图的标准库回归测试入口，与其他测�
 #### test_help_without_ml_or_plotting_dependencies
 
 从项目外启动对比脚本，在禁用 ML 与绘图库导入时验证命令行帮助。
+
+## test/unittest_shard_loader.py
+
+使用 CPU float32 随机权重小型 Llama，比较官方完整模型与从磁盘加载的两段分片。执行不需要下载权重。
+
+### ShardCausalAttentionTests
+
+验证 eager/SDPA 的因果注意力、分片边界、KV 历史和 padding 语义。
+
+#### setUpClass
+
+创建三层完整模型，将各层和 final norm 保存到临时目录，再加载两个起始层不同的分片。
+
+#### tearDownClass
+
+释放临时权重并恢复 CPU 线程数。
+
+#### set_backend
+
+为完整模型与各分片选择同一个 attention 后端。
+
+#### forward_shards
+
+从 embedding 开始按分片顺序前向，共用本轮 RoPE，各分片使用自己的相对层索引和独立 KV；返回 logits 与分片边界 hidden states。
+
+#### assert_matches_reference
+
+比较有效查询位置的 logits、边界 hidden states，以及各层缓存的 K/V 和长度。
+
+#### test_prefill_matches_official_model
+
+验证有缓存和无缓存的批量 prefill，与官方完整模型对齐。
+
+#### test_future_tokens_do_not_change_prefix
+
+改变输入后缀，验证所有更早位置的 logits 保持一致。
+
+#### test_cached_single_and_multi_token_decode
+
+依次输入 prefill、单 token 和多 token decode，比较逐步官方前向及一次性完整序列结果。
+
+#### test_padding_is_respected_in_prefill_and_decode
+
+验证左右 padding、改变 PAD 内容不影响有效输出，以及包含 padding 历史的多 token decode。
+
+#### test_interleaved_requests_keep_separate_histories
+
+交错处理两条历史长度不同的请求，验证共享模型层时缓存仍按请求独立。
+
+#### test_chunk_mask_uses_past_length_and_padding
+
+逐格检查带历史 KV 的多 token 查询：有效历史可见、PAD 不可见、当前块的未来位置不可见。
+
+#### test_decode_rejects_mask_missing_history
+
+验证漏掉历史部分的二维 padding mask 在修改缓存前报错。

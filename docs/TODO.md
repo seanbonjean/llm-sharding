@@ -1,22 +1,22 @@
 # TODO
 
-## P0：核查 `attention_mask=None` 与分层推理回答质量
+## P0：验证分层推理的因果注意力与回答质量
 
-背景：构建分层推理框架时，显式设置 `attention_mask` 后程序无法正常运行，当时未找到解决方法，因此保留了 `attention_mask=None` 的实现。长期观察到分层推理的回答效果不佳，有理由怀疑掩码处理与此有关；目前这是待验证的原因，尚未确认因果关系。
+分层前向通过 `LlamaShardPart.prepare_attention_mask` 复用 Transformers 4.53.2 的官方因果掩码构造逻辑。输入 None 表示无 padding；二维 padding mask 覆盖历史和当前 token。每轮在各层写入 KV 前准备一次因果掩码和 cache_position，供顺序推理、pipeline 和 NodeProfiler 共用。
 
-涉及位置：`utils/shard_loader.py:LlamaShardPart.forward`，以及顺序推理、pipeline、NodeProfiler 调用该分片前向的路径。本次长上下文 profiling 使用现有分片前向行为，结果应同时保留 attention 实现和掩码状态。正式解释模型质量、比较有效 causal prefill 性能之前，需要完成以下验证。
+- [x] 接入 prefill、单 token decode、多 token decode 的因果约束及历史 KV 偏移。
+- [x] 逐层 profiler 在计时前调用同一掩码接口，各层实际应用掩码的开销计入时延；端到端 profiling 同时计入掩码构造。两种结果 JSON 均记录 `attention_mask="causal"`。
+- [x] 在 PyTorch 2.7.1 / Transformers 4.53.2、CPU float32 环境通过 7 项随机权重小型 Llama 测试，覆盖 eager/SDPA、后文不影响前文、非零起始层分片、分片边界 hidden states/logits/KV 对齐、左右 padding、单/多 token decode、请求缓存隔离及错误 padding 长度。
+- [x] 通过现有 NodeProfiler 的 78 项回归测试，包括因果掩码标记和逐层计时边界。
 
 为了正确测试batching的前向推理时延，B/L 前向时延测试 `analysis\batch_forward_latency.py`中单独设置了正确的因果掩码 attention mask，绕开了 `shard_loader.forward`
 
-建议的排查和修改方案：
+目标设备验证：
 
-1. 在远程环境固定模型权重、tokenizer、chat template、dtype、PyTorch/Transformers 版本及 attention backend。建立官方完整模型与同设备逐层模型的对照，先用短输入、batch size 1、无 padding 验证。
-2. 对比每层 hidden states、final norm 输出、最后位置 logits、首 token；随后加入带 KV cache 的逐 token decode，定位最早出现偏差的位置，同时核对 RoPE、position IDs、cache 长度和分片相对层索引。
-3. 检查该版本官方模型 forward 如何从二维 padding mask、cache position 和历史长度构造因果掩码。直接调用 `LlamaDecoderLayer` 时，需要核实当前 eager/SDPA 等 backend 是否具备相同的因果约束；不能把 tokenizer 的二维 mask 原样传入并假定其等价，也不能仅凭 `None` 断定所有 backend 都会缺失因果性。
-4. 实现与固定版本兼容的统一 mask 构造接口，覆盖 prefill 的可见前缀及 decode 的历史 KV；结合 backend 明确二维/四维 mask、形状、dtype、device 和遮蔽值。顺序模型链与 pipeline 各 stage 根据同一请求的有效长度、padding 和 cache 状态保持一致。
-5. 增加单设备逐层对齐、跨分片对齐、不同长度/padding、prefill→decode、pipeline 多请求隔离测试。通过后重新测量时延和峰值显存；显式长序列掩码可能增加内存占用，需结合 backend 验证，避免仅为构造掩码就占满内存。
-
-当前工作范围是记录诊断计划；掩码实现待上述对照验证后单独修改。
+- [ ] 固定真实模型权重、tokenizer、chat template、dtype、依赖版本及 backend，在 PC GPU 和 Jetson 上对比官方完整模型与分片模型的各层 hidden states、final norm、logits、首 token 和连续 decode。
+- [ ] 验证实际跨设备模型链与 pipeline 多请求运行；当前 CPU 测试覆盖分片 API 和独立缓存，节点通信及有 padding 的批量输入协议需分别验证。
+- [ ] 检查真实回答质量。因果注意力的数值对齐不能替代 tokenizer、chat template、RoPE 和完整生成流程的检查。
+- [ ] 使用修复后的实现重新测量时延和峰值显存。历史 eager+None 记录对应不同的注意力行为，比较时固定同一实现和 backend。
 
 ## 输入模板接入两套主程序
 
